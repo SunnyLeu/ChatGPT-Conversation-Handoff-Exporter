@@ -49,72 +49,72 @@ Tampermonkey userscript，用來在 ChatGPT 對話頁匯出目前對話的原始
 
 ```json
 {
-  "title": "ChatGPT-Conversation-Handoff-Exporter",
-  "create_time": "2026-05-05T07:10:00.000+00:00",
-  "update_time": "2026-05-05T07:30:00.000+00:00",
-  "conversation_id": "69f98abc-3ac4-8320-9afb-ad658dac4e9b",
-  "messages": [
-    {
-      "id": "u01",
-      "role": "user",
-      "content": "請先完整閱讀這兩份檔案\n並掌握對話進度和程式內容"
-    },
-    {
-      "id": "a01",
-      "role": "assistant",
-      "content": "已完整閱讀並掌握兩份檔案。"
-    },
-    {
-      "id": "u02",
-      "role": "user",
-      "content": "幫我比較 Bookmarklet 與 Userscript 的差異"
-    },
-    {
-      "id": "a02",
-      "role": "assistant",
-      "content": "以目前需求來看，Userscript 會比 Bookmarklet 更適合長期使用。",
-      "cite_sources": [
+    "title": "ChatGPT-Conversation-Handoff-Exporter",
+    "create_time": "2026-05-05T07:10:00.000+00:00",
+    "update_time": "2026-05-05T07:30:00.000+00:00",
+    "conversation_id": "69f98abc-3ac4-8320-9afb-ad658dac4e9b",
+    "messages": [
         {
-          "url": "https://example.com/article",
-          "title": "Example Article",
-          "snippet": "A short summary or excerpt of the referenced source.",
-          "pub_date": "2026-05-05T00:00:00.000+00:00",
-          "attribution": "Example Site"
+            "id": "u01",
+            "role": "user",
+            "content": "請先完整閱讀這兩份檔案\n並掌握對話進度和程式內容"
+        },
+        {
+            "id": "a01",
+            "role": "assistant",
+            "content": "已完整閱讀並掌握兩份檔案。"
+        },
+        {
+            "id": "u02",
+            "role": "user",
+            "content": "幫我比較 Bookmarklet 與 Userscript 的差異"
+        },
+        {
+            "id": "a02",
+            "role": "assistant",
+            "content": "以目前需求來看，Userscript 會比 Bookmarklet 更適合長期使用。",
+            "cite_sources": [
+                {
+                    "url": "https://example.com/article",
+                    "title": "Example Article",
+                    "snippet": "A short summary or excerpt of the referenced source.",
+                    "pub_date": "2026-05-05T00:00:00.000+00:00",
+                    "attribution": "Example Site"
+                }
+            ]
         }
-      ]
-    }
-  ]
+    ]
 }
 ```
 
 ### 頂層欄位
 
-| 欄位              | 型別             | 說明                                                                                                 |
-| ----------------- | ---------------- | ---------------------------------------------------------------------------------------------------- |
-| `title`           | `string | null` | 原始 ChatGPT 對話標題。若原始資料沒有標題，可能為 `null`。                                           |
-| `create_time`     | `string \| null` | 對話建立時間。若原始值是 Unix timestamp，會轉成 UTC ISO 格式，例如 `2026-05-05T07:10:00.000+00:00`。 |
-| `update_time`     | `string \| null` | 對話最後更新時間。格式同 `create_time`。                                                             |
-| `conversation_id` | `string \| null` | ChatGPT 原始 conversation ID。通常會對應網址中的 `/c/{conversation_id}`。                            |
-| `messages`        | `array`          | 精簡後的訊息陣列，只保留目前主分支上的可見 `user` / `assistant` 訊息。                               |
+| 欄位 | 型別 | 說明 |
+|---|---|---|
+| `title` | `string \| null` | 原始 ChatGPT 對話標題。若原始資料沒有標題，可能為 `null`。 |
+| `create_time` | `string \| null` | 對話建立時間。若原始值是 Unix timestamp，會轉成 UTC ISO 格式，例如 `2026-05-05T07:10:00.000+00:00`。 |
+| `update_time` | `string \| null` | 對話最後更新時間。格式同 `create_time`。 |
+| `conversation_id` | `string \| null` | ChatGPT 原始 conversation ID。通常會對應網址中的 `/c/{conversation_id}`。 |
+| `messages` | `array` | 精簡後的訊息陣列，只保留目前主分支上的可見 `user` / `assistant` 訊息。 |
 
 ### `messages[]` 單一訊息欄位
 
-| 欄位           | 型別                    | 說明                                                                                                                                         |
-| -------------- | ----------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
-| `id`           | `string`                | 交接檔內部使用的簡短訊息 ID。`user` 訊息會編成 `u01`, `u02`, ...；`assistant` 訊息會編成 `a01`, `a02`, ...。這不是 ChatGPT 原始 message ID。 |
-| `role`         | `"user" \| "assistant"` | 訊息角色。交接檔只保留使用者與助理的實際對話訊息。                                                                                           |
-| `content`      | `string`                | 訊息文字內容。會排除非文字 asset pointer，並移除 ChatGPT 內嵌引用標記，例如 `...`。                                                        |
-| `cite_sources` | `array`，選填           | 僅在 `assistant` 訊息有可解析的引用來源 metadata 時出現。若沒有引用來源，這個欄位不會輸出。                                                  |
+| 欄位 | 型別 | 說明 |
+|---|---|---|
+| `id` | `string` | 交接檔內部使用的簡短訊息 ID。`user` 訊息會編成 `u01`, `u02`, ...；`assistant` 訊息會編成 `a01`, `a02`, ...。這不是 ChatGPT 原始 message ID。 |
+| `role` | `"user" \| "assistant"` | 訊息角色。交接檔只保留使用者與助理的實際對話訊息。 |
+| `content` | `string` | 訊息文字內容。會排除非文字 asset pointer，並移除 ChatGPT 內嵌引用標記，例如 `...`。 |
+| `cite_sources` | `array`，選填 | 僅在 `assistant` 訊息有可解析的引用來源 metadata 時出現。若沒有引用來源，這個欄位不會輸出。 |
 
 ### `cite_sources[]` 引用來源欄位
 
-| 欄位          | 型別             | 說明                                             |
-| ------------- | ---------------- | ------------------------------------------------ |
-| `url`         | `string \| null` | 引用來源 URL。                                   |
-| `title`       | `string \| null` | 引用來源標題。                                   |
-| `snippet`     | `string \| null` | 引用來源摘要、片段或簡短描述。                   |
-| `pub_date`    | `string \| null` | 引用來源發布時間。若可轉換，會轉成可讀時間格式。 |
-| `attribution` | `string \| null` | 來源站台、作者、發布者或歸屬資訊。               |
+| 欄位 | 型別 | 說明 |
+|---|---|---|
+| `url` | `string \| null` | 引用來源 URL。 |
+| `title` | `string \| null` | 引用來源標題。 |
+| `snippet` | `string \| null` | 引用來源摘要、片段或簡短描述。 |
+| `pub_date` | `string \| null` | 引用來源發布時間。若可轉換，會轉成可讀時間格式。 |
+| `attribution` | `string \| null` | 來源站台、作者、發布者或歸屬資訊。 |
 
 ### 訊息順序與主分支
 
