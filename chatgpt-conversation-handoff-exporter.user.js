@@ -1,0 +1,2001 @@
+// ==UserScript==
+// @name         ChatGPT 對話 JSON 與交接檔匯出工具
+// @name:en      ChatGPT Conversation Handoff Exporter
+// @namespace    https://github.com/SunnyLeu/ChatGPT-Conversation-Handoff-Exporter
+// @version      1.0.0
+// @description  在 ChatGPT 對話頁新增按鈕，可下載目前對話的格式化原始 JSON，或直接產出精簡交接用 handoff JSON。
+// @description:en Export the current ChatGPT conversation as formatted raw JSON or compact handoff JSON.
+// @author       SunnyLeu
+// @license      MIT
+// @match        https://chatgpt.com/*
+// @run-at       document-start
+// @grant        none
+// ==/UserScript==
+
+/*
+ * ChatGPT 對話 JSON 與交接檔匯出工具
+ * ============================================================
+ *
+ * 這是一個 Tampermonkey / Userscript 腳本。
+ *
+ * 主要用途：
+ *   1. 在 ChatGPT 對話頁右上角新增兩個按鈕：
+ *      -「下載原始 JSON」
+ *      -「下載交接 JSON」
+ *
+ *   2.「下載原始 JSON」會匯出目前對話的 raw conversation JSON。
+ *
+ *   3.「下載交接 JSON」會把 raw conversation JSON 轉成較精簡、
+ *      適合上傳到新 ChatGPT 對話接續前情的 handoff JSON。
+ *
+ * 設計原則：
+ *   - 只處理目前使用者正在看的單一對話。
+ *   - 不批次掃描所有對話。
+ *   - 不上傳任何資料到第三方伺服器。
+ *   - 不把 token、cookie、header、raw JSON 印到 Console。
+ *   - 不把驗證資訊寫死在程式碼。
+ *   - 所有暫存資料只放在瀏覽器頁面的記憶體中。
+ *
+ * 注意事項：
+ *   - 本腳本依賴 ChatGPT 網頁版目前的內部請求與 DOM 結構。
+ *   - ChatGPT 前端或內部 endpoint 若改版，腳本可能需要更新。
+ *   - 本腳本不是 OpenAI 官方 API，也不是官方匯出功能。
+ */
+
+(function () {
+  'use strict';
+
+  // ============================================================
+  // 一、全域常數與狀態
+  // ============================================================
+
+  /*
+   * INSTALL_FLAG 用來避免腳本在同一頁面被重複安裝。
+   *
+   * ChatGPT 是 SPA（Single Page Application），頁面可能不完整重新載入，
+   * Tampermonkey 或瀏覽器也可能因為導航行為導致腳本重複初始化。
+   *
+   * 若不防重，可能會出現：
+   *   - 多個相同按鈕
+   *   - 多次包裝 window.fetch
+   *   - 重複的 timer / listener
+   */
+  const INSTALL_FLAG = '__chatgptConversationHandoffExporterInstalled_v100';
+
+  /*
+   * 兩個按鈕的 DOM id。
+   *
+   * raw button：
+   *   下載 ChatGPT 原始 conversation JSON。
+   *
+   * handoff button：
+   *   將原始 conversation JSON 轉換成 handoff JSON 後下載。
+   */
+  const RAW_BUTTON_ID = 'cgpt-export-raw-json-button';
+  const HANDOFF_BUTTON_ID = 'cgpt-export-handoff-json-button';
+
+  /*
+   * 若目前頁面已經安裝過本腳本，就直接結束。
+   */
+  if (window[INSTALL_FLAG]) {
+    return;
+  }
+
+  window[INSTALL_FLAG] = true;
+
+  /*
+   * capturedRawByConversationId：
+   *   暫存已捕捉到的 raw conversation JSON。
+   *
+   *   key：conversation_id
+   *   value：
+   *     {
+   *       rawText: string,     // 原始 JSON 字串
+   *       capturedAt: number   // 捕捉時間，Date.now()
+   *     }
+   *
+   * 注意：
+   *   這些資料只存在目前頁面的記憶體中，不會寫入 localStorage、
+   *   IndexedDB、cookie 或任何永久儲存區。
+   */
+  const capturedRawByConversationId = new Map();
+
+  /*
+   * replayRequestByConversationId：
+   *   暫存可重新抓取目前對話 JSON 的請求資訊。
+   *
+   * 目的：
+   *   使用者可能新增訊息、編輯訊息、重新產生回答。
+   *   若只下載一開始捕捉到的 raw JSON，可能不是最新狀態。
+   *
+   *   因此腳本會在 ChatGPT 自己成功請求 conversation JSON 時，
+   *   記住必要且安全可重用的請求資訊。
+   *
+   * 注意：
+   *   - 不主動讀取 document.cookie。
+   *   - 不把 cookie 寫進 headers。
+   *   - 不把 headers 印到 Console。
+   *   - 實際重抓時使用 credentials: 'include'，讓瀏覽器自行處理同源驗證。
+   */
+  const replayRequestByConversationId = new Map();
+
+  /*
+   * SPA 導航與 UI 插入控制用狀態。
+   */
+  let lastPathname = location.pathname;
+  let ensureTimer = null;
+  let uiStarted = false;
+
+  /*
+   * ChatGPT 回覆中的內嵌引用標記，例如：
+   *   citeturn0search0
+   *   fileciteturn1file3
+   *
+   * handoff JSON 主要要給新對話閱讀，因此這類 UI 內嵌標記會移除。
+   */
+  const INLINE_MARK_PATTERN = /.*?/gs;
+
+  /*
+   * handoff JSON 只保留 user / assistant。
+   *
+   * system、tool 等內部訊息通常會讓新對話失焦，因此不輸出。
+   */
+  const ALLOWED_ROLES = new Set(['user', 'assistant']);
+
+  /*
+   * 這些 content_type 不輸出到 handoff：
+   *
+   * thoughts：
+   *   模型思考過程。
+   *
+   * reasoning_recap：
+   *   推理摘要或內部推理資訊。
+   *
+   * user_editable_context：
+   *   使用者設定 / 個人化上下文，不屬於實際對話訊息。
+   */
+  const EXCLUDED_CONTENT_TYPES = new Set([
+    'thoughts',
+    'reasoning_recap',
+    'user_editable_context'
+  ]);
+
+  /*
+   * 某些 assistant 訊息其實是工具操作內容，而不是一般可讀回覆。
+   * 例如 web 搜尋工具的 search_query / open / find 等。
+   *
+   * 這些內容若輸出到 handoff，會讓新對話看到內部工具呼叫細節，
+   * 因此要排除。
+   */
+  const ASSISTANT_TOOL_OPERATION_PATTERN =
+    /(^|\n)\s*\{?\s*"?(search_query|open|find|click|image_query|product_query|sports|finance|weather|calculator|time)"?\s*:/i;
+
+  /*
+   * 兩個按鈕使用的 inline SVG。
+   *
+   * 使用 inline SVG 的理由：
+   *   - 不需要額外載入圖片。
+   *   - 不依賴外部 CDN。
+   *   - 顏色會跟著 currentColor，自動配合 ChatGPT UI 主題。
+   */
+  const RAW_JSON_ICON_SVG = `
+        <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" aria-hidden="true" class="-ms-0.5 icon" fill="none">
+          <path d="M14 2H7a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V7z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/>
+          <path d="M14 2v5h5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+          <path d="M10 12l-2 2 2 2M14 12l2 2-2 2" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+  `;
+
+  const HANDOFF_ICON_SVG = `
+        <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" aria-hidden="true" class="-ms-0.5 icon" fill="none">
+          <path d="M5 4h9l5 5v11a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/>
+          <path d="M14 4v5h5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+          <path d="M8 15h8M8 18h5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+        </svg>
+  `;
+
+  // ============================================================
+  // 二、安全 Log 與錯誤處理輔助函式
+  // ============================================================
+
+  /*
+   * 本腳本會處理對話 JSON 與請求上下文。
+   *
+   * 為了避免使用者不小心截圖或複製 Console 時外洩敏感資訊，
+   * log 設計採取「最小揭露」原則：
+   *
+   *   - 不輸出 raw JSON。
+   *   - 不輸出 headers。
+   *   - 不輸出 cookie。
+   *   - 不輸出 bearer token。
+   *   - 不輸出完整 response body。
+   *
+   * 只輸出事件名稱、conversation ID、狀態碼、訊息摘要。
+   */
+  const LOG_PREFIX = '[ChatGPT 對話匯出工具]';
+
+  function logInfo(message, data = null) {
+    if (data === null || data === undefined) {
+      console.info(LOG_PREFIX, message);
+      return;
+    }
+
+    console.info(LOG_PREFIX, message, data);
+  }
+
+  function logWarn(message, data = null) {
+    if (data === null || data === undefined) {
+      console.warn(LOG_PREFIX, message);
+      return;
+    }
+
+    console.warn(LOG_PREFIX, message, data);
+  }
+
+  function logError(message, error = null) {
+    if (!error) {
+      console.error(LOG_PREFIX, message);
+      return;
+    }
+
+    console.error(LOG_PREFIX, message, {
+      name: error.name || 'Error',
+      message: error.message || String(error)
+    });
+  }
+
+  function toErrorMessage(error) {
+    if (error instanceof Error) {
+      return error.message;
+    }
+
+    return String(error);
+  }
+
+  /*
+   * 給使用者看的錯誤提示。
+   *
+   * 這裡用 alert 是因為使用者前面指定錯誤提示先使用 alert。
+   */
+  function showErrorAlert(error) {
+    alert(toErrorMessage(error));
+  }
+
+  // ============================================================
+  // 三、網址、標題、時間與檔名處理
+  // ============================================================
+
+  /*
+   * 判斷目前頁面是否是 ChatGPT 對話頁。
+   *
+   * 支援：
+   *   https://chatgpt.com/c/{conversation_id}
+   *   https://chatgpt.com/g/.../c/{conversation_id}
+   */
+  function isConversationPage() {
+    return /\/c\/[^/?#]+/.test(location.pathname);
+  }
+
+  /*
+   * 從目前網址取得 conversation ID。
+   */
+  function getConversationIdFromUrl() {
+    const match = location.pathname.match(/\/c\/([^/?#]+)/);
+    return match ? decodeURIComponent(match[1]) : null;
+  }
+
+  /*
+   * 從 ChatGPT 原始 conversation endpoint 取得 conversation ID。
+   *
+   * 只接受精確 endpoint：
+   *   /backend-api/conversation/{conversation_id}
+   *
+   * 不接受：
+   *   /backend-api/conversation/{conversation_id}/...
+   *
+   * 這樣可以避免誤捕捉子路徑請求，導致重抓時拿到錯的 JSON。
+   */
+  function getConversationIdFromExactApiUrl(url) {
+    try {
+      const parsedUrl = new URL(url, location.origin);
+      const match = parsedUrl.pathname.match(/^\/backend-api\/conversation\/([^/]+)\/?$/);
+
+      return match ? decodeURIComponent(match[1]) : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /*
+   * 從 fetch 的 input 參數中取出 URL。
+   *
+   * fetch 可能被呼叫成：
+   *   fetch("...")
+   *   fetch(new URL(...))
+   *   fetch(new Request(...))
+   */
+  function getRequestUrl(input) {
+    if (typeof input === 'string') {
+      return input;
+    }
+
+    if (input instanceof URL) {
+      return input.href;
+    }
+
+    if (input && typeof input.url === 'string') {
+      return input.url;
+    }
+
+    return '';
+  }
+
+  function pad2(value) {
+    return String(value).padStart(2, '0');
+  }
+
+  /*
+   * 產生檔名用時間戳。
+   *
+   * 格式：
+   *   yyyyMMddHHmmss
+   */
+  function getTimestampString(date = new Date()) {
+    return [
+      date.getFullYear(),
+      pad2(date.getMonth() + 1),
+      pad2(date.getDate()),
+      pad2(date.getHours()),
+      pad2(date.getMinutes()),
+      pad2(date.getSeconds())
+    ].join('');
+  }
+
+  /*
+   * tooltip 顯示用時間。
+   */
+  function getDisplayDateTime(date = new Date()) {
+    return [
+      `${date.getFullYear()}-${pad2(date.getMonth() + 1)}-${pad2(date.getDate())}`,
+      `${pad2(date.getHours())}:${pad2(date.getMinutes())}:${pad2(date.getSeconds())}`
+    ].join(' ');
+  }
+
+  /*
+   * 將 Unix timestamp 轉成 UTC ISO 字串。
+   *
+   * Python 版原本會輸出 +00:00。
+   * JS 原生 toISOString() 會輸出 Z。
+   * 這裡轉成 +00:00，讓輸出較接近 Python 版。
+   */
+  function toUtcIsoString(date) {
+    return date.toISOString().replace('Z', '+00:00');
+  }
+
+  /*
+   * 將 conversation JSON 裡的時間值轉成可讀字串。
+   *
+   * 支援：
+   *   - number：視為 Unix timestamp 秒數。
+   *   - numeric string：同上。
+   *   - 一般 string：原樣保留。
+   */
+  function toReadableTime(value) {
+    if (value === null || value === undefined) {
+      return null;
+    }
+
+    if (typeof value === 'number' && Number.isFinite(value)) {
+      return toUtcIsoString(new Date(value * 1000));
+    }
+
+    if (typeof value === 'string') {
+      const stripped = value.trim();
+
+      if (!stripped) {
+        return null;
+      }
+
+      if (/^[+-]?\d+(?:\.\d+)?$/.test(stripped)) {
+        const numeric = Number(stripped);
+
+        if (Number.isFinite(numeric)) {
+          return toUtcIsoString(new Date(numeric * 1000));
+        }
+      }
+
+      return stripped;
+    }
+
+    return null;
+  }
+
+  /*
+   * 清理檔名片段。
+   *
+   * Windows 不允許的字元：
+   *   \ / : * ? " < > |
+   *
+   * 另外也會移除控制字元、尾端句點與空白。
+   */
+  function sanitizeFilenamePart(value) {
+    const sanitized = String(value || '')
+      .replace(/[\u0000-\u001f\u007f]/g, '')
+      .replace(/[\\/:*?"<>|]/g, '_')
+      .replace(/\s+/g, ' ')
+      .replace(/[. ]+$/g, '')
+      .trim()
+      .slice(0, 120);
+
+    return sanitized || 'chatgpt-conversation';
+  }
+
+  function tryParseJson(rawText) {
+    return JSON.parse(rawText);
+  }
+
+  /*
+   * 從 conversation 物件取得標題。
+   */
+  function getConversationTitle(conversation, fallback = 'chatgpt-conversation') {
+    if (conversation && typeof conversation.title === 'string' && conversation.title.trim()) {
+      return conversation.title.trim();
+    }
+
+    return fallback;
+  }
+
+  /*
+   * 清理瀏覽器 document.title。
+   *
+   * 重要修正：
+   *   只移除「有空白分隔」的 ChatGPT 品牌前綴或後綴。
+   *
+   * 會移除：
+   *   ChatGPT - My Title
+   *   ChatGPT | My Title
+   *   My Title - ChatGPT
+   *
+   * 不會移除：
+   *   ChatGPT-Conversation-Handoff-Exporter
+   *
+   * 因為後者很可能是使用者自己設定的對話標題。
+   */
+  function cleanBrowserTitle(value) {
+    let title = String(value || '').trim();
+
+    if (!title || /^chatgpt$/i.test(title)) {
+      return '';
+    }
+
+    title = title
+      .replace(/^ChatGPT\s+[-–—|]\s+/i, '')
+      .replace(/\s+[-–—|]\s+ChatGPT$/i, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+
+    if (!title || /^chatgpt$/i.test(title)) {
+      return '';
+    }
+
+    return title;
+  }
+
+  /*
+   * CSS attribute selector 簡易跳脫。
+   *
+   * 用於查找目前對話在側邊欄中的連結文字。
+   */
+  function cssAttributeEscape(value) {
+    return String(value || '')
+      .replace(/\\/g, '\\\\')
+      .replace(/"/g, '\\"');
+  }
+
+  /*
+   * 優先從目前頁面取得即時標題。
+   *
+   * 原因：
+   *   使用者重新命名對話後，raw JSON 中的 title 可能要等下一次
+   *   重新抓取才更新；但頁面標題或側邊欄文字可能較快更新。
+   *
+   * 取值順序：
+   *   1. document.title
+   *   2. 側邊欄中連到目前 conversation ID 的連結文字
+   *   3. 空字串
+   */
+  function getTitleFromCurrentPage(conversationId) {
+    const browserTitle = cleanBrowserTitle(document.title);
+
+    if (browserTitle) {
+      return browserTitle;
+    }
+
+    if (!conversationId) {
+      return '';
+    }
+
+    try {
+      const escapedId = cssAttributeEscape(conversationId);
+      const links = document.querySelectorAll(`a[href*="/c/${escapedId}"]`);
+
+      for (const link of links) {
+        const text = String(link.textContent || '')
+          .replace(/\s+/g, ' ')
+          .trim();
+
+        if (
+          text &&
+          text.length <= 160 &&
+          !/^ChatGPT$/i.test(text) &&
+          !text.includes('下載原始 JSON') &&
+          !text.includes('下載交接 JSON')
+        ) {
+          return text;
+        }
+      }
+    } catch {
+      // DOM 查找只是輔助，不成功也不影響匯出。
+    }
+
+    return '';
+  }
+
+  /*
+   * tooltip 顯示用標題。
+   *
+   * 優先使用目前頁面上的即時標題；
+   * 若沒有，再退回已捕捉 raw JSON 中的 title。
+   */
+  function getKnownConversationTitle(conversationId) {
+    const liveTitle = getTitleFromCurrentPage(conversationId);
+
+    if (liveTitle) {
+      return liveTitle;
+    }
+
+    const capture = capturedRawByConversationId.get(conversationId);
+
+    if (capture && capture.rawText) {
+      try {
+        const conversation = JSON.parse(capture.rawText);
+        return getConversationTitle(conversation, '尚未取得標題');
+      } catch {
+        return '尚未取得標題';
+      }
+    }
+
+    return '尚未取得標題';
+  }
+
+  function tryGetTitleFromRawJson(rawText, conversationId) {
+    try {
+      const data = tryParseJson(rawText);
+      return getConversationTitle(data, conversationId || 'chatgpt-conversation');
+    } catch {
+      return conversationId || 'chatgpt-conversation';
+    }
+  }
+
+  function buildRawFilename(rawText, conversationId) {
+    const title = sanitizeFilenamePart(tryGetTitleFromRawJson(rawText, conversationId));
+    return `${title}-${getTimestampString()}.json`;
+  }
+
+  function buildHandoffFilename(rawText, conversationId) {
+    const title = sanitizeFilenamePart(tryGetTitleFromRawJson(rawText, conversationId));
+    return `${title}-${getTimestampString()}.handoff.json`;
+  }
+
+  /*
+   * 下載文字檔。
+   */
+  function downloadTextFile(text, filename, mimeType = 'application/json;charset=utf-8') {
+    const blob = new Blob([text], {
+      type: mimeType
+    });
+
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+
+    link.href = url;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+
+    link.remove();
+    URL.revokeObjectURL(url);
+  }
+
+  // ============================================================
+  // 四、捕捉與重新抓取 ChatGPT 原始 conversation JSON
+  // ============================================================
+
+  /*
+   * 判斷哪些 header 適合重用。
+   *
+   * 不重用的 header 類型：
+   *   - 瀏覽器禁止手動設定的 header。
+   *   - cookie / user-agent / referer 等敏感或不必要 header。
+   *   - sec-* 系列瀏覽器安全 header。
+   *
+   * cookie 不需要也不應該手動複製。
+   * 重抓時會使用 credentials: 'include'，讓瀏覽器自行處理同源 cookie。
+   */
+  function shouldReplayHeader(name) {
+    const lowerName = String(name || '').toLowerCase();
+
+    if (!lowerName) {
+      return false;
+    }
+
+    if (lowerName.startsWith('sec-')) {
+      return false;
+    }
+
+    const forbiddenOrUnhelpful = new Set([
+      'accept-encoding',
+      'access-control-request-headers',
+      'access-control-request-method',
+      'connection',
+      'content-length',
+      'cookie',
+      'cookie2',
+      'date',
+      'expect',
+      'host',
+      'keep-alive',
+      'origin',
+      'permissions-policy',
+      'priority',
+      'referer',
+      'te',
+      'trailer',
+      'transfer-encoding',
+      'upgrade',
+      'user-agent',
+      'via'
+    ]);
+
+    return !forbiddenOrUnhelpful.has(lowerName);
+  }
+
+  function copyHeadersFrom(headersLike, targetHeaders) {
+    if (!headersLike) {
+      return;
+    }
+
+    try {
+      const sourceHeaders = new Headers(headersLike);
+
+      sourceHeaders.forEach((value, key) => {
+        if (shouldReplayHeader(key)) {
+          targetHeaders.set(key, value);
+        }
+      });
+    } catch {
+      // 某些非標準 headers 物件可能無法被 Headers 建構式處理，忽略即可。
+    }
+  }
+
+  /*
+   * 從原始 fetch 呼叫中取出可安全重用的 headers。
+   */
+  function getReplayHeaders(input, init) {
+    const headers = new Headers();
+
+    if (input && typeof input === 'object' && 'headers' in input) {
+      copyHeadersFrom(input.headers, headers);
+    }
+
+    if (init && init.headers) {
+      copyHeadersFrom(init.headers, headers);
+    }
+
+    if (!headers.has('accept')) {
+      headers.set('accept', 'application/json');
+    }
+
+    return headers;
+  }
+
+  /*
+   * 記住某個 conversation_id 的重抓請求資訊。
+   */
+  function captureReplayRequest(conversationId, input, init) {
+    if (!conversationId) {
+      return;
+    }
+
+    const requestUrl = getRequestUrl(input);
+
+    if (!requestUrl) {
+      return;
+    }
+
+    replayRequestByConversationId.set(conversationId, {
+      url: new URL(requestUrl, location.origin).href,
+      headers: getReplayHeaders(input, init),
+      capturedAt: Date.now()
+    });
+  }
+
+  /*
+   * 把 raw JSON 暫存到記憶體。
+   */
+  function rememberRawConversation(conversationId, rawText) {
+    capturedRawByConversationId.set(conversationId, {
+      rawText,
+      capturedAt: Date.now()
+    });
+
+    logInfo('已捕捉 conversation JSON。', {
+      conversationId,
+      length: rawText.length
+    });
+
+    ensureButtonsSoon();
+  }
+
+  /*
+   * 快速判斷一段文字是否像完整 conversation JSON。
+   *
+   * 只接受包含：
+   *   - mapping
+   *   - current_node
+   *
+   * 的 JSON 物件。
+   */
+  function looksLikeConversationObject(rawText) {
+    const trimmed = String(rawText || '').trim();
+
+    if (!trimmed.startsWith('{')) {
+      return false;
+    }
+
+    try {
+      const data = JSON.parse(trimmed);
+
+      return Boolean(
+        data &&
+        typeof data === 'object' &&
+        typeof data.mapping === 'object' &&
+        typeof data.current_node === 'string'
+      );
+    } catch {
+      return false;
+    }
+  }
+
+  /*
+   * 解析並驗證 raw conversation JSON。
+   *
+   * 這裡會比對：
+   *   目前網址上的 conversation ID
+   *   raw JSON 內的 conversation_id
+   *
+   * 若不一致就停止下載，避免 SPA 切換對話時誤抓上一個對話。
+   */
+  function parseAndValidateRawConversation(rawText, expectedConversationId) {
+    let conversation;
+
+    try {
+      conversation = JSON.parse(rawText);
+    } catch (error) {
+      throw new Error(`raw JSON 解析失敗：${toErrorMessage(error)}`);
+    }
+
+    if (!conversation || typeof conversation !== 'object' || Array.isArray(conversation)) {
+      throw new Error('raw JSON 不是有效的 conversation 物件。');
+    }
+
+    if (!conversation.mapping || typeof conversation.mapping !== 'object' || Array.isArray(conversation.mapping)) {
+      throw new Error('raw JSON 不包含有效的 mapping 物件。');
+    }
+
+    if (typeof conversation.current_node !== 'string' || !conversation.current_node) {
+      throw new Error('raw JSON 不包含有效的 current_node。');
+    }
+
+    if (typeof conversation.conversation_id !== 'string' || !conversation.conversation_id) {
+      throw new Error('raw JSON 不包含有效的 conversation_id。');
+    }
+
+    if (expectedConversationId && conversation.conversation_id !== expectedConversationId) {
+      throw new Error(
+        '下載中止：目前網址的 conversation ID 與 raw JSON 內的 conversation_id 不一致。\n\n' +
+        `目前網址 ID：${expectedConversationId}\n` +
+        `raw JSON ID：${conversation.conversation_id}\n\n` +
+        '這通常表示頁面剛切換對話，或捕捉到舊對話資料。請稍等一秒後再試。'
+      );
+    }
+
+    return conversation;
+  }
+
+  /*
+   * 從 ChatGPT 自己成功取得的 response 複製一份 raw JSON。
+   *
+   * 使用 response.clone() 的理由：
+   *   原頁面仍要使用原本 response。
+   *   clone 後讀取副本，不會破壞 ChatGPT 本身的流程。
+   */
+  function captureConversationResponse(conversationId, response) {
+    if (!conversationId || !response || !response.ok) {
+      return;
+    }
+
+    const contentType = response.headers.get('content-type') || '';
+
+    if (!contentType.includes('application/json')) {
+      return;
+    }
+
+    const clonedResponse = response.clone();
+
+    window.setTimeout(() => {
+      clonedResponse
+        .text()
+        .then((rawText) => {
+          if (!looksLikeConversationObject(rawText)) {
+            return;
+          }
+
+          try {
+            parseAndValidateRawConversation(rawText, conversationId);
+          } catch {
+            return;
+          }
+
+          rememberRawConversation(conversationId, rawText);
+        })
+        .catch((error) => {
+          logWarn('捕捉 conversation JSON 失敗。', {
+            message: toErrorMessage(error)
+          });
+        });
+    }, 0);
+  }
+
+  /*
+   * 包裝 window.fetch。
+   *
+   * 用途：
+   *   - 觀察 ChatGPT 頁面自己發出的 conversation JSON 請求。
+   *   - 記住可重抓的請求資訊。
+   *   - 捕捉成功回應的 raw JSON。
+   *
+   * 這裡不會：
+   *   - 修改 ChatGPT 的請求內容。
+   *   - 阻擋原始請求。
+   *   - 把敏感資訊印出來。
+   */
+  function installFetchInterceptor() {
+    const originalFetch = window.fetch;
+
+    if (typeof originalFetch !== 'function') {
+      return;
+    }
+
+    if (originalFetch.__chatgptConversationHandoffExporterWrapped) {
+      return;
+    }
+
+    function interceptedFetch(input, init) {
+      const requestUrl = getRequestUrl(input);
+      const conversationId = getConversationIdFromExactApiUrl(requestUrl);
+
+      if (conversationId) {
+        captureReplayRequest(conversationId, input, init);
+      }
+
+      return originalFetch.apply(this, arguments).then((response) => {
+        if (conversationId) {
+          captureConversationResponse(conversationId, response);
+        }
+
+        return response;
+      });
+    }
+
+    interceptedFetch.__chatgptConversationHandoffExporterWrapped = true;
+    window.fetch = interceptedFetch;
+  }
+
+  /*
+   * 使用先前捕捉的 request context 即時重新抓最新 raw JSON。
+   *
+   * 這可避免使用者新增 / 編輯訊息後必須手動重新整理頁面。
+   */
+  async function refetchLatestConversationRaw(conversationId) {
+    const replayRequest = replayRequestByConversationId.get(conversationId);
+
+    if (!replayRequest) {
+      throw new Error(
+        '尚未捕捉到目前對話的原始請求資訊。\n\n' +
+        '請先讓目前對話內容載入完成；如果仍然失敗，請重新進入此對話頁再試一次。'
+      );
+    }
+
+    const response = await fetch(replayRequest.url, {
+      method: 'GET',
+      credentials: 'include',
+      cache: 'no-store',
+      headers: new Headers(replayRequest.headers)
+    });
+
+    if (!response.ok) {
+      throw new Error(`即時重新抓取失敗：HTTP ${response.status} ${response.statusText}`);
+    }
+
+    const contentType = response.headers.get('content-type') || '';
+
+    if (!contentType.includes('application/json')) {
+      throw new Error(
+        '即時重新抓取失敗：回應不是 JSON。\n\n' +
+        `Content-Type: ${contentType || '未知'}`
+      );
+    }
+
+    const rawText = await response.text();
+
+    if (!looksLikeConversationObject(rawText)) {
+      throw new Error(
+        '即時重新抓取失敗：回應不是完整 conversation JSON 物件。\n\n' +
+        `內容長度：${rawText ? rawText.length : 0}`
+      );
+    }
+
+    parseAndValidateRawConversation(rawText, conversationId);
+    rememberRawConversation(conversationId, rawText);
+
+    return rawText;
+  }
+
+  /*
+   * 取得最新 raw JSON。
+   *
+   * 優先順序：
+   *   1. 若已捕捉到可重抓 request context，直接重新抓最新版本。
+   *   2. 否則使用已捕捉的 raw JSON。
+   */
+  async function getLatestRawText(conversationId) {
+    const replayRequest = replayRequestByConversationId.get(conversationId);
+    const capture = capturedRawByConversationId.get(conversationId);
+
+    if (replayRequest) {
+      return refetchLatestConversationRaw(conversationId);
+    }
+
+    if (capture) {
+      parseAndValidateRawConversation(capture.rawText, conversationId);
+      return capture.rawText;
+    }
+
+    throw new Error(
+      '尚未捕捉到目前對話的 JSON。\n\n' +
+      '請等待對話內容載入完成後再按一次。'
+    );
+  }
+
+  /*
+   * 取得目前頁面的 conversation 狀態。
+   */
+  function getCurrentState() {
+    const conversationId = getConversationIdFromUrl();
+
+    if (!conversationId) {
+      return {
+        conversationId: null,
+        capture: null,
+        replayRequest: null
+      };
+    }
+
+    return {
+      conversationId,
+      capture: capturedRawByConversationId.get(conversationId) || null,
+      replayRequest: replayRequestByConversationId.get(conversationId) || null
+    };
+  }
+
+  // ============================================================
+  // 五、handoff JSON 轉換邏輯
+  // ============================================================
+
+  /*
+   * 將 ChatGPT content.parts 中的文字片段合併。
+   *
+   * 會排除：
+   *   - image_asset_pointer
+   *   - asset_pointer
+   *
+   * 避免把圖片 / 檔案資產指標塞進 handoff content。
+   */
+  function flattenTextLikeParts(parts) {
+    if (!Array.isArray(parts)) {
+      return '';
+    }
+
+    const texts = [];
+
+    for (const part of parts) {
+      if (typeof part === 'string') {
+        if (part.trim()) {
+          texts.push(part);
+        }
+
+        continue;
+      }
+
+      if (!part || typeof part !== 'object') {
+        continue;
+      }
+
+      const partContentType = part.content_type;
+
+      if (partContentType === 'image_asset_pointer' || partContentType === 'asset_pointer') {
+        continue;
+      }
+
+      if (typeof part.text === 'string' && part.text.trim()) {
+        texts.push(part.text);
+        continue;
+      }
+
+      if (typeof part.content === 'string' && part.content.trim()) {
+        texts.push(part.content);
+        continue;
+      }
+    }
+
+    return texts.join('\n');
+  }
+
+  /*
+   * 將 ChatGPT message.content 正規化成純文字。
+   */
+  function normalizeContentToText(content, role) {
+    if (!content || typeof content !== 'object') {
+      if (typeof content === 'string' && content.trim()) {
+        return content.trim();
+      }
+
+      return null;
+    }
+
+    const contentType = content.content_type;
+
+    if (EXCLUDED_CONTENT_TYPES.has(contentType)) {
+      return null;
+    }
+
+    /*
+     * assistant 的 code / execution_output / tether_browsing_display
+     * 通常是工具呼叫、中間輸出或瀏覽工具顯示資料。
+     */
+    if (
+      role === 'assistant' &&
+      ['code', 'execution_output', 'tether_browsing_display'].includes(contentType)
+    ) {
+      return null;
+    }
+
+    if (contentType === 'text' || contentType === 'multimodal_text') {
+      const text = flattenTextLikeParts(content.parts);
+      return text.trim() || null;
+    }
+
+    if (contentType === 'code' || contentType === 'execution_output') {
+      if (typeof content.text === 'string' && content.text.trim()) {
+        return content.text.trim();
+      }
+
+      return null;
+    }
+
+    if (contentType === 'tether_browsing_display') {
+      if (typeof content.summary === 'string' && content.summary.trim()) {
+        return content.summary.trim();
+      }
+
+      return null;
+    }
+
+    return null;
+  }
+
+  /*
+   * 移除 ChatGPT 內嵌引用標記。
+   */
+  function removeInlineMarks(text) {
+    return String(text || '')
+      .replace(INLINE_MARK_PATTERN, '')
+      .replace(/[ \t]+\n/g, '\n')
+      .replace(/\n{3,}/g, '\n\n')
+      .trim();
+  }
+
+  function looksLikeAssistantToolOperation(text) {
+    const stripped = String(text || '').trim();
+
+    if (!stripped) {
+      return false;
+    }
+
+    return ASSISTANT_TOOL_OPERATION_PATTERN.test(stripped);
+  }
+
+  /*
+   * 引用來源 attribution 可能是字串，也可能是物件。
+   */
+  function normalizeAttribution(attribution) {
+    if (attribution && typeof attribution === 'object') {
+      return attribution.name || attribution.display_name || attribution.url || null;
+    }
+
+    return typeof attribution === 'string' && attribution.trim() ? attribution : null;
+  }
+
+  function buildCiteSource(source) {
+    const rawPubDate =
+      typeof source.pub_date === 'string' && source.pub_date.trim()
+        ? source.pub_date
+        : typeof source.published_at === 'string' && source.published_at.trim()
+          ? source.published_at
+          : source.time;
+
+    return {
+      url: typeof source.url === 'string' ? source.url : null,
+      title: typeof source.title === 'string' ? source.title : null,
+      snippet: typeof source.snippet === 'string' ? source.snippet : null,
+      pub_date: toReadableTime(rawPubDate),
+      attribution: normalizeAttribution(source.attribution)
+    };
+  }
+
+  function citeSourceKey(source) {
+    return JSON.stringify([
+      source.url,
+      source.title,
+      source.snippet,
+      source.pub_date,
+      source.attribution
+    ]);
+  }
+
+  /*
+   * 去除重複引用來源。
+   */
+  function dedupeCiteSources(values) {
+    const result = [];
+    const seen = new Set();
+
+    for (const value of values) {
+      if (!value || typeof value !== 'object') {
+        continue;
+      }
+
+      const normalized = {
+        url: typeof value.url === 'string' && value.url.trim() ? value.url : null,
+        title: typeof value.title === 'string' && value.title.trim() ? value.title : null,
+        snippet: typeof value.snippet === 'string' && value.snippet.trim() ? value.snippet : null,
+        pub_date: toReadableTime(value.pub_date),
+        attribution:
+          typeof value.attribution === 'string' && value.attribution.trim()
+            ? value.attribution
+            : null
+      };
+
+      if (
+        normalized.url === null &&
+        normalized.title === null &&
+        normalized.snippet === null &&
+        normalized.pub_date === null &&
+        normalized.attribution === null
+      ) {
+        continue;
+      }
+
+      const key = citeSourceKey(normalized);
+
+      if (seen.has(key)) {
+        continue;
+      }
+
+      seen.add(key);
+      result.push(normalized);
+    }
+
+    return result;
+  }
+
+  /*
+   * 從 assistant 訊息 metadata 中抽出引用來源。
+   *
+   * 支援多種可能位置：
+   *   - metadata.content_references[].items
+   *   - metadata.content_references[].safe_urls
+   *   - metadata.search_result_groups[].entries
+   *   - metadata.citations
+   *   - metadata.safe_urls
+   */
+  function extractAssistantCiteSources(message) {
+    const metadata = message && typeof message.metadata === 'object' ? message.metadata : null;
+
+    if (!metadata) {
+      return [];
+    }
+
+    const sources = [];
+
+    if (Array.isArray(metadata.content_references)) {
+      for (const ref of metadata.content_references) {
+        if (!ref || typeof ref !== 'object') {
+          continue;
+        }
+
+        if (Array.isArray(ref.items)) {
+          for (const item of ref.items) {
+            if (item && typeof item === 'object') {
+              sources.push(buildCiteSource(item));
+            }
+          }
+        }
+
+        if (Array.isArray(ref.safe_urls)) {
+          for (const url of ref.safe_urls) {
+            if (typeof url === 'string') {
+              sources.push(buildCiteSource({ url }));
+            }
+          }
+        }
+      }
+    }
+
+    if (Array.isArray(metadata.search_result_groups)) {
+      for (const group of metadata.search_result_groups) {
+        if (!group || typeof group !== 'object' || !Array.isArray(group.entries)) {
+          continue;
+        }
+
+        for (const entry of group.entries) {
+          if (entry && typeof entry === 'object') {
+            sources.push(buildCiteSource(entry));
+          }
+        }
+      }
+    }
+
+    if (Array.isArray(metadata.citations)) {
+      for (const citation of metadata.citations) {
+        if (citation && typeof citation === 'object') {
+          sources.push(buildCiteSource(citation));
+        }
+      }
+    }
+
+    if (Array.isArray(metadata.safe_urls)) {
+      for (const url of metadata.safe_urls) {
+        if (typeof url === 'string') {
+          sources.push(buildCiteSource({ url }));
+        }
+      }
+    }
+
+    return dedupeCiteSources(sources);
+  }
+
+  function getMapping(conversation) {
+    const mapping = conversation.mapping;
+
+    if (!mapping || typeof mapping !== 'object' || Array.isArray(mapping)) {
+      throw new Error('conversation JSON 不包含有效的 mapping 物件。');
+    }
+
+    return mapping;
+  }
+
+  /*
+   * ChatGPT 原始 conversation JSON 是樹狀結構。
+   *
+   * current_node 表示目前 UI 採用的最後節點。
+   * 沿 parent 一路往上追，即可取得目前主分支。
+   */
+  function resolveMainPath(mapping, currentNode) {
+    if (!currentNode) {
+      return [];
+    }
+
+    const path = [];
+    const seen = new Set();
+    let nodeId = currentNode;
+
+    while (nodeId) {
+      if (seen.has(nodeId)) {
+        throw new Error(`偵測到循環 parent chain：${nodeId}`);
+      }
+
+      seen.add(nodeId);
+      path.push(nodeId);
+
+      const node = mapping[nodeId];
+
+      if (!node || typeof node !== 'object') {
+        break;
+      }
+
+      nodeId = typeof node.parent === 'string' && node.parent ? node.parent : null;
+    }
+
+    path.reverse();
+    return path;
+  }
+
+  /*
+   * 從一個 mapping node 中抽出 handoff message。
+   */
+  function extractMessageItem(node) {
+    const message = node && typeof node.message === 'object' ? node.message : null;
+
+    if (!message) {
+      return null;
+    }
+
+    const author = message.author && typeof message.author === 'object' ? message.author : null;
+
+    if (!author) {
+      return null;
+    }
+
+    const role = author.role;
+
+    if (!ALLOWED_ROLES.has(role)) {
+      return null;
+    }
+
+    const metadata = message.metadata && typeof message.metadata === 'object' ? message.metadata : null;
+
+    if (metadata && metadata.is_visually_hidden_from_conversation === true) {
+      return null;
+    }
+
+    const text = normalizeContentToText(message.content, role);
+
+    if (!text) {
+      return null;
+    }
+
+    const item = {
+      role,
+      content: text
+    };
+
+    if (role === 'assistant') {
+      item.content = removeInlineMarks(text);
+
+      if (!item.content) {
+        return null;
+      }
+
+      if (looksLikeAssistantToolOperation(item.content)) {
+        return null;
+      }
+
+      const citeSources = extractAssistantCiteSources(message);
+
+      if (citeSources.length > 0) {
+        item.cite_sources = citeSources;
+      }
+    }
+
+    return item;
+  }
+
+  /*
+   * 建立 handoff JSON。
+   *
+   * 輸出格式：
+   *   {
+   *     title,
+   *     create_time,
+   *     update_time,
+   *     conversation_id,
+   *     messages: [
+   *       { id: "u01", role: "user", content: "..." },
+   *       { id: "a01", role: "assistant", content: "...", cite_sources: [...] }
+   *     ]
+   *   }
+   */
+  function buildHandoff(conversation) {
+    const mapping = getMapping(conversation);
+    const currentNode = conversation.current_node;
+    const pathNodeIds = resolveMainPath(mapping, currentNode);
+
+    const messages = [];
+    let userIndex = 0;
+    let assistantIndex = 0;
+
+    for (const nodeId of pathNodeIds) {
+      const node = mapping[nodeId];
+
+      if (!node || typeof node !== 'object') {
+        continue;
+      }
+
+      const item = extractMessageItem(node);
+
+      if (!item) {
+        continue;
+      }
+
+      let messageId;
+
+      if (item.role === 'user') {
+        userIndex += 1;
+        messageId = `u${String(userIndex).padStart(2, '0')}`;
+      } else if (item.role === 'assistant') {
+        assistantIndex += 1;
+        messageId = `a${String(assistantIndex).padStart(2, '0')}`;
+      } else {
+        continue;
+      }
+
+      messages.push({
+        id: messageId,
+        ...item
+      });
+    }
+
+    return {
+      title: conversation.title ?? null,
+      create_time: toReadableTime(conversation.create_time),
+      update_time: toReadableTime(conversation.update_time),
+      conversation_id: conversation.conversation_id ?? null,
+      messages
+    };
+  }
+
+  /*
+   * 檢查 handoff 轉換結果是否合理。
+   *
+   * 若檢查失敗，代表不應該下載，避免使用者拿到空或錯誤的 handoff。
+   */
+  function validateHandoffOrThrow(handoff, sourceConversation) {
+    const problems = [];
+
+    if (!handoff || typeof handoff !== 'object') {
+      problems.push('handoff 不是有效物件。');
+    }
+
+    if (!Array.isArray(handoff.messages)) {
+      problems.push('handoff.messages 不是陣列。');
+    } else {
+      if (handoff.messages.length === 0) {
+        problems.push('handoff.messages 為空。');
+      }
+
+      if (!handoff.messages.some((message) => message && message.role === 'user')) {
+        problems.push('handoff.messages 不包含任何 user 訊息。');
+      }
+
+      for (const [index, message] of handoff.messages.entries()) {
+        if (!message || typeof message !== 'object') {
+          problems.push(`第 ${index + 1} 則訊息不是有效物件。`);
+          continue;
+        }
+
+        if (typeof message.id !== 'string' || !message.id) {
+          problems.push(`第 ${index + 1} 則訊息缺少 id。`);
+        }
+
+        if (message.role !== 'user' && message.role !== 'assistant') {
+          problems.push(`第 ${index + 1} 則訊息 role 不合法：${String(message.role)}`);
+        }
+
+        if (typeof message.content !== 'string' || !message.content.trim()) {
+          problems.push(`第 ${index + 1} 則訊息 content 為空。`);
+        }
+      }
+    }
+
+    if (!handoff.conversation_id) {
+      problems.push('handoff 缺少 conversation_id。');
+    }
+
+    if (
+      sourceConversation &&
+      sourceConversation.conversation_id &&
+      handoff.conversation_id !== sourceConversation.conversation_id
+    ) {
+      problems.push(
+        `handoff.conversation_id 與 raw JSON 不一致：${handoff.conversation_id} !== ${sourceConversation.conversation_id}`
+      );
+    }
+
+    if (problems.length > 0) {
+      throw new Error(`交接 JSON 轉換結果檢查失敗：\n\n- ${problems.join('\n- ')}`);
+    }
+  }
+
+  // ============================================================
+  // 六、按鈕 UI、tooltip 與頁面導航處理
+  // ============================================================
+
+  function setButtonText(buttonId, text) {
+    const button = document.querySelector(`#${buttonId}`);
+
+    if (!button) {
+      return;
+    }
+
+    const label = button.querySelector('[data-export-label]');
+
+    if (label) {
+      label.textContent = text;
+    }
+  }
+
+  function setButtonTooltip(buttonId, text) {
+    const button = document.querySelector(`#${buttonId}`);
+
+    if (!button) {
+      return;
+    }
+
+    button.title = text;
+  }
+
+  function setButtonBusy(buttonId, isBusy) {
+    const button = document.querySelector(`#${buttonId}`);
+
+    if (!button) {
+      return;
+    }
+
+    button.disabled = isBusy;
+    button.style.opacity = isBusy ? '0.65' : '';
+    button.style.cursor = isBusy ? 'wait' : '';
+  }
+
+  function setAllButtonsBusy(isBusy) {
+    setButtonBusy(RAW_BUTTON_ID, isBusy);
+    setButtonBusy(HANDOFF_BUTTON_ID, isBusy);
+  }
+
+  /*
+   * 建立按鈕 tooltip。
+   *
+   * 兩個按鈕會使用不同 actionName，
+   * 避免 title 看起來像共用同一段說明。
+   */
+  function buildBaseTooltip({ actionName, conversationId, capture, replayRequest }) {
+    const title = conversationId ? getKnownConversationTitle(conversationId) : '尚未取得標題';
+    const lines = [
+      actionName,
+      `對話標題：${title}`,
+      `Conversation ID：${conversationId || '尚未取得'}`
+    ];
+
+    if (replayRequest) {
+      lines.push(`最近一次捕捉請求資訊：${getDisplayDateTime(new Date(replayRequest.capturedAt))}`);
+    } else {
+      lines.push('最近一次捕捉請求資訊：尚未捕捉');
+    }
+
+    if (capture) {
+      lines.push(`最近一次捕捉 JSON：${getDisplayDateTime(new Date(capture.capturedAt))}`);
+    } else {
+      lines.push('最近一次捕捉 JSON：尚未捕捉');
+    }
+
+    return lines.join('\n');
+  }
+
+  /*
+   * 根據目前狀態更新按鈕文字與 tooltip。
+   */
+  function updateButtonState() {
+    const { conversationId, capture, replayRequest } = getCurrentState();
+
+    if (!isConversationPage() || !conversationId) {
+      setButtonText(RAW_BUTTON_ID, '下載原始 JSON');
+      setButtonText(HANDOFF_BUTTON_ID, '下載交接 JSON');
+      setButtonTooltip(RAW_BUTTON_ID, '');
+      setButtonTooltip(HANDOFF_BUTTON_ID, '');
+      setAllButtonsBusy(false);
+      return;
+    }
+
+    if (replayRequest || capture) {
+      setButtonText(RAW_BUTTON_ID, '下載原始 JSON');
+      setButtonText(HANDOFF_BUTTON_ID, '下載交接 JSON');
+
+      setButtonTooltip(
+        RAW_BUTTON_ID,
+        buildBaseTooltip({
+          actionName: '下載目前對話的原始 raw conversation JSON',
+          conversationId,
+          capture,
+          replayRequest
+        })
+      );
+
+      setButtonTooltip(
+        HANDOFF_BUTTON_ID,
+        buildBaseTooltip({
+          actionName: '產出並下載目前對話的交接 handoff JSON',
+          conversationId,
+          capture,
+          replayRequest
+        })
+      );
+
+      return;
+    }
+
+    setButtonText(RAW_BUTTON_ID, '等待 JSON');
+    setButtonText(HANDOFF_BUTTON_ID, '等待交接 JSON');
+
+    setButtonTooltip(
+      RAW_BUTTON_ID,
+      [
+        '下載目前對話的原始 raw conversation JSON',
+        '對話標題：尚未取得標題',
+        `Conversation ID：${conversationId}`,
+        '尚未捕捉到目前對話 JSON。請等待對話內容載入完成。'
+      ].join('\n')
+    );
+
+    setButtonTooltip(
+      HANDOFF_BUTTON_ID,
+      [
+        '產出並下載目前對話的交接 handoff JSON',
+        '對話標題：尚未取得標題',
+        `Conversation ID：${conversationId}`,
+        '尚未捕捉到目前對話 JSON。請等待對話內容載入完成。'
+      ].join('\n')
+    );
+  }
+
+  function removeButtonsIfNeeded() {
+    const rawButton = document.querySelector(`#${RAW_BUTTON_ID}`);
+    const handoffButton = document.querySelector(`#${HANDOFF_BUTTON_ID}`);
+
+    if (rawButton) {
+      rawButton.remove();
+    }
+
+    if (handoffButton) {
+      handoffButton.remove();
+    }
+  }
+
+  /*
+   * 建立和 ChatGPT header action 風格接近的按鈕。
+   */
+  function createHeaderButton({ id, label, ariaLabel, testId, iconSvg, onClick }) {
+    const button = document.createElement('button');
+
+    button.id = id;
+    button.type = 'button';
+    button.setAttribute('aria-label', ariaLabel);
+    button.setAttribute('data-testid', testId);
+
+    /*
+     * 這裡沿用 ChatGPT 既有按鈕 class，讓樣式與「分享」按鈕一致。
+     * 若 ChatGPT 未來改 class，按鈕可能仍存在，但外觀可能需要調整。
+     */
+    button.className = [
+      'btn',
+      'relative',
+      'group-focus-within/dialog:focus-visible:[outline-width:1.5px]',
+      'group-focus-within/dialog:focus-visible:[outline-offset:2.5px]',
+      'group-focus-within/dialog:focus-visible:[outline-style:solid]',
+      'group-focus-within/dialog:focus-visible:[outline-color:var(--text-primary)]',
+      'btn-ghost',
+      'text-token-text-primary',
+      'hover:bg-token-surface-hover',
+      'keyboard-focused:bg-token-surface-hover',
+      'rounded-lg',
+      'max-sm:hidden'
+    ].join(' ');
+
+    button.innerHTML = `
+      <div class="flex w-full items-center justify-center gap-1.5">
+        ${iconSvg || ''}
+        <span data-export-label>${label}</span>
+      </div>
+    `;
+
+    /*
+     * 滑鼠移入或鍵盤 focus 時重新整理 tooltip。
+     * 這能讓剛改名的對話標題較快反映到 title。
+     */
+    button.addEventListener('mouseenter', () => {
+      updateButtonState();
+    });
+
+    button.addEventListener('focus', () => {
+      updateButtonState();
+    });
+
+    button.addEventListener('click', onClick);
+
+    return button;
+  }
+
+  /*
+   * 點擊「下載原始 JSON」。
+   *
+   * raw JSON 會輸出為 4 空白縮排，方便閱讀與版本管理。
+   */
+  async function handleDownloadRawClick() {
+    const { conversationId } = getCurrentState();
+
+    if (!conversationId) {
+      alert('找不到 conversation ID。請確認目前頁面是 ChatGPT 對話頁。');
+      return;
+    }
+
+    try {
+      setAllButtonsBusy(true);
+      setButtonText(RAW_BUTTON_ID, '抓取中…');
+
+      const rawText = await getLatestRawText(conversationId);
+      const conversation = parseAndValidateRawConversation(rawText, conversationId);
+      const prettyRawText = JSON.stringify(conversation, null, 4);
+      const filename = buildRawFilename(rawText, conversationId);
+
+      downloadTextFile(prettyRawText, filename);
+    } catch (error) {
+      logError('下載原始 JSON 失敗。', error);
+      showErrorAlert(error);
+    } finally {
+      setAllButtonsBusy(false);
+      updateButtonState();
+    }
+  }
+
+  /*
+   * 點擊「下載交接 JSON」。
+   *
+   * 流程：
+   *   1. 取得最新 raw JSON。
+   *   2. 驗證 raw JSON 與目前 conversation ID 一致。
+   *   3. 轉換成 handoff JSON。
+   *   4. 檢查 handoff 結果合理性。
+   *   5. 以 4 空白縮排下載。
+   */
+  async function handleDownloadHandoffClick() {
+    const { conversationId } = getCurrentState();
+
+    if (!conversationId) {
+      alert('找不到 conversation ID。請確認目前頁面是 ChatGPT 對話頁。');
+      return;
+    }
+
+    try {
+      setAllButtonsBusy(true);
+      setButtonText(HANDOFF_BUTTON_ID, '產出中…');
+
+      const rawText = await getLatestRawText(conversationId);
+      const conversation = parseAndValidateRawConversation(rawText, conversationId);
+      const handoff = buildHandoff(conversation);
+
+      validateHandoffOrThrow(handoff, conversation);
+
+      const handoffText = JSON.stringify(handoff, null, 4);
+      const filename = buildHandoffFilename(rawText, conversationId);
+
+      downloadTextFile(handoffText, filename);
+    } catch (error) {
+      logError('下載交接 JSON 失敗。', error);
+      showErrorAlert(error);
+    } finally {
+      setAllButtonsBusy(false);
+      updateButtonState();
+    }
+  }
+
+  /*
+   * 將兩個按鈕插入 ChatGPT 對話頁 header。
+   *
+   * 插入位置：
+   *   #conversation-header-actions 裡的「分享」按鈕旁邊。
+   */
+  function insertButtonsOnce() {
+    if (!isConversationPage()) {
+      removeButtonsIfNeeded();
+      return;
+    }
+
+    const rawButtonExists = Boolean(document.querySelector(`#${RAW_BUTTON_ID}`));
+    const handoffButtonExists = Boolean(document.querySelector(`#${HANDOFF_BUTTON_ID}`));
+
+    if (rawButtonExists && handoffButtonExists) {
+      updateButtonState();
+      return;
+    }
+
+    const headerActions = document.querySelector('#conversation-header-actions');
+
+    if (!headerActions) {
+      return;
+    }
+
+    if (!rawButtonExists) {
+      const rawButton = createHeaderButton({
+        id: RAW_BUTTON_ID,
+        label: '下載原始 JSON',
+        ariaLabel: '下載目前對話原始 JSON',
+        testId: 'raw-json-export-button',
+        iconSvg: RAW_JSON_ICON_SVG,
+        onClick: handleDownloadRawClick
+      });
+
+      const shareButton = headerActions.querySelector('[data-testid="share-chat-button"]');
+
+      if (shareButton) {
+        shareButton.insertAdjacentElement('afterend', rawButton);
+      } else {
+        headerActions.prepend(rawButton);
+      }
+    }
+
+    if (!handoffButtonExists) {
+      const handoffButton = createHeaderButton({
+        id: HANDOFF_BUTTON_ID,
+        label: '下載交接 JSON',
+        ariaLabel: '產出並下載目前對話交接 JSON',
+        testId: 'handoff-json-export-button',
+        iconSvg: HANDOFF_ICON_SVG,
+        onClick: handleDownloadHandoffClick
+      });
+
+      const rawButton = document.querySelector(`#${RAW_BUTTON_ID}`);
+
+      if (rawButton) {
+        rawButton.insertAdjacentElement('afterend', handoffButton);
+      } else {
+        headerActions.prepend(handoffButton);
+      }
+    }
+
+    updateButtonState();
+  }
+
+  /*
+   * 節流插入按鈕。
+   *
+   * 避免 ChatGPT DOM 頻繁變動時，每次都立即查 DOM。
+   */
+  function ensureButtonsSoon() {
+    if (ensureTimer !== null) {
+      return;
+    }
+
+    ensureTimer = window.setTimeout(() => {
+      ensureTimer = null;
+      insertButtonsOnce();
+    }, 300);
+  }
+
+  /*
+   * 偵測 SPA path 是否改變。
+   */
+  function handleRouteMaybeChanged() {
+    if (location.pathname === lastPathname) {
+      return;
+    }
+
+    lastPathname = location.pathname;
+    ensureButtonsSoon();
+  }
+
+  /*
+   * 包裝 history.pushState / replaceState。
+   *
+   * ChatGPT 是 SPA，切換對話時不一定重新載入整頁。
+   * 因此需要監聽路由變化，才能在新對話頁補上按鈕。
+   */
+  function installHistoryListener() {
+    const originalPushState = history.pushState;
+    const originalReplaceState = history.replaceState;
+
+    history.pushState = function () {
+      const result = originalPushState.apply(this, arguments);
+      ensureButtonsSoon();
+      return result;
+    };
+
+    history.replaceState = function () {
+      const result = originalReplaceState.apply(this, arguments);
+      ensureButtonsSoon();
+      return result;
+    };
+
+    window.addEventListener('popstate', () => {
+      ensureButtonsSoon();
+    });
+  }
+
+  /*
+   * 低頻輪詢。
+   *
+   * 用途：
+   *   - 補救某些 React 重繪導致按鈕消失的情況。
+   *   - 確認非對話頁時移除按鈕。
+   *
+   * 頻率：
+   *   每秒一次，且主要只做輕量檢查。
+   */
+  function startLightPolling() {
+    window.setInterval(() => {
+      handleRouteMaybeChanged();
+
+      if (isConversationPage()) {
+        insertButtonsOnce();
+      } else {
+        removeButtonsIfNeeded();
+      }
+    }, 1000);
+  }
+
+  /*
+   * 監聽 document.title 變化。
+   *
+   * 使用者修改對話標題後，ChatGPT 可能會更新 document.title。
+   * 此時重新整理 tooltip，使按鈕 title 顯示較新的對話標題。
+   */
+  function installTitleObserver() {
+    const titleElement = document.querySelector('title');
+
+    if (!titleElement) {
+      return;
+    }
+
+    const observer = new MutationObserver(() => {
+      ensureButtonsSoon();
+    });
+
+    observer.observe(titleElement, {
+      childList: true,
+      subtree: true,
+      characterData: true
+    });
+  }
+
+  /*
+   * 啟動 UI 相關邏輯。
+   */
+  function startUi() {
+    if (uiStarted) {
+      return;
+    }
+
+    uiStarted = true;
+
+    installHistoryListener();
+    installTitleObserver();
+    ensureButtonsSoon();
+    startLightPolling();
+  }
+
+  // ============================================================
+  // 七、啟動腳本
+  // ============================================================
+
+  /*
+   * 越早包裝 fetch，越有機會捕捉到 ChatGPT 載入對話時的原始 JSON。
+   *
+   * UI 插入則等 DOM 可用後再開始。
+   */
+  installFetchInterceptor();
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', startUi, { once: true });
+  } else {
+    startUi();
+  }
+})();
