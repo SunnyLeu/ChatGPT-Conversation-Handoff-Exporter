@@ -45,22 +45,15 @@ https://raw.githubusercontent.com/SunnyLeu/ChatGPT-Conversation-Handoff-Exporter
 
 ## 自動更新
 
-本腳本已設定 Tampermonkey metadata：
+若透過 Raw URL 安裝，Tampermonkey 可依照腳本中的 `@updateURL` / `@downloadURL` 檢查遠端版本。
 
-```javascript
-// @updateURL    https://raw.githubusercontent.com/SunnyLeu/ChatGPT-Conversation-Handoff-Exporter/main/chatgpt-conversation-handoff-exporter.user.js
-// @downloadURL  https://raw.githubusercontent.com/SunnyLeu/ChatGPT-Conversation-Handoff-Exporter/main/chatgpt-conversation-handoff-exporter.user.js
-```
-
-若使用 Raw URL 安裝，Tampermonkey 可依照 `@version` 檢查更新。
-
-發布新版時，請記得遞增 `@version`，例如：
+腳本目前使用的更新來源為：
 
 ```text
-1.0.2 → 1.0.3
+https://raw.githubusercontent.com/SunnyLeu/ChatGPT-Conversation-Handoff-Exporter/main/chatgpt-conversation-handoff-exporter.user.js
 ```
 
-若版本號沒有變，Tampermonkey 通常不會把遠端腳本判定為新版。
+Tampermonkey 會依照其自身設定定期檢查更新；也可以在 Tampermonkey 管理頁中手動檢查 userscript 更新。
 
 ## 使用方式
 
