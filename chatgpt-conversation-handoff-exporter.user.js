@@ -2,7 +2,7 @@
 // @name         ChatGPT 對話 JSON 與交接檔匯出工具
 // @name:en      ChatGPT Conversation Handoff Exporter
 // @namespace    https://github.com/SunnyLeu/ChatGPT-Conversation-Handoff-Exporter
-// @version      1.0.1
+// @version      1.0.2
 // @description  在 ChatGPT 對話頁新增按鈕，可下載目前對話的格式化原始 JSON，或直接產出精簡交接用 handoff JSON。
 // @description:en Export the current ChatGPT conversation as formatted raw JSON or compact handoff JSON.
 // @author       SunnyLeu
@@ -60,7 +60,7 @@
    *   - 多次包裝 window.fetch
    *   - 重複的 timer / listener
    */
-  const INSTALL_FLAG = '__chatgptConversationHandoffExporterInstalled_v101';
+  const INSTALL_FLAG = '__chatgptConversationHandoffExporterInstalled_v102';
 
   /*
    * 兩個按鈕的 DOM id。
@@ -118,6 +118,27 @@
    *   - 實際重抓時使用 credentials: 'include'，讓瀏覽器自行處理同源驗證。
    */
   const replayRequestByConversationId = new Map();
+
+  /*
+   * latestReplayRequestTemplate：
+   *   保存最近一次可用的 ChatGPT backend API 請求樣板。
+   *
+   * 用途：
+   *   新對話剛建立完成時，ChatGPT 不一定會立刻發出
+   *   /backend-api/conversation/{conversation_id} 這個完整對話 JSON 請求。
+   *
+   *   但新對話送出訊息或接收回覆時，通常仍會呼叫其他 /backend-api/...
+   *   endpoint。這些同源請求可提供匯出時重新抓取 JSON 所需的安全
+   *   headers 樣板。
+   *
+   * 注意：
+   *   - 這不是背景補抓。
+   *   - 不會主動定時打 API。
+   *   - 只有使用者按下匯出按鈕時才會用它抓最新 JSON。
+   *   - 不保存 cookie。
+   *   - 不輸出 headers。
+   */
+  let latestReplayRequestTemplate = null;
 
   /*
    * SPA 導航與 UI 插入控制用狀態。
@@ -284,6 +305,12 @@
     return match ? decodeURIComponent(match[1]) : null;
   }
 
+  function looksLikeUuid(value) {
+    return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
+      String(value || '')
+    );
+  }
+
   /*
    * 從 ChatGPT 原始 conversation endpoint 取得 conversation ID。
    *
@@ -293,16 +320,82 @@
    * 不接受：
    *   /backend-api/conversation/{conversation_id}/...
    *
-   * 這樣可以避免誤捕捉子路徑請求，導致重抓時拿到錯的 JSON。
+   * 這樣可以避免把 stream_status、textdocs 等子路徑回應誤認為 raw conversation JSON。
    */
   function getConversationIdFromExactApiUrl(url) {
     try {
       const parsedUrl = new URL(url, location.origin);
       const match = parsedUrl.pathname.match(/^\/backend-api\/conversation\/([^/]+)\/?$/);
 
-      return match ? decodeURIComponent(match[1]) : null;
+      if (!match) {
+        return null;
+      }
+
+      const conversationId = decodeURIComponent(match[1]);
+      return looksLikeUuid(conversationId) ? conversationId : null;
     } catch {
       return null;
+    }
+  }
+
+  /*
+   * 從 conversation 相關子路徑取得 conversation ID。
+   *
+   * 新對話完成後，ChatGPT 常見請求可能是：
+   *   /backend-api/conversation/{conversation_id}/stream_status
+   *   /backend-api/conversation/{conversation_id}/textdocs
+   *
+   * 這些不是 raw conversation JSON，但它們帶有目前 conversation ID，
+   * 可以作為重新抓取 raw JSON 時的 request context 來源。
+   */
+  function getConversationIdFromScopedApiUrl(url) {
+    try {
+      const parsedUrl = new URL(url, location.origin);
+      const match = parsedUrl.pathname.match(/^\/backend-api\/conversation\/([^/]+)(?:\/|$)/);
+
+      if (!match) {
+        return null;
+      }
+
+      const conversationId = decodeURIComponent(match[1]);
+      return looksLikeUuid(conversationId) ? conversationId : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /*
+   * 判斷是否為可用來建立請求樣板的 ChatGPT backend API 請求。
+   *
+   * 這個判斷刻意比 conversation endpoint 寬：
+   *   - 新對話送出訊息時，不一定會打完整 conversation JSON endpoint。
+   *   - 但只要有其他 /backend-api/... 請求，就可能帶有重新抓取 JSON 需要的 headers。
+   *
+   * 這裡只保存安全篩選後的 headers，不保存 body、cookie 或回應內容。
+   */
+  function isReusableBackendApiRequest(url) {
+    try {
+      const parsedUrl = new URL(url, location.origin);
+
+      if (parsedUrl.origin !== location.origin) {
+        return false;
+      }
+
+      if (!parsedUrl.pathname.startsWith('/backend-api/')) {
+        return false;
+      }
+
+      /*
+       * estuary/public_content 之類資產請求與匯出 conversation JSON 關聯較低，
+       * 不拿來當 request template。
+       */
+      if (parsedUrl.pathname.includes('/public_content/')) {
+        return false;
+      }
+
+      return true;
+    } catch {
+      return false;
     }
   }
 
@@ -552,13 +645,13 @@
     if (capture && capture.rawText) {
       try {
         const conversation = JSON.parse(capture.rawText);
-        return getConversationTitle(conversation, '尚未取得標題');
+        return getConversationTitle(conversation, '');
       } catch {
-        return '尚未取得標題';
+        return '';
       }
     }
 
-    return '尚未取得標題';
+    return '';
   }
 
   function tryGetTitleFromRawJson(rawText, conversationId) {
@@ -692,6 +785,29 @@
     return headers;
   }
 
+  function hasReusableAuthHeaders(headers) {
+    return headers.has('authorization') && headers.has('x-oai-is');
+  }
+
+  /*
+   * 保存最近一次 backend API 請求樣板。
+   *
+   * 這個樣板只在使用者按下匯出按鈕時使用，
+   * 用來補足目前對話尚未產生專屬 raw JSON request context 的情況。
+   */
+  function captureReplayTemplate(input, init) {
+    const headers = getReplayHeaders(input, init);
+
+    if (!hasReusableAuthHeaders(headers)) {
+      return;
+    }
+
+    latestReplayRequestTemplate = {
+      headers,
+      capturedAt: Date.now()
+    };
+  }
+
   /*
    * 記住某個 conversation_id 的重抓請求資訊。
    */
@@ -706,11 +822,24 @@
       return;
     }
 
-    replayRequestByConversationId.set(conversationId, {
+    const headers = getReplayHeaders(input, init);
+
+    if (!hasReusableAuthHeaders(headers)) {
+      return;
+    }
+
+    const replayRequest = {
       url: new URL(requestUrl, location.origin).href,
-      headers: getReplayHeaders(input, init),
+      headers,
       capturedAt: Date.now()
-    });
+    };
+
+    replayRequestByConversationId.set(conversationId, replayRequest);
+
+    latestReplayRequestTemplate = {
+      headers: new Headers(replayRequest.headers),
+      capturedAt: replayRequest.capturedAt
+    };
   }
 
   /*
@@ -876,15 +1005,20 @@
 
     function interceptedFetch(input, init) {
       const requestUrl = getRequestUrl(input);
-      const conversationId = getConversationIdFromExactApiUrl(requestUrl);
+      const exactConversationId = getConversationIdFromExactApiUrl(requestUrl);
+      const scopedConversationId = getConversationIdFromScopedApiUrl(requestUrl);
 
-      if (conversationId) {
-        captureReplayRequest(conversationId, input, init);
+      if (isReusableBackendApiRequest(requestUrl)) {
+        captureReplayTemplate(input, init);
+      }
+
+      if (scopedConversationId) {
+        captureReplayRequest(scopedConversationId, input, init);
       }
 
       return originalFetch.apply(this, arguments).then((response) => {
-        if (conversationId) {
-          captureConversationResponse(conversationId, response);
+        if (exactConversationId) {
+          captureConversationResponse(exactConversationId, response);
         }
 
         return response;
@@ -896,19 +1030,89 @@
   }
 
   /*
+   * 建立目前 conversation ID 專用的 conversation endpoint。
+   */
+  function buildConversationApiUrl(conversationId) {
+    return new URL(
+      `/backend-api/conversation/${encodeURIComponent(conversationId)}`,
+      location.origin
+    ).href;
+  }
+
+  /*
+   * 將可重用 headers 調整成目前 conversation endpoint 專用。
+   *
+   * 某些 ChatGPT backend 請求會帶有 x-openai-target-path /
+   * x-openai-target-route 這類路由提示 header。
+   *
+   * 若直接重用其他 endpoint 的 request template，這些 header 可能仍指向
+   * 原本的 API 路徑，導致實際請求 URL 與 target headers 不一致。
+   *
+   * 因此在按下匯出按鈕、準備抓目前 conversation JSON 時，
+   * 需要把它們改成目前 conversation ID 對應的 endpoint。
+   */
+  function applyConversationTargetHeaders(headers, conversationId) {
+    const targetPath = `/backend-api/conversation/${encodeURIComponent(conversationId)}`;
+
+    headers.set('accept', 'application/json');
+    headers.set('x-openai-target-path', targetPath);
+    headers.set('x-openai-target-route', '/backend-api/conversation/{conversation_id}');
+
+    /*
+     * GET 請求不需要 content-type。
+     * 若 request template 來自 POST endpoint，留下 content-type 可能造成誤導。
+     */
+    headers.delete('content-type');
+
+    return headers;
+  }
+
+  /*
+   * 取得目前 conversation ID 可用的重抓請求資訊。
+   *
+   * 優先使用此 conversation ID 專屬 request context。
+   * 若沒有，改用最近一次 conversation API 請求樣板。
+   *
+   * 這個函式只在使用者按下匯出按鈕後的抓取流程中使用。
+   */
+  function getReplayRequestForConversation(conversationId) {
+    const replayRequest = replayRequestByConversationId.get(conversationId);
+
+    if (replayRequest) {
+      return {
+        url: buildConversationApiUrl(conversationId),
+        headers: applyConversationTargetHeaders(new Headers(replayRequest.headers), conversationId),
+        capturedAt: replayRequest.capturedAt
+      };
+    }
+
+    if (!latestReplayRequestTemplate) {
+      return null;
+    }
+
+    return {
+      url: buildConversationApiUrl(conversationId),
+      headers: applyConversationTargetHeaders(new Headers(latestReplayRequestTemplate.headers), conversationId),
+      capturedAt: latestReplayRequestTemplate.capturedAt
+    };
+  }
+
+  /*
    * 使用先前捕捉的 request context 即時重新抓最新 raw JSON。
    *
    * 這可避免使用者新增 / 編輯訊息後必須手動重新整理頁面。
    */
   async function refetchLatestConversationRaw(conversationId) {
-    const replayRequest = replayRequestByConversationId.get(conversationId);
+    const replayRequest = getReplayRequestForConversation(conversationId);
 
     if (!replayRequest) {
       throw new Error(
-        '尚未捕捉到目前對話的原始請求資訊。\n\n' +
-        '請先讓目前對話內容載入完成；如果仍然失敗，請重新進入此對話頁再試一次。'
+        '目前無法取得此對話的 JSON 請求資訊。\n\n' +
+        '請確認對話內容已載入完成，或重新進入此對話頁後再試一次。'
       );
     }
+
+    replayRequestByConversationId.set(conversationId, replayRequest);
 
     const response = await fetch(replayRequest.url, {
       method: 'GET',
@@ -966,8 +1170,8 @@
     }
 
     throw new Error(
-      '目前尚未取得此對話的 JSON 請求資訊。\n\n' +
-      '請確認目前對話內容已載入完成，或重新進入此對話頁後再試一次。'
+      '目前無法取得此對話的 JSON 請求資訊。\n\n' +
+      '請確認對話內容已載入完成，或重新進入此對話頁後再試一次。'
     );
   }
 
@@ -1563,23 +1767,23 @@
    * 避免 title 看起來像共用同一段說明。
    */
   function buildBaseTooltip({ actionName, conversationId, capture, replayRequest }) {
-    const title = conversationId ? getKnownConversationTitle(conversationId) : '尚未取得標題';
-    const lines = [
-      actionName,
-      `對話標題：${title}`,
-      `Conversation ID：${conversationId || '尚未取得'}`
-    ];
+    const title = conversationId ? getKnownConversationTitle(conversationId) : '';
+    const lines = [actionName];
+
+    if (title) {
+      lines.push(`對話標題：${title}`);
+    }
+
+    if (conversationId) {
+      lines.push(`Conversation ID：${conversationId}`);
+    }
 
     if (replayRequest) {
       lines.push(`最近一次捕捉請求資訊：${getDisplayDateTime(new Date(replayRequest.capturedAt))}`);
-    } else {
-      lines.push('最近一次捕捉請求資訊：尚未捕捉');
     }
 
     if (capture) {
       lines.push(`最近一次捕捉 JSON：${getDisplayDateTime(new Date(capture.capturedAt))}`);
-    } else {
-      lines.push('最近一次捕捉 JSON：尚未捕捉');
     }
 
     return lines.join('\n');
@@ -1606,13 +1810,8 @@
     setButtonText(RAW_BUTTON_ID, '下載原始 JSON');
     setButtonText(HANDOFF_BUTTON_ID, '下載交接 JSON');
 
-    const rawActionName = replayRequest || capture
-      ? '下載目前對話的原始 raw conversation JSON'
-      : '下載目前對話的原始 raw conversation JSON（尚未取得請求資訊）';
-
-    const handoffActionName = replayRequest || capture
-      ? '產出並下載目前對話的交接 handoff JSON'
-      : '產出並下載目前對話的交接 handoff JSON（尚未取得請求資訊）';
+    const rawActionName = '下載目前對話的原始 raw conversation JSON';
+    const handoffActionName = '產出並下載目前對話的交接 handoff JSON';
 
     setButtonTooltip(
       RAW_BUTTON_ID,
