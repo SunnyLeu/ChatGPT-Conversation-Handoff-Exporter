@@ -2,7 +2,7 @@
 // @name         ChatGPT 對話 JSON 與交接檔匯出工具
 // @name:en      ChatGPT Conversation Handoff Exporter
 // @namespace    https://github.com/SunnyLeu/ChatGPT-Conversation-Handoff-Exporter
-// @version      1.0.0
+// @version      1.0.1
 // @description  在 ChatGPT 對話頁新增按鈕，可下載目前對話的格式化原始 JSON，或直接產出精簡交接用 handoff JSON。
 // @description:en Export the current ChatGPT conversation as formatted raw JSON or compact handoff JSON.
 // @author       SunnyLeu
@@ -60,7 +60,7 @@
    *   - 多次包裝 window.fetch
    *   - 重複的 timer / listener
    */
-  const INSTALL_FLAG = '__chatgptConversationHandoffExporterInstalled_v100';
+  const INSTALL_FLAG = '__chatgptConversationHandoffExporterInstalled_v101';
 
   /*
    * 兩個按鈕的 DOM id。
@@ -253,9 +253,9 @@
   }
 
   /*
-   * 給使用者看的錯誤提示。
+   * 顯示使用者可理解的錯誤訊息。
    *
-   * 這裡用 alert 是因為使用者前面指定錯誤提示先使用 alert。
+   * 使用 alert 的好處是簡單、明確，而且不需要額外建立提示元件。
    */
   function showErrorAlert(error) {
     alert(toErrorMessage(error));
@@ -364,9 +364,7 @@
   /*
    * 將 Unix timestamp 轉成 UTC ISO 字串。
    *
-   * Python 版原本會輸出 +00:00。
-   * JS 原生 toISOString() 會輸出 Z。
-   * 這裡轉成 +00:00，讓輸出較接近 Python 版。
+   * 輸出使用 +00:00 後綴，讓時間格式更直觀。
    */
   function toUtcIsoString(date) {
     return date.toISOString().replace('Z', '+00:00');
@@ -448,18 +446,13 @@
   /*
    * 清理瀏覽器 document.title。
    *
-   * 重要修正：
-   *   只移除「有空白分隔」的 ChatGPT 品牌前綴或後綴。
-   *
-   * 會移除：
+   * 僅移除明確以空白分隔的 ChatGPT 品牌前綴或後綴，例如：
    *   ChatGPT - My Title
    *   ChatGPT | My Title
    *   My Title - ChatGPT
    *
-   * 不會移除：
+   * 不移除沒有空白分隔的標題，例如：
    *   ChatGPT-Conversation-Handoff-Exporter
-   *
-   * 因為後者很可能是使用者自己設定的對話標題。
    */
   function cleanBrowserTitle(value) {
     let title = String(value || '').trim();
@@ -956,7 +949,7 @@
    * 取得最新 raw JSON。
    *
    * 優先順序：
-   *   1. 若已捕捉到可重抓 request context，直接重新抓最新版本。
+   *   1. 若已捕捉到可重抓 request context，直接重新抓取最新資料。
    *   2. 否則使用已捕捉的 raw JSON。
    */
   async function getLatestRawText(conversationId) {
@@ -973,8 +966,8 @@
     }
 
     throw new Error(
-      '尚未捕捉到目前對話的 JSON。\n\n' +
-      '請等待對話內容載入完成後再按一次。'
+      '目前尚未取得此對話的 JSON 請求資訊。\n\n' +
+      '請確認目前對話內容已載入完成，或重新進入此對話頁後再試一次。'
     );
   }
 
@@ -1593,7 +1586,10 @@
   }
 
   /*
-   * 根據目前狀態更新按鈕文字與 tooltip。
+   * 根據目前頁面狀態更新按鈕文字與 tooltip。
+   *
+   * 按鈕文字維持動作名稱，避免在 SPA 導航或新對話頁面中殘留暫時狀態。
+   * 詳細狀態放在 tooltip 與錯誤訊息中呈現。
    */
   function updateButtonState() {
     const { conversationId, capture, replayRequest } = getCurrentState();
@@ -1607,54 +1603,35 @@
       return;
     }
 
-    if (replayRequest || capture) {
-      setButtonText(RAW_BUTTON_ID, '下載原始 JSON');
-      setButtonText(HANDOFF_BUTTON_ID, '下載交接 JSON');
+    setButtonText(RAW_BUTTON_ID, '下載原始 JSON');
+    setButtonText(HANDOFF_BUTTON_ID, '下載交接 JSON');
 
-      setButtonTooltip(
-        RAW_BUTTON_ID,
-        buildBaseTooltip({
-          actionName: '下載目前對話的原始 raw conversation JSON',
-          conversationId,
-          capture,
-          replayRequest
-        })
-      );
+    const rawActionName = replayRequest || capture
+      ? '下載目前對話的原始 raw conversation JSON'
+      : '下載目前對話的原始 raw conversation JSON（尚未取得請求資訊）';
 
-      setButtonTooltip(
-        HANDOFF_BUTTON_ID,
-        buildBaseTooltip({
-          actionName: '產出並下載目前對話的交接 handoff JSON',
-          conversationId,
-          capture,
-          replayRequest
-        })
-      );
-
-      return;
-    }
-
-    setButtonText(RAW_BUTTON_ID, '等待 JSON');
-    setButtonText(HANDOFF_BUTTON_ID, '等待交接 JSON');
+    const handoffActionName = replayRequest || capture
+      ? '產出並下載目前對話的交接 handoff JSON'
+      : '產出並下載目前對話的交接 handoff JSON（尚未取得請求資訊）';
 
     setButtonTooltip(
       RAW_BUTTON_ID,
-      [
-        '下載目前對話的原始 raw conversation JSON',
-        '對話標題：尚未取得標題',
-        `Conversation ID：${conversationId}`,
-        '尚未捕捉到目前對話 JSON。請等待對話內容載入完成。'
-      ].join('\n')
+      buildBaseTooltip({
+        actionName: rawActionName,
+        conversationId,
+        capture,
+        replayRequest
+      })
     );
 
     setButtonTooltip(
       HANDOFF_BUTTON_ID,
-      [
-        '產出並下載目前對話的交接 handoff JSON',
-        '對話標題：尚未取得標題',
-        `Conversation ID：${conversationId}`,
-        '尚未捕捉到目前對話 JSON。請等待對話內容載入完成。'
-      ].join('\n')
+      buildBaseTooltip({
+        actionName: handoffActionName,
+        conversationId,
+        capture,
+        replayRequest
+      })
     );
   }
 
