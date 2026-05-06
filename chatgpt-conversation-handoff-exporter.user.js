@@ -135,6 +135,11 @@
   let latestReplayRequestTemplate = null;
   /*
    * SPA 導航與 UI 插入控制用狀態。
+   *
+   * lastPathname：記錄上一個路徑，用來偵測 ChatGPT SPA 內部換頁。
+   * ensureTimer：避免短時間內重複排程 UI 插入。
+   * uiStarted：避免重複啟動 UI 觀察與輪詢。
+   * activeExportState：匯出進行中時保留按鈕文字，避免被週期性 UI refresh 覆蓋。
    */
   let lastPathname = location.pathname;
   let ensureTimer = null;
@@ -220,6 +225,11 @@
    * 只輸出事件名稱、conversation ID、狀態碼、訊息摘要。
    */
   const LOG_PREFIX = '[ChatGPT 對話匯出工具]';
+  /*
+   * 輸出一般狀態訊息。
+   *
+   * 只允許輸出安全摘要，不應傳入 raw JSON、headers、cookie 或 token。
+   */
   function logInfo(message, data = null) {
     if (data === null || data === undefined) {
       console.info(LOG_PREFIX, message);
@@ -227,6 +237,11 @@
     }
     console.info(LOG_PREFIX, message, data);
   }
+  /*
+   * 輸出可恢復的警告訊息。
+   *
+   * 例如 textdocs 取得失敗但主要匯出仍可繼續時，使用 warning 而不是 error。
+   */
   function logWarn(message, data = null) {
     if (data === null || data === undefined) {
       console.warn(LOG_PREFIX, message);
@@ -234,6 +249,11 @@
     }
     console.warn(LOG_PREFIX, message, data);
   }
+  /*
+   * 輸出需要使用者注意的錯誤摘要。
+   *
+   * 只保留錯誤名稱與訊息，避免把 response body 或請求內容印到 Console。
+   */
   function logError(message, error = null) {
     if (!error) {
       console.error(LOG_PREFIX, message);
@@ -244,6 +264,11 @@
       message: error.message || String(error)
     });
   }
+  /*
+   * 將任意錯誤值轉成可顯示文字。
+   *
+   * JavaScript throw 的值不一定是 Error 物件，因此這裡統一轉字串。
+   */
   function toErrorMessage(error) {
     if (error instanceof Error) {
       return error.message;
@@ -278,6 +303,11 @@
     const match = location.pathname.match(/\/c\/([^/?#]+)/);
     return match ? decodeURIComponent(match[1]) : null;
   }
+  /*
+   * 檢查字串是否符合 ChatGPT conversation ID 常見的 UUID 格式。
+   *
+   * 這只是格式檢查，不代表該 ID 一定存在或可存取。
+   */
   function looksLikeUuid(value) {
     return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
       String(value || '')
@@ -380,6 +410,11 @@
     }
     return '';
   }
+  /*
+   * 將日期時間欄位補成兩位數。
+   *
+   * 主要用於檔名時間戳與 tooltip 顯示時間。
+   */
   function pad2(value) {
     return String(value).padStart(2, '0');
   }
@@ -416,6 +451,11 @@
   function toUtcIsoString(date) {
     return date.toISOString().replace('Z', '+00:00');
   }
+  /*
+   * 正規化 ISO 時間字串。
+   *
+   * 目標是統一輸出毫秒 3 位與明確的 UTC offset，讓 handoff JSON 的時間格式穩定。
+   */
   function normalizeIsoTimeString(value) {
     const stripped = String(value || '').trim();
     const match = stripped.match(
@@ -429,6 +469,11 @@
     const offset = match[3].toUpperCase() === 'Z' ? '+00:00' : match[3];
     return `${base}.${milliseconds}${offset}`;
   }
+  /*
+   * 取得可排序的時間數值。
+   *
+   * 無法解析的時間會排到最後，避免影響已知建立時間的 textdocs 排序。
+   */
   function getTimeSortValue(value) {
     const normalized = toReadableTime(value);
     if (!normalized) {
@@ -485,6 +530,9 @@
       .slice(0, 120);
     return sanitized || 'chatgpt-conversation';
   }
+  /*
+   * 集中 JSON.parse 呼叫點，方便未來需要加強錯誤處理時調整。
+   */
   function tryParseJson(rawText) {
     return JSON.parse(rawText);
   }
@@ -565,6 +613,11 @@
     }
     return '';
   }
+  /*
+   * 從已捕捉的 raw conversation JSON 取得對話標題。
+   *
+   * 這個來源通常比 document.title 更準，尤其是在 project 對話頁中。
+   */
   function getTitleFromCapturedRawJson(conversationId) {
     const capture = capturedRawByConversationId.get(conversationId);
     if (!capture || !capture.rawText) {
@@ -613,6 +666,11 @@
     }
     return cleanBrowserTitle(document.title);
   }
+  /*
+   * 從 raw JSON 取得下載檔名用標題。
+   *
+   * 若 raw JSON 無法解析，退回 conversation ID，避免檔名產生流程中斷。
+   */
   function tryGetTitleFromRawJson(rawText, conversationId) {
     try {
       const data = tryParseJson(rawText);
@@ -621,14 +679,23 @@
       return conversationId || 'chatgpt-conversation';
     }
   }
+  /*
+   * 建立 raw conversation JSON 的下載檔名。
+   */
   function buildRawFilename(rawText, conversationId, timestamp = getTimestampString()) {
     const title = sanitizeFilenamePart(tryGetTitleFromRawJson(rawText, conversationId));
     return `${title}-${timestamp}.json`;
   }
+  /*
+   * 建立 textdocs 原始 JSON 的下載檔名。
+   */
   function buildTextdocsFilename(rawText, conversationId, timestamp = getTimestampString()) {
     const title = sanitizeFilenamePart(tryGetTitleFromRawJson(rawText, conversationId));
     return `${title}-${timestamp}.textdocs.json`;
   }
+  /*
+   * 建立 handoff JSON 的下載檔名。
+   */
   function buildHandoffFilename(rawText, conversationId, timestamp = getTimestampString()) {
     const title = sanitizeFilenamePart(tryGetTitleFromRawJson(rawText, conversationId));
     return `${title}-${timestamp}.handoff.json`;
@@ -696,6 +763,11 @@
     ]);
     return !forbiddenOrUnhelpful.has(lowerName);
   }
+  /*
+   * 複製可安全重用的 request headers。
+   *
+   * 這裡會套用 shouldReplayHeader()，避免手動保存 cookie 或瀏覽器管理的安全 headers。
+   */
   function copyHeadersFrom(headersLike, targetHeaders) {
     if (!headersLike) {
       return;
@@ -727,6 +799,11 @@
     }
     return headers;
   }
+  /*
+   * 判斷 headers 是否足以作為重新抓取 ChatGPT backend API 的樣板。
+   *
+   * 缺少必要驗證資訊時不保存，避免之後用不完整的 request context 發出無效請求。
+   */
   function hasReusableAuthHeaders(headers) {
     return headers.has('authorization') && headers.has('x-oai-is');
   }
@@ -930,6 +1007,8 @@
   }
   /*
    * 建立目前 conversation ID 專用的 conversation endpoint。
+   *
+   * 只負責組出同源 URL；驗證資訊由先前捕捉到的 request context 與瀏覽器 cookie 處理。
    */
   function buildConversationApiUrl(conversationId) {
     return new URL(
@@ -937,6 +1016,9 @@
       location.origin
     ).href;
   }
+  /*
+   * 建立目前 conversation ID 專用的 textdocs endpoint。
+   */
   function buildTextdocsApiUrl(conversationId) {
     return new URL(
       `/backend-api/conversation/${encodeURIComponent(conversationId)}/textdocs`,
@@ -965,6 +1047,9 @@
     headers.delete('content-type');
     return headers;
   }
+  /*
+   * 將重用 headers 調整為 conversation JSON endpoint 使用。
+   */
   function applyConversationTargetHeaders(headers, conversationId) {
     const targetPath = `/backend-api/conversation/${encodeURIComponent(conversationId)}`;
     return applyTargetHeaders(
@@ -973,6 +1058,9 @@
       '/backend-api/conversation/{conversation_id}'
     );
   }
+  /*
+   * 將重用 headers 調整為 textdocs endpoint 使用。
+   */
   function applyTextdocsTargetHeaders(headers, conversationId) {
     const targetPath = `/backend-api/conversation/${encodeURIComponent(conversationId)}/textdocs`;
     return applyTargetHeaders(
@@ -987,6 +1075,7 @@
    * 優先使用此 conversation ID 專屬 request context。
    * 若沒有，改用最近一次 ChatGPT backend API 請求樣板。
    *
+   * 回傳的 headers 會被調整為 conversation endpoint 專用，避免重用其他 API 的 target headers。
    * 這個函式只在使用者按下匯出按鈕後的抓取流程中使用。
    */
   function getReplayRequestForConversation(conversationId) {
@@ -1012,6 +1101,8 @@
    *
    * textdocs 使用同一套 request context，但 target path / route 必須改成
    * /backend-api/conversation/{conversation_id}/textdocs。
+   *
+   * 如果沒有可重用 context，呼叫端會把 textdocs 視為不可取得，而不是中斷主要匯出。
    */
   function getReplayRequestForTextdocs(conversationId) {
     const replayRequest = replayRequestByConversationId.get(conversationId);
@@ -1072,9 +1163,19 @@
     rememberRawConversation(conversationId, rawText);
     return rawText;
   }
+  /*
+   * 判斷值是否為一般物件。
+   *
+   * textdocs endpoint 可能回傳不同外層格式，因此需要先排除 null 與陣列。
+   */
   function isObjectRecord(value) {
     return Boolean(value && typeof value === 'object' && !Array.isArray(value));
   }
+  /*
+   * 從 textdocs endpoint 回應中取出 textdocs 陣列。
+   *
+   * 目前支援直接回傳陣列，也支援包在 textdocs、items、data、documents 欄位中的陣列。
+   */
   function getTextdocsArrayFromParsedJson(parsed) {
     if (Array.isArray(parsed)) {
       return parsed;
@@ -1090,6 +1191,11 @@
     }
     return [];
   }
+  /*
+   * 正規化單一 textdoc comment。
+   *
+   * 缺少位置或內容時使用 null / 空字串，避免因部分欄位缺失導致整體匯出失敗。
+   */
   function normalizeTextdocComment(comment) {
     if (!isObjectRecord(comment)) {
       return null;
@@ -1099,6 +1205,11 @@
       content: typeof comment.content === 'string' ? comment.content : ''
     };
   }
+  /*
+   * 正規化單一 textdoc。
+   *
+   * textdocs endpoint 格式若有小幅變動，這裡會盡量轉成 handoff builder 可處理的穩定形狀。
+   */
   function normalizeTextdoc(textdoc, index) {
     if (!isObjectRecord(textdoc)) {
       logWarn('略過格式不支援的 textdoc 項目。', {
@@ -1120,6 +1231,11 @@
       .filter(Boolean);
     return normalized;
   }
+  /*
+   * 解析 textdocs 原始 JSON，並轉成可用的 textdocs 陣列。
+   *
+   * 這裡採寬鬆策略：能保留的項目盡量保留，無法辨識的項目略過。
+   */
   function parseAndValidateTextdocsRaw(rawText) {
     let parsed;
     try {
@@ -1132,6 +1248,11 @@
       .map(normalizeTextdoc)
       .filter(Boolean);
   }
+  /*
+   * textdocs 取得或解析失敗時的共同退路。
+   *
+   * textdocs 是附加資料；失敗時改用空陣列，避免阻斷主要對話匯出。
+   */
   function warnAndReturnEmptyTextdocs(message, data = null) {
     logWarn(message, data);
     return '[]';
@@ -1139,8 +1260,8 @@
   /*
    * 即時抓取目前對話的 textdocs JSON。
    *
-   * 不是所有對話都有畫布。若 textdocs endpoint 無法提供可用 JSON，
-   * 會改用空陣列繼續匯出，避免畫布資料取得失敗阻斷一般對話匯出。
+   * textdocs 是附加資料，不應阻斷主要對話匯出。
+   * 因此 204、205、404、空回應、非 JSON 或解析失敗都會轉成空陣列。
    */
   async function refetchTextdocsRaw(conversationId) {
     const replayRequest = getReplayRequestForTextdocs(conversationId);
@@ -1195,6 +1316,11 @@
     }
     return rawText;
   }
+  /*
+   * 取得最新 textdocs 原始 JSON。
+   *
+   * 目前直接重新抓取 endpoint，並由 refetchTextdocsRaw() 負責容錯。
+   */
   async function getLatestTextdocsRaw(conversationId) {
     return refetchTextdocsRaw(conversationId);
   }
@@ -1332,6 +1458,11 @@
       .replace(/\n{3,}/g, '\n\n')
       .trim();
   }
+  /*
+   * 判斷 assistant 訊息是否比較像工具操作 payload。
+   *
+   * 這類內容不是給使用者閱讀的自然語言回覆，因此不輸出到 handoff。
+   */
   function looksLikeAssistantToolOperation(text) {
     const stripped = String(text || '').trim();
     if (!stripped) {
@@ -1348,6 +1479,11 @@
     }
     return typeof attribution === 'string' && attribution.trim() ? attribution : null;
   }
+  /*
+   * 從 citation metadata 建立 handoff 用的引用來源物件。
+   *
+   * 僅保留 URL、標題、摘要、發布時間與歸屬資訊。
+   */
   function buildCiteSource(source) {
     const rawPubDate =
       typeof source.pub_date === 'string' && source.pub_date.trim()
@@ -1363,6 +1499,11 @@
       attribution: normalizeAttribution(source.attribution)
     };
   }
+  /*
+   * 建立引用來源去重用 key。
+   *
+   * 優先用 URL；若沒有 URL，改用其他欄位組合降低重複輸出。
+   */
   function citeSourceKey(source) {
     return JSON.stringify([
       source.url,
@@ -1475,6 +1616,11 @@
     }
     return dedupeCiteSources(sources);
   }
+  /*
+   * 取得 conversation mapping。
+   *
+   * mapping 是 ChatGPT 對話樹的核心資料，後續會用 current_node 回推主分支。
+   */
   function getMapping(conversation) {
     const mapping = conversation.mapping;
     if (!mapping || typeof mapping !== 'object' || Array.isArray(mapping)) {
@@ -1553,6 +1699,11 @@
     }
     return item;
   }
+  /*
+   * 根據 comment start / end 取出對應的畫布文字片段。
+   *
+   * 如果位置資訊無效，回傳 null，避免產生錯誤的 target_text。
+   */
   function getTextdocCommentTargetText(textdocContent, start, end) {
     if (
       typeof textdocContent !== 'string' ||
@@ -1568,6 +1719,11 @@
     }
     return textdocContent.slice(start, end);
   }
+  /*
+   * 從 canvas tool message 判斷 canmore 指令名稱。
+   *
+   * 優先讀 metadata.command；若沒有，再從 author.name 的 canmore.* 格式推得。
+   */
   function getCanvasCommand(message) {
     const metadata = message && typeof message.metadata === 'object' ? message.metadata : null;
     if (metadata && typeof metadata.command === 'string' && metadata.command.trim()) {
@@ -1664,6 +1820,11 @@
     }
     return lifecycleById;
   }
+  /*
+   * 建立單一 textdoc 的生命週期摘要。
+   *
+   * 只輸出對接續對話有幫助的統計資訊，不輸出內部追蹤欄位。
+   */
   function buildTextdocLifecycleSummary(textdoc, lifecycle) {
     const summary = {};
     if (Number.isFinite(textdoc.version)) {
@@ -1685,6 +1846,11 @@
     }
     return summary;
   }
+  /*
+   * 判斷是否為非空的一般物件。
+   *
+   * 用於 metadata 等選填欄位，避免在 handoff JSON 中輸出沒有資訊量的空物件。
+   */
   function isNonEmptyObject(value) {
     return Boolean(
       value &&
@@ -1693,6 +1859,11 @@
       Object.keys(value).length > 0
     );
   }
+  /*
+   * 建立 handoff JSON 中的 textdocs 陣列。
+   *
+   * 會依建立時間排序、重新編號，並整合 textdocs endpoint 與 conversation canvas event 的資訊。
+   */
   function buildHandoffTextdocs(textdocs, lifecycleById = new Map()) {
     if (!Array.isArray(textdocs)) {
       return [];
@@ -1871,6 +2042,9 @@
   // ============================================================
   // 六、按鈕 UI、tooltip 與頁面導航處理
   // ============================================================
+  /*
+   * 更新指定匯出按鈕上的可見文字。
+   */
   function setButtonText(buttonId, text) {
     const button = document.querySelector(`#${buttonId}`);
     if (!button) {
@@ -1881,6 +2055,9 @@
       label.textContent = text;
     }
   }
+  /*
+   * 更新指定匯出按鈕的 title tooltip。
+   */
   function setButtonTooltip(buttonId, text) {
     const button = document.querySelector(`#${buttonId}`);
     if (!button) {
@@ -1888,6 +2065,11 @@
     }
     button.title = text;
   }
+  /*
+   * 設定單一按鈕的 busy 狀態。
+   *
+   * busy 時會停用點擊並調整外觀，避免使用者重複觸發同一個匯出流程。
+   */
   function setButtonBusy(buttonId, isBusy) {
     const button = document.querySelector(`#${buttonId}`);
     if (!button) {
@@ -1897,10 +2079,18 @@
     button.style.opacity = isBusy ? '0.65' : '';
     button.style.cursor = isBusy ? 'wait' : '';
   }
+  /*
+   * 同步設定兩個匯出按鈕的 busy 狀態。
+   */
   function setAllButtonsBusy(isBusy) {
     setButtonBusy(RAW_BUTTON_ID, isBusy);
     setButtonBusy(HANDOFF_BUTTON_ID, isBusy);
   }
+  /*
+   * 標記目前有匯出流程正在進行。
+   *
+   * 這個狀態會讓週期性 UI 更新保留「抓取中…／產出中…」文字。
+   */
   function setExportInProgress(buttonId, text) {
     activeExportState = {
       buttonId,
@@ -1909,6 +2099,11 @@
     setAllButtonsBusy(true);
     setButtonText(buttonId, text);
   }
+  /*
+   * 若目前正在匯出，重新套用匯出中的按鈕狀態。
+   *
+   * 回傳 true 代表已接管 UI 狀態，呼叫端不應再覆蓋按鈕文字。
+   */
   function applyExportInProgressState() {
     if (!activeExportState) {
       return false;
@@ -1917,6 +2112,9 @@
     setButtonText(activeExportState.buttonId, activeExportState.text);
     return true;
   }
+  /*
+   * 清除匯出中狀態，並恢復一般按鈕文字與 tooltip。
+   */
   function clearExportInProgress() {
     activeExportState = null;
     setAllButtonsBusy(false);
@@ -1925,8 +2123,8 @@
   /*
    * 建立按鈕 tooltip。
    *
-   * 兩個按鈕會使用不同 actionName，
-   * 避免 title 看起來像共用同一段說明。
+   * 兩個按鈕會使用不同 actionName，避免 title 看起來像共用同一段說明。
+   * tooltip 只顯示對話標題、conversation ID 與捕捉時間，不顯示 headers 或 raw JSON。
    */
   function buildBaseTooltip({ actionName, conversationId, capture, replayRequest }) {
     const title = conversationId ? getKnownConversationTitle(conversationId) : '';
@@ -1990,6 +2188,11 @@
       })
     );
   }
+  /*
+   * 離開對話頁時移除匯出按鈕。
+   *
+   * ChatGPT 是 SPA，網址切換時不一定重新載入頁面，因此需要主動清理舊 UI。
+   */
   function removeButtonsIfNeeded() {
     const rawButton = document.querySelector(`#${RAW_BUTTON_ID}`);
     const handoffButton = document.querySelector(`#${HANDOFF_BUTTON_ID}`);
