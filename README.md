@@ -8,7 +8,9 @@ Tampermonkey userscript，用來在 ChatGPT 對話頁匯出目前對話的原始
   - **下載原始 JSON**
   - **下載交接 JSON**
 - 原始 JSON 會以 4 空白縮排輸出，方便閱讀與保存。
+- 若對話包含畫布 / textdocs，下載原始 JSON 時會一併下載 textdocs 原始 JSON。
 - 交接 JSON 會保留目前主分支上的可見 `user` / `assistant` 訊息。
+- 交接 JSON 會包含畫布 / textdocs 的內容、註解與精簡生命週期資訊。
 - 支援一般對話網址與 GPT/project 內的對話網址。
 - 點擊按鈕時會即時重新抓取目前對話的最新 raw JSON。
 - 不需要手動複製 DevTools response。
@@ -19,7 +21,7 @@ Tampermonkey userscript，用來在 ChatGPT 對話頁匯出目前對話的原始
 
 ### 推薦方式：Raw URL 安裝
 
-建議使用 Raw URL 安裝，這樣 Tampermonkey 才能依照腳本中的 `@updateURL` / `@downloadURL` 自動檢查更新。
+建議使用 Raw URL 安裝，這樣 Tampermonkey 可以依照腳本中的 `@updateURL` / `@downloadURL` 檢查更新。
 
 1. 安裝 Tampermonkey。
 2. 開啟以下 Raw URL：
@@ -62,11 +64,19 @@ Tampermonkey 會依照其自身設定定期檢查更新；也可以在 Tampermon
 - **下載原始 JSON**
 - **下載交接 JSON**
 
-點擊 **下載原始 JSON** 會下載：
+點擊 **下載原始 JSON** 會下載目前對話的原始 conversation JSON：
 
 ```text
 {對話標題}-{yyyyMMddHHmmss}.json
 ```
+
+如果該對話包含畫布 / textdocs，會額外下載：
+
+```text
+{對話標題}-{yyyyMMddHHmmss}.textdocs.json
+```
+
+如果該對話沒有畫布 / textdocs，則只會下載原始 conversation JSON。
 
 點擊 **下載交接 JSON** 會下載：
 
@@ -74,9 +84,13 @@ Tampermonkey 會依照其自身設定定期檢查更新；也可以在 Tampermon
 {對話標題}-{yyyyMMddHHmmss}.handoff.json
 ```
 
+交接 JSON 會把對話訊息與畫布 / textdocs 整合在同一份檔案中。
+
+> 瀏覽器可能會在第一次下載多個檔案時詢問是否允許 `chatgpt.com` 下載多個檔案。這是瀏覽器的正常安全提示。
+
 ## 交接 JSON 格式
 
-交接 JSON 是從 ChatGPT 原始 conversation JSON 轉換而來的精簡格式，目標是讓新的 ChatGPT 對話能快速理解前一段對話的實際進度與內容。
+交接 JSON 是從 ChatGPT 原始 conversation JSON 與 textdocs JSON 轉換而來的精簡格式，目標是讓新的 ChatGPT 對話能快速理解前一段對話的實際進度、訊息脈絡與畫布內容。
 
 完整結構大致如下：
 
@@ -116,6 +130,34 @@ Tampermonkey 會依照其自身設定定期檢查更新；也可以在 Tampermon
         }
       ]
     }
+  ],
+  "textdocs": [
+    {
+      "id": "td01",
+      "version": 7,
+      "title": "程式碼畫布",
+      "textdoc_type": "code/other",
+      "created_at": "2026-05-06T03:25:27.868+00:00",
+      "updated_at": "2026-05-06T03:48:35.854+00:00",
+      "create_source": "model",
+      "lifecycle": {
+        "latest_version": 7,
+        "created_version": 1,
+        "update_count": 2,
+        "comment_event_count": 1,
+        "last_canvas_event_at": "2026-05-06T03:48:35.854+00:00"
+      },
+      "content": "# 超簡單 Python 程式：打招呼\n...",
+      "comments": [
+        {
+          "id": "tdc01",
+          "start": 0,
+          "end": 19,
+          "target_text": "# 超簡單 Python 程式：打招呼",
+          "content": "這個標題很清楚；若這份程式要給初學者看，可以再補一句說明它展示的是「輸入與輸出」基本概念。"
+        }
+      ]
+    }
   ]
 }
 ```
@@ -129,6 +171,7 @@ Tampermonkey 會依照其自身設定定期檢查更新；也可以在 Tampermon
 | `update_time`     | `string \| null` | 對話最後更新時間。格式同 `create_time`。                                                             |
 | `conversation_id` | `string \| null` | ChatGPT 原始 conversation ID。通常會對應網址中的 `/c/{conversation_id}`。                            |
 | `messages`        | `array`          | 精簡後的訊息陣列，只保留目前主分支上的可見 `user` / `assistant` 訊息。                               |
+| `textdocs`        | `array`          | 畫布 / textdocs 陣列。若對話沒有畫布，會輸出空陣列 `[]`。                                            |
 
 ### `messages[]` 單一訊息欄位
 
@@ -148,6 +191,42 @@ Tampermonkey 會依照其自身設定定期檢查更新；也可以在 Tampermon
 | `snippet`     | `string \| null` | 引用來源摘要、片段或簡短描述。                   |
 | `pub_date`    | `string \| null` | 引用來源發布時間。若可轉換，會轉成可讀時間格式。 |
 | `attribution` | `string \| null` | 來源站台、作者、發布者或歸屬資訊。               |
+
+### `textdocs[]` 畫布欄位
+
+| 欄位            | 型別             | 說明                                                                                           |
+| --------------- | ---------------- | ---------------------------------------------------------------------------------------------- |
+| `id`            | `string`         | 交接檔內部使用的畫布 ID，例如 `td01`, `td02`, ...。畫布會依建立時間由舊到新排序。              |
+| `version`       | `number \| null` | 畫布目前版本。                                                                                 |
+| `title`         | `string \| null` | 畫布標題。                                                                                     |
+| `textdoc_type`  | `string \| null` | 畫布類型，例如 `document`、`code/other`。                                                      |
+| `created_at`    | `string`，選填   | 畫布建立時間。從原始 conversation JSON 中的 canvas tool event 推得。                           |
+| `updated_at`    | `string`，選填   | 畫布最後更新時間。來自 textdocs endpoint。時間會整理成毫秒 3 位與 `+00:00` UTC offset 格式。   |
+| `create_source` | `string`，選填   | 畫布建立來源，例如 `model`。                                                                   |
+| `lifecycle`     | `object`，選填   | 畫布生命週期摘要，例如目前版本、建立版本、更新次數、註解事件次數、最後一次 canvas event 時間。 |
+| `content`       | `string`         | 畫布完整內容。                                                                                 |
+| `metadata`      | `object`，選填   | 若 textdocs endpoint 回傳非空 metadata，會保留。                                               |
+| `comments`      | `array`          | 畫布註解陣列。若沒有註解，會是空陣列 `[]`。                                                    |
+
+### `textdocs[].lifecycle` 欄位
+
+| 欄位                   | 型別           | 說明                                                             |
+| ---------------------- | -------------- | ---------------------------------------------------------------- |
+| `latest_version`       | `number`，選填 | 已知最新版本。通常會等於 `version`。                             |
+| `created_version`      | `number`，選填 | 建立畫布時的版本。通常是 `1`。                                   |
+| `update_count`         | `number`，選填 | 從原始 conversation JSON 中觀察到的 `update_textdoc` 次數。      |
+| `comment_event_count`  | `number`，選填 | 從原始 conversation JSON 中觀察到的 `comment_textdoc` 事件次數。 |
+| `last_canvas_event_at` | `string`，選填 | 原始 conversation JSON 中最後一次 canvas tool event 時間。       |
+
+### `textdocs[].comments[]` 畫布註解欄位
+
+| 欄位          | 型別             | 說明                                                                          |
+| ------------- | ---------------- | ----------------------------------------------------------------------------- |
+| `id`          | `string`         | 交接檔內部使用的註解 ID，例如 `tdc01`, `tdc02`, ...。                         |
+| `start`       | `number \| null` | 註解對應內容的起始位置。                                                      |
+| `end`         | `number \| null` | 註解對應內容的結束位置。                                                      |
+| `target_text` | `string \| null` | 根據 `start` / `end` 從 `content` 擷取出的目標文字。若位置無效，會是 `null`。 |
+| `content`     | `string`         | 註解內容。                                                                    |
 
 ### 訊息順序與主分支
 
@@ -170,6 +249,9 @@ ChatGPT 原始 conversation JSON 的 `mapping` 是樹狀結構，不是單純的
 - conversation ID
 - 目前主分支上的 `user` / `assistant` 訊息
 - assistant 訊息中可取得的引用來源 metadata
+- 畫布 / textdocs 目前內容
+- 畫布註解
+- 畫布精簡生命週期資訊
 
 交接 JSON 會排除：
 
@@ -183,6 +265,7 @@ ChatGPT 原始 conversation JSON 的 `mapping` 是樹狀結構，不是單純的
 - 非文字 `asset_pointer`
 - assistant 工具操作 payload，例如 `search_query`, `open`, `find`, `click`
 - ChatGPT 內嵌引用標記，例如 `...`
+- canvas tool event 的內部追蹤欄位，例如 `request_id`、`turn_exchange_id`、`async_source`、`stream_topic_id`
 
 ## 隱私與安全
 
@@ -192,9 +275,12 @@ ChatGPT 原始 conversation JSON 的 `mapping` 是樹狀結構，不是單純的
 
 - 上傳資料到第三方伺服器
 - 批次匯出所有對話
+- 背景定時抓取對話或畫布內容
 - 將 token、cookie 或 session 寫死在程式碼
 - 將 raw JSON 或敏感 headers 印到 Console
 - 將 raw JSON 寫入 localStorage、IndexedDB 或 cookie
+
+textdocs 內容只會在使用者按下 **下載原始 JSON** 或 **下載交接 JSON** 時抓取。
 
 ## 限制
 
