@@ -2,7 +2,7 @@
 // @name         ChatGPT 對話 JSON 與交接檔匯出工具
 // @name:en      ChatGPT Conversation Handoff Exporter
 // @namespace    https://github.com/SunnyLeu/ChatGPT-Conversation-Handoff-Exporter
-// @version      1.1.6
+// @version      1.1.7
 // @description  在 ChatGPT 對話頁新增按鈕，可下載目前對話的格式化原始 JSON，或直接產出精簡交接用 handoff JSON。
 // @description:en Export the current ChatGPT conversation as formatted raw JSON or compact handoff JSON.
 // @author       SunnyLeu
@@ -60,7 +60,7 @@
    *   - 多次包裝 window.fetch
    *   - 重複的 timer / listener
    */
-  const INSTALL_FLAG = '__chatgptConversationHandoffExporterInstalled_v116';
+  const INSTALL_FLAG = '__chatgptConversationHandoffExporterInstalled_v117';
   /*
    * 兩個按鈕的 DOM id。
    *
@@ -139,7 +139,7 @@
    * lastPathname：記錄上一個路徑，用來偵測 ChatGPT SPA 內部換頁。
    * ensureTimer：避免短時間內重複排程 UI 插入。
    * uiStarted：避免重複啟動 UI 觀察與輪詢。
-   * activeExportState：匯出進行中時保留按鈕文字，避免被週期性 UI refresh 覆蓋。
+   * activeExportState：匯出進行中時保留目前進度文字，避免被週期性 UI refresh 覆蓋。
    */
   let lastPathname = location.pathname;
   let ensureTimer = null;
@@ -1407,19 +1407,25 @@
     downloadTextFile(prettyTextdocsText, textdocsFilename);
   }
   /*
-   * 建立並下載 handoff JSON。
+   * 建立 handoff JSON 下載內容。
    *
-   * 這個 helper 只處理 handoff 轉換、結果檢查與下載，
-   * raw JSON / textdocs 的取得由上層匯出流程負責。
+   * 這個 helper 只處理 handoff 轉換、結果檢查與序列化，
+   * 實際下載由上層流程負責，方便在下載前更新 UI 進度文字。
    */
-  function downloadHandoff({ rawText, conversation }, textdocs, conversationId, exportTimestamp) {
+  function buildHandoffDownloadPayload({ rawText, conversation }, textdocs, conversationId, exportTimestamp) {
     const handoff = buildHandoff(conversation, textdocs);
     validateHandoffOrThrow(handoff, conversation);
 
-    const handoffText = JSON.stringify(handoff, null, 4);
-    const filename = buildHandoffFilename(rawText, conversationId, exportTimestamp);
-
-    downloadTextFile(handoffText, filename);
+    return {
+      text: JSON.stringify(handoff, null, 4),
+      filename: buildHandoffFilename(rawText, conversationId, exportTimestamp)
+    };
+  }
+  /*
+   * 下載已建立好的 handoff JSON。
+   */
+  function downloadHandoffPayload({ text, filename }) {
+    downloadTextFile(text, filename);
   }
   /*
    * 取得目前頁面的 conversation 狀態。
@@ -2164,7 +2170,8 @@
   /*
    * 標記目前有匯出流程正在進行。
    *
-   * 這個狀態會讓週期性 UI 更新保留「抓取中…／產出中…」文字。
+   * 這個狀態會讓週期性 UI 更新保留目前進度文字，
+   * 例如「正在擷取原始 JSON…」或「正在下載交接 JSON…」。
    */
   function setExportInProgress(buttonId, text) {
     activeExportState = {
@@ -2172,6 +2179,18 @@
       text
     };
     setAllButtonsBusy(true);
+    setButtonText(buttonId, text);
+  }
+  /*
+   * 更新目前匯出流程的進度文字。
+   *
+   * 匯出流程會分階段呼叫這個 helper，讓使用者知道目前正在擷取、產出或下載哪一種資料。
+   */
+  function setExportProgress(buttonId, text) {
+    if (!activeExportState || activeExportState.buttonId !== buttonId) {
+      return;
+    }
+    activeExportState.text = text;
     setButtonText(buttonId, text);
   }
   /*
@@ -2200,15 +2219,15 @@
    *
    * 這裡集中處理：
    *   - conversation ID 檢查
-   *   - 匯出中按鈕文字
+   *   - 匯出中進度文字
    *   - busy 狀態
    *   - 錯誤 log 與 alert
    *   - 流程結束後恢復 UI
    *
    * 實際的 raw / handoff 匯出邏輯由 operation callback 提供，
-   * 讓兩個按鈕共用相同的 UI 狀態管理，避免日後出現行為不一致。
+   * callback 可透過 updateProgress() 更新目前階段，讓兩個按鈕共用相同的 UI 狀態管理。
    */
-  async function runExportFlow({ buttonId, busyText, errorLogMessage, operation }) {
+  async function runExportFlow({ buttonId, initialProgressText, errorLogMessage, operation }) {
     const { conversationId } = getCurrentState();
 
     if (!conversationId) {
@@ -2216,9 +2235,13 @@
       return;
     }
 
+    const updateProgress = (text) => {
+      setExportProgress(buttonId, text);
+    };
+
     try {
-      setExportInProgress(buttonId, busyText);
-      await operation(conversationId);
+      setExportInProgress(buttonId, initialProgressText);
+      await operation(conversationId, updateProgress);
     } catch (error) {
       logError(errorLogMessage, error);
       showErrorAlert(error);
@@ -2365,14 +2388,22 @@
    *
    * 這樣即使 textdocs 取得失敗，也不會影響最重要的 raw JSON。
    */
-  async function exportRawConversationFiles(conversationId) {
+  async function exportRawConversationFiles(conversationId, updateProgress) {
     const exportTimestamp = getTimestampString();
+
+    updateProgress('正在擷取原始 JSON…');
     const snapshot = await getLatestConversationSnapshot(conversationId);
 
+    updateProgress('正在下載原始 JSON…');
     downloadRawConversation(snapshot, conversationId, exportTimestamp);
 
+    updateProgress('正在擷取 textdocs…');
     const textdocs = await getLatestTextdocs(conversationId);
-    downloadTextdocsIfPresent(textdocs, snapshot.rawText, conversationId, exportTimestamp);
+
+    if (Array.isArray(textdocs) && textdocs.length > 0) {
+      updateProgress('正在下載 textdocs…');
+      downloadTextdocsIfPresent(textdocs, snapshot.rawText, conversationId, exportTimestamp);
+    }
   }
   /*
    * 執行「下載交接 JSON」的實際匯出工作。
@@ -2380,12 +2411,20 @@
    * handoff 需要同時整合對話主分支與 textdocs。
    * textdocs 若不可取得會被視為空陣列，讓主要對話脈絡仍可交接。
    */
-  async function exportHandoffFile(conversationId) {
+  async function exportHandoffFile(conversationId, updateProgress) {
     const exportTimestamp = getTimestampString();
+
+    updateProgress('正在擷取原始 JSON…');
     const snapshot = await getLatestConversationSnapshot(conversationId);
+
+    updateProgress('正在擷取 textdocs…');
     const textdocs = await getLatestTextdocs(conversationId);
 
-    downloadHandoff(snapshot, textdocs, conversationId, exportTimestamp);
+    updateProgress('正在產出交接 JSON…');
+    const handoffPayload = buildHandoffDownloadPayload(snapshot, textdocs, conversationId, exportTimestamp);
+
+    updateProgress('正在下載交接 JSON…');
+    downloadHandoffPayload(handoffPayload);
   }
   /*
    * 點擊「下載原始 JSON」。
@@ -2395,7 +2434,7 @@
   async function handleDownloadRawClick() {
     await runExportFlow({
       buttonId: RAW_BUTTON_ID,
-      busyText: '抓取中…',
+      initialProgressText: '正在擷取原始 JSON…',
       errorLogMessage: '下載原始 JSON 失敗。',
       operation: exportRawConversationFiles
     });
@@ -2409,64 +2448,116 @@
   async function handleDownloadHandoffClick() {
     await runExportFlow({
       buttonId: HANDOFF_BUTTON_ID,
-      busyText: '產出中…',
+      initialProgressText: '正在擷取原始 JSON…',
       errorLogMessage: '下載交接 JSON 失敗。',
       operation: exportHandoffFile
     });
   }
   /*
+   * 移除同一個按鈕 ID 的重複節點。
+   *
+   * ChatGPT SPA 重繪或 userscript 重複初始化異常時，可能留下重複按鈕；
+   * 保留第一個節點並移除其餘節點，可避免 UI 上出現多組匯出按鈕。
+   */
+  function removeDuplicateButtons(buttonId) {
+    const buttons = Array.from(document.querySelectorAll(`#${buttonId}`));
+    for (const duplicateButton of buttons.slice(1)) {
+      duplicateButton.remove();
+    }
+  }
+  /*
+   * 取得匯出按鈕應插入的 header action 容器。
+   *
+   * 優先使用目前最精準的 #conversation-header-actions；
+   * 若 ChatGPT 前端調整 DOM，則依序退回 thread header 右側 action 區與 page header。
+   */
+  function findHeaderActionsContainer() {
+    const selectors = [
+      '#conversation-header-actions',
+      '[data-testid="thread-header-right-actions"]',
+      '[data-testid="thread-header-right-actions-container"]',
+      '#page-header'
+    ];
+    for (const selector of selectors) {
+      const element = document.querySelector(selector);
+      if (element) {
+        return element;
+      }
+    }
+    return null;
+  }
+  /*
+   * 取得或建立指定匯出按鈕。
+   *
+   * 若按鈕已存在，會重用既有節點，避免重新綁定事件或造成 focus 狀態遺失。
+   */
+  function getOrCreateExportButton(config) {
+    const existingButton = document.querySelector(`#${config.id}`);
+    if (existingButton) {
+      return existingButton;
+    }
+    return createHeaderButton(config);
+  }
+  /*
+   * 將匯出按鈕移到正確順序。
+   *
+   * 目標順序：
+   *   分享 → 下載原始 JSON → 下載交接 JSON → 更多選單
+   *
+   * 若找不到分享按鈕或更多選單，仍會把兩顆匯出按鈕插入 action 容器中，避免按鈕消失。
+   */
+  function placeExportButtons(headerActions, rawButton, handoffButton) {
+    const shareButton = headerActions.querySelector('[data-testid="share-chat-button"]');
+    const optionsButton = headerActions.querySelector('[data-testid="conversation-options-button"]');
+
+    if (shareButton) {
+      shareButton.insertAdjacentElement('afterend', rawButton);
+    } else if (optionsButton && optionsButton.parentElement) {
+      optionsButton.parentElement.insertAdjacentElement('beforebegin', rawButton);
+    } else {
+      headerActions.append(rawButton);
+    }
+
+    rawButton.insertAdjacentElement('afterend', handoffButton);
+  }
+  /*
    * 將兩個按鈕插入 ChatGPT 對話頁 header。
    *
-   * 插入位置：
-   *   #conversation-header-actions 裡的「分享」按鈕旁邊。
+   * 這個函式同時負責建立、去重、搬移與狀態更新。
+   * ChatGPT header 若因 SPA 導航或 React 重繪被重建，下一次 ensureButtonsSoon() 會把按鈕放回正確位置。
    */
   function insertButtonsOnce() {
     if (!isConversationPage()) {
       removeButtonsIfNeeded();
       return;
     }
-    const rawButtonExists = Boolean(document.querySelector(`#${RAW_BUTTON_ID}`));
-    const handoffButtonExists = Boolean(document.querySelector(`#${HANDOFF_BUTTON_ID}`));
-    if (rawButtonExists && handoffButtonExists) {
-      updateButtonState();
-      return;
-    }
-    const headerActions = document.querySelector('#conversation-header-actions');
+
+    removeDuplicateButtons(RAW_BUTTON_ID);
+    removeDuplicateButtons(HANDOFF_BUTTON_ID);
+
+    const headerActions = findHeaderActionsContainer();
     if (!headerActions) {
       return;
     }
-    if (!rawButtonExists) {
-      const rawButton = createHeaderButton({
-        id: RAW_BUTTON_ID,
-        label: '下載原始 JSON',
-        ariaLabel: '下載目前對話原始 JSON',
-        testId: 'raw-json-export-button',
-        iconSvg: RAW_JSON_ICON_SVG,
-        onClick: handleDownloadRawClick
-      });
-      const shareButton = headerActions.querySelector('[data-testid="share-chat-button"]');
-      if (shareButton) {
-        shareButton.insertAdjacentElement('afterend', rawButton);
-      } else {
-        headerActions.prepend(rawButton);
-      }
-    }
-    if (!handoffButtonExists) {
-      const handoffButton = createHeaderButton({
-        id: HANDOFF_BUTTON_ID,
-        label: '下載交接 JSON',
-        ariaLabel: '產出並下載目前對話交接 JSON',
-        testId: 'handoff-json-export-button',
-        iconSvg: HANDOFF_ICON_SVG,
-        onClick: handleDownloadHandoffClick
-      });
-      const rawButton = document.querySelector(`#${RAW_BUTTON_ID}`);
-      if (rawButton) {
-        rawButton.insertAdjacentElement('afterend', handoffButton);
-      } else {
-        headerActions.prepend(handoffButton);
-      }
-    }
+
+    const rawButton = getOrCreateExportButton({
+      id: RAW_BUTTON_ID,
+      label: '下載原始 JSON',
+      ariaLabel: '下載目前對話原始 JSON',
+      testId: 'raw-json-export-button',
+      iconSvg: RAW_JSON_ICON_SVG,
+      onClick: handleDownloadRawClick
+    });
+    const handoffButton = getOrCreateExportButton({
+      id: HANDOFF_BUTTON_ID,
+      label: '下載交接 JSON',
+      ariaLabel: '產出並下載目前對話交接 JSON',
+      testId: 'handoff-json-export-button',
+      iconSvg: HANDOFF_ICON_SVG,
+      onClick: handleDownloadHandoffClick
+    });
+
+    placeExportButtons(headerActions, rawButton, handoffButton);
     updateButtonState();
   }
   /*
