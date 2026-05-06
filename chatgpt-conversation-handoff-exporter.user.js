@@ -2,7 +2,7 @@
 // @name         ChatGPT 對話 JSON 與交接檔匯出工具
 // @name:en      ChatGPT Conversation Handoff Exporter
 // @namespace    https://github.com/SunnyLeu/ChatGPT-Conversation-Handoff-Exporter
-// @version      1.1.1
+// @version      1.1.2
 // @description  在 ChatGPT 對話頁新增按鈕，可下載目前對話的格式化原始 JSON，或直接產出精簡交接用 handoff JSON。
 // @description:en Export the current ChatGPT conversation as formatted raw JSON or compact handoff JSON.
 // @author       SunnyLeu
@@ -64,7 +64,7 @@
    *   - 多次包裝 window.fetch
    *   - 重複的 timer / listener
    */
-  const INSTALL_FLAG = '__chatgptConversationHandoffExporterInstalled_v111';
+  const INSTALL_FLAG = '__chatgptConversationHandoffExporterInstalled_v112';
 
   /*
    * 兩個按鈕的 DOM id。
@@ -1273,47 +1273,78 @@
     return textdocs;
   }
 
+  function warnAndReturnEmptyTextdocs(message, data = null) {
+    logWarn(message, data);
+    return '[]';
+  }
+
   /*
    * 即時抓取目前對話的 textdocs JSON。
    *
-   * 不是所有對話都有畫布。若 endpoint 回傳 404，視為沒有 textdocs。
+   * 不是所有對話都有畫布。若 textdocs endpoint 無法提供可用 JSON，
+   * 會改用空陣列繼續匯出，避免畫布資料取得失敗阻斷一般對話匯出。
    */
   async function refetchTextdocsRaw(conversationId) {
     const replayRequest = getReplayRequestForTextdocs(conversationId);
 
     if (!replayRequest) {
-      throw new Error(
-        '目前無法取得此對話的 textdocs 請求資訊。\n\n' +
-        '請確認對話內容已載入完成，或重新進入此對話頁後再試一次。'
+      return warnAndReturnEmptyTextdocs(
+        '目前無法取得此對話的 textdocs 請求資訊，改以空 textdocs 繼續。',
+        { conversationId }
       );
     }
 
-    const response = await fetch(replayRequest.url, {
-      method: 'GET',
-      credentials: 'include',
-      cache: 'no-store',
-      headers: new Headers(replayRequest.headers)
-    });
+    let response;
 
-    if (response.status === 404) {
+    try {
+      response = await fetch(replayRequest.url, {
+        method: 'GET',
+        credentials: 'include',
+        cache: 'no-store',
+        headers: new Headers(replayRequest.headers)
+      });
+    } catch (error) {
+      return warnAndReturnEmptyTextdocs('即時重新抓取 textdocs 失敗，改以空 textdocs 繼續。', {
+        conversationId,
+        message: toErrorMessage(error)
+      });
+    }
+
+    if (response.status === 204 || response.status === 205 || response.status === 404) {
       return '[]';
     }
 
     if (!response.ok) {
-      throw new Error(`即時重新抓取 textdocs 失敗：HTTP ${response.status} ${response.statusText}`);
+      return warnAndReturnEmptyTextdocs('textdocs endpoint 回應非成功狀態，改以空 textdocs 繼續。', {
+        conversationId,
+        status: response.status,
+        statusText: response.statusText || ''
+      });
+    }
+
+    const rawText = await response.text();
+
+    if (!rawText.trim()) {
+      return '[]';
     }
 
     const contentType = response.headers.get('content-type') || '';
 
     if (!contentType.includes('application/json')) {
-      throw new Error(
-        '即時重新抓取 textdocs 失敗：回應不是 JSON。\n\n' +
-        `Content-Type: ${contentType || '未知'}`
-      );
+      return warnAndReturnEmptyTextdocs('textdocs endpoint 回應不是 JSON，改以空 textdocs 繼續。', {
+        conversationId,
+        contentType: contentType || '未知'
+      });
     }
 
-    const rawText = await response.text();
-    parseAndValidateTextdocsRaw(rawText);
+    try {
+      parseAndValidateTextdocsRaw(rawText);
+    } catch (error) {
+      return warnAndReturnEmptyTextdocs('textdocs JSON 格式無法使用，改以空 textdocs 繼續。', {
+        conversationId,
+        message: toErrorMessage(error)
+      });
+    }
 
     return rawText;
   }
