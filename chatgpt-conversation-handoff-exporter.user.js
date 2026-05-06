@@ -7,6 +7,10 @@
 // @description:en Export the current ChatGPT conversation as formatted raw JSON or compact handoff JSON.
 // @author       SunnyLeu
 // @license      MIT
+// @homepageURL  https://github.com/SunnyLeu/ChatGPT-Conversation-Handoff-Exporter
+// @supportURL   https://github.com/SunnyLeu/ChatGPT-Conversation-Handoff-Exporter/issues
+// @updateURL    https://raw.githubusercontent.com/SunnyLeu/ChatGPT-Conversation-Handoff-Exporter/main/chatgpt-conversation-handoff-exporter.user.js
+// @downloadURL  https://raw.githubusercontent.com/SunnyLeu/ChatGPT-Conversation-Handoff-Exporter/main/chatgpt-conversation-handoff-exporter.user.js
 // @match        https://chatgpt.com/*
 // @run-at       document-start
 // @grant        none
