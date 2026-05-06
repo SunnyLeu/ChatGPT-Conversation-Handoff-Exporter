@@ -2,7 +2,7 @@
 // @name         ChatGPT 對話 JSON 與交接檔匯出工具
 // @name:en      ChatGPT Conversation Handoff Exporter
 // @namespace    https://github.com/SunnyLeu/ChatGPT-Conversation-Handoff-Exporter
-// @version      1.1.0
+// @version      1.1.1
 // @description  在 ChatGPT 對話頁新增按鈕，可下載目前對話的格式化原始 JSON，或直接產出精簡交接用 handoff JSON。
 // @description:en Export the current ChatGPT conversation as formatted raw JSON or compact handoff JSON.
 // @author       SunnyLeu
@@ -64,7 +64,7 @@
    *   - 多次包裝 window.fetch
    *   - 重複的 timer / listener
    */
-  const INSTALL_FLAG = '__chatgptConversationHandoffExporterInstalled_v110';
+  const INSTALL_FLAG = '__chatgptConversationHandoffExporterInstalled_v111';
 
   /*
    * 兩個按鈕的 DOM id。
@@ -2344,19 +2344,32 @@
       const exportTimestamp = getTimestampString();
       const rawText = await getLatestRawText(conversationId);
       const conversation = parseAndValidateRawConversation(rawText, conversationId);
-      const textdocsRawText = await getLatestTextdocsRaw(conversationId);
-      const textdocs = parseAndValidateTextdocsRaw(textdocsRawText);
 
       const prettyRawText = JSON.stringify(conversation, null, 4);
       const filename = buildRawFilename(rawText, conversationId, exportTimestamp);
 
       downloadTextFile(prettyRawText, filename);
 
-      if (textdocs.length > 0) {
-        const prettyTextdocsText = JSON.stringify(textdocs, null, 4);
-        const textdocsFilename = buildTextdocsFilename(rawText, conversationId, exportTimestamp);
+      try {
+        const textdocsRawText = await getLatestTextdocsRaw(conversationId);
+        const textdocs = parseAndValidateTextdocsRaw(textdocsRawText);
 
-        downloadTextFile(prettyTextdocsText, textdocsFilename);
+        if (textdocs.length > 0) {
+          const prettyTextdocsText = JSON.stringify(textdocs, null, 4);
+          const textdocsFilename = buildTextdocsFilename(rawText, conversationId, exportTimestamp);
+
+          downloadTextFile(prettyTextdocsText, textdocsFilename);
+        }
+      } catch (textdocsError) {
+        logWarn('原始 JSON 已下載，但 textdocs JSON 下載失敗。', {
+          message: toErrorMessage(textdocsError)
+        });
+
+        alert(
+          '原始 JSON 已成功下載，但 textdocs JSON 下載失敗。\n\n' +
+          '這不影響原始 conversation JSON。若這段對話有畫布內容，請稍後再試。\n\n' +
+          `textdocs 錯誤：${toErrorMessage(textdocsError)}`
+        );
       }
     } catch (error) {
       logError('下載原始 JSON 失敗。', error);
