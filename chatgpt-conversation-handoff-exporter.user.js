@@ -2,7 +2,7 @@
 // @name         ChatGPT 對話 JSON 與交接檔匯出工具
 // @name:en      ChatGPT Conversation Handoff Exporter
 // @namespace    https://github.com/SunnyLeu/ChatGPT-Conversation-Handoff-Exporter
-// @version      1.1.3
+// @version      1.1.4
 // @description  在 ChatGPT 對話頁新增按鈕，可下載目前對話的格式化原始 JSON，或直接產出精簡交接用 handoff JSON。
 // @description:en Export the current ChatGPT conversation as formatted raw JSON or compact handoff JSON.
 // @author       SunnyLeu
@@ -15,7 +15,6 @@
 // @run-at       document-start
 // @grant        none
 // ==/UserScript==
-
 /*
  * ChatGPT 對話 JSON 與交接檔匯出工具
  * ============================================================
@@ -45,14 +44,11 @@
  *   - ChatGPT 前端或內部 endpoint 若改版，腳本可能需要更新。
  *   - 本腳本不是 OpenAI 官方 API，也不是官方匯出功能。
  */
-
 (function () {
   'use strict';
-
   // ============================================================
   // 一、全域常數與狀態
   // ============================================================
-
   /*
    * INSTALL_FLAG 用來避免腳本在同一頁面被重複安裝。
    *
@@ -64,8 +60,7 @@
    *   - 多次包裝 window.fetch
    *   - 重複的 timer / listener
    */
-  const INSTALL_FLAG = '__chatgptConversationHandoffExporterInstalled_v113';
-
+  const INSTALL_FLAG = '__chatgptConversationHandoffExporterInstalled_v114';
   /*
    * 兩個按鈕的 DOM id。
    *
@@ -77,16 +72,13 @@
    */
   const RAW_BUTTON_ID = 'cgpt-export-raw-json-button';
   const HANDOFF_BUTTON_ID = 'cgpt-export-handoff-json-button';
-
   /*
    * 若目前頁面已經安裝過本腳本，就直接結束。
    */
   if (window[INSTALL_FLAG]) {
     return;
   }
-
   window[INSTALL_FLAG] = true;
-
   /*
    * capturedRawByConversationId：
    *   暫存已捕捉到的 raw conversation JSON。
@@ -103,7 +95,6 @@
    *   IndexedDB、cookie 或任何永久儲存區。
    */
   const capturedRawByConversationId = new Map();
-
   /*
    * replayRequestByConversationId：
    *   暫存可重新抓取目前對話 JSON 的請求資訊。
@@ -122,7 +113,6 @@
    *   - 實際重抓時使用 credentials: 'include'，讓瀏覽器自行處理同源驗證。
    */
   const replayRequestByConversationId = new Map();
-
   /*
    * latestReplayRequestTemplate：
    *   保存最近一次可用的 ChatGPT backend API 請求樣板。
@@ -143,14 +133,12 @@
    *   - 不輸出 headers。
    */
   let latestReplayRequestTemplate = null;
-
   /*
    * SPA 導航與 UI 插入控制用狀態。
    */
   let lastPathname = location.pathname;
   let ensureTimer = null;
   let uiStarted = false;
-
   /*
    * ChatGPT 回覆中的內嵌引用標記，例如：
    *   citeturn0search0
@@ -159,14 +147,12 @@
    * handoff JSON 主要要給新對話閱讀，因此這類 UI 內嵌標記會移除。
    */
   const INLINE_MARK_PATTERN = /.*?/gs;
-
   /*
    * handoff JSON 只保留 user / assistant。
    *
    * system、tool 等內部訊息通常會讓新對話失焦，因此不輸出。
    */
   const ALLOWED_ROLES = new Set(['user', 'assistant']);
-
   /*
    * 這些 content_type 不輸出到 handoff：
    *
@@ -184,7 +170,6 @@
     'reasoning_recap',
     'user_editable_context'
   ]);
-
   /*
    * 某些 assistant 訊息其實是工具操作內容，而不是一般可讀回覆。
    * 例如 web 搜尋工具的 search_query / open / find 等。
@@ -194,7 +179,6 @@
    */
   const ASSISTANT_TOOL_OPERATION_PATTERN =
     /(^|\n)\s*\{?\s*"?(search_query|open|find|click|image_query|product_query|sports|finance|weather|calculator|time)"?\s*:/i;
-
   /*
    * 兩個按鈕使用的 inline SVG。
    *
@@ -210,7 +194,6 @@
           <path d="M10 12l-2 2 2 2M14 12l2 2-2 2" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
         </svg>
   `;
-
   const HANDOFF_ICON_SVG = `
         <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" aria-hidden="true" class="-ms-0.5 icon" fill="none">
           <path d="M5 4h9l5 5v11a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/>
@@ -218,11 +201,9 @@
           <path d="M8 15h8M8 18h5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
         </svg>
   `;
-
   // ============================================================
   // 二、安全 Log 與錯誤處理輔助函式
   // ============================================================
-
   /*
    * 本腳本會處理對話 JSON 與請求上下文。
    *
@@ -238,45 +219,36 @@
    * 只輸出事件名稱、conversation ID、狀態碼、訊息摘要。
    */
   const LOG_PREFIX = '[ChatGPT 對話匯出工具]';
-
   function logInfo(message, data = null) {
     if (data === null || data === undefined) {
       console.info(LOG_PREFIX, message);
       return;
     }
-
     console.info(LOG_PREFIX, message, data);
   }
-
   function logWarn(message, data = null) {
     if (data === null || data === undefined) {
       console.warn(LOG_PREFIX, message);
       return;
     }
-
     console.warn(LOG_PREFIX, message, data);
   }
-
   function logError(message, error = null) {
     if (!error) {
       console.error(LOG_PREFIX, message);
       return;
     }
-
     console.error(LOG_PREFIX, message, {
       name: error.name || 'Error',
       message: error.message || String(error)
     });
   }
-
   function toErrorMessage(error) {
     if (error instanceof Error) {
       return error.message;
     }
-
     return String(error);
   }
-
   /*
    * 顯示使用者可理解的錯誤訊息。
    *
@@ -285,11 +257,9 @@
   function showErrorAlert(error) {
     alert(toErrorMessage(error));
   }
-
   // ============================================================
   // 三、網址、標題、時間與檔名處理
   // ============================================================
-
   /*
    * 判斷目前頁面是否是 ChatGPT 對話頁。
    *
@@ -300,7 +270,6 @@
   function isConversationPage() {
     return /\/c\/[^/?#]+/.test(location.pathname);
   }
-
   /*
    * 從目前網址取得 conversation ID。
    */
@@ -308,13 +277,11 @@
     const match = location.pathname.match(/\/c\/([^/?#]+)/);
     return match ? decodeURIComponent(match[1]) : null;
   }
-
   function looksLikeUuid(value) {
     return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
       String(value || '')
     );
   }
-
   /*
    * 從 ChatGPT 原始 conversation endpoint 取得 conversation ID。
    *
@@ -330,18 +297,15 @@
     try {
       const parsedUrl = new URL(url, location.origin);
       const match = parsedUrl.pathname.match(/^\/backend-api\/conversation\/([^/]+)\/?$/);
-
       if (!match) {
         return null;
       }
-
       const conversationId = decodeURIComponent(match[1]);
       return looksLikeUuid(conversationId) ? conversationId : null;
     } catch {
       return null;
     }
   }
-
   /*
    * 從 conversation 相關子路徑取得 conversation ID。
    *
@@ -356,18 +320,15 @@
     try {
       const parsedUrl = new URL(url, location.origin);
       const match = parsedUrl.pathname.match(/^\/backend-api\/conversation\/([^/]+)(?:\/|$)/);
-
       if (!match) {
         return null;
       }
-
       const conversationId = decodeURIComponent(match[1]);
       return looksLikeUuid(conversationId) ? conversationId : null;
     } catch {
       return null;
     }
   }
-
   /*
    * 判斷是否為可用來建立請求樣板的 ChatGPT backend API 請求。
    *
@@ -380,15 +341,12 @@
   function isReusableBackendApiRequest(url) {
     try {
       const parsedUrl = new URL(url, location.origin);
-
       if (parsedUrl.origin !== location.origin) {
         return false;
       }
-
       if (!parsedUrl.pathname.startsWith('/backend-api/')) {
         return false;
       }
-
       /*
        * estuary/public_content 之類資產請求與匯出 conversation JSON 關聯較低，
        * 不拿來當 request template。
@@ -396,13 +354,11 @@
       if (parsedUrl.pathname.includes('/public_content/')) {
         return false;
       }
-
       return true;
     } catch {
       return false;
     }
   }
-
   /*
    * 從 fetch 的 input 參數中取出 URL。
    *
@@ -415,22 +371,17 @@
     if (typeof input === 'string') {
       return input;
     }
-
     if (input instanceof URL) {
       return input.href;
     }
-
     if (input && typeof input.url === 'string') {
       return input.url;
     }
-
     return '';
   }
-
   function pad2(value) {
     return String(value).padStart(2, '0');
   }
-
   /*
    * 產生檔名用時間戳。
    *
@@ -447,7 +398,6 @@
       pad2(date.getSeconds())
     ].join('');
   }
-
   /*
    * tooltip 顯示用時間。
    */
@@ -457,7 +407,6 @@
       `${pad2(date.getHours())}:${pad2(date.getMinutes())}:${pad2(date.getSeconds())}`
     ].join(' ');
   }
-
   /*
    * 將 Unix timestamp 轉成 UTC ISO 字串。
    *
@@ -466,36 +415,27 @@
   function toUtcIsoString(date) {
     return date.toISOString().replace('Z', '+00:00');
   }
-
   function normalizeIsoTimeString(value) {
     const stripped = String(value || '').trim();
     const match = stripped.match(
       /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d+))?(Z|[+-]\d{2}:\d{2})$/i
     );
-
     if (!match) {
       return stripped;
     }
-
     const base = match[1];
     const milliseconds = String(match[2] || '000').slice(0, 3).padEnd(3, '0');
     const offset = match[3].toUpperCase() === 'Z' ? '+00:00' : match[3];
-
     return `${base}.${milliseconds}${offset}`;
   }
-
   function getTimeSortValue(value) {
     const normalized = toReadableTime(value);
-
     if (!normalized) {
       return Number.POSITIVE_INFINITY;
     }
-
     const timestamp = Date.parse(normalized);
-
     return Number.isFinite(timestamp) ? timestamp : Number.POSITIVE_INFINITY;
   }
-
   /*
    * 將 conversation JSON 裡的時間值轉成可讀字串。
    *
@@ -508,32 +448,24 @@
     if (value === null || value === undefined) {
       return null;
     }
-
     if (typeof value === 'number' && Number.isFinite(value)) {
       return toUtcIsoString(new Date(value * 1000));
     }
-
     if (typeof value === 'string') {
       const stripped = value.trim();
-
       if (!stripped) {
         return null;
       }
-
       if (/^[+-]?\d+(?:\.\d+)?$/.test(stripped)) {
         const numeric = Number(stripped);
-
         if (Number.isFinite(numeric)) {
           return toUtcIsoString(new Date(numeric * 1000));
         }
       }
-
       return normalizeIsoTimeString(stripped);
     }
-
     return null;
   }
-
   /*
    * 清理檔名片段。
    *
@@ -550,14 +482,11 @@
       .replace(/[. ]+$/g, '')
       .trim()
       .slice(0, 120);
-
     return sanitized || 'chatgpt-conversation';
   }
-
   function tryParseJson(rawText) {
     return JSON.parse(rawText);
   }
-
   /*
    * 從 conversation 物件取得標題。
    */
@@ -565,10 +494,8 @@
     if (conversation && typeof conversation.title === 'string' && conversation.title.trim()) {
       return conversation.title.trim();
     }
-
     return fallback;
   }
-
   /*
    * 清理瀏覽器 document.title。
    *
@@ -582,24 +509,19 @@
    */
   function cleanBrowserTitle(value) {
     let title = String(value || '').trim();
-
     if (!title || /^chatgpt$/i.test(title)) {
       return '';
     }
-
     title = title
       .replace(/^ChatGPT\s+[-–—|]\s+/i, '')
       .replace(/\s+[-–—|]\s+ChatGPT$/i, '')
       .replace(/\s+/g, ' ')
       .trim();
-
     if (!title || /^chatgpt$/i.test(title)) {
       return '';
     }
-
     return title;
   }
-
   /*
    * CSS attribute selector 簡易跳脫。
    *
@@ -610,39 +532,23 @@
       .replace(/\\/g, '\\\\')
       .replace(/"/g, '\\"');
   }
-
   /*
-   * 優先從目前頁面取得即時標題。
+   * 從側邊欄或目前頁面連結取得 conversation 標題。
    *
-   * 原因：
-   *   使用者重新命名對話後，raw JSON 中的 title 可能要等下一次
-   *   重新抓取才更新；但頁面標題或側邊欄文字可能較快更新。
-   *
-   * 取值順序：
-   *   1. document.title
-   *   2. 側邊欄中連到目前 conversation ID 的連結文字
-   *   3. 空字串
+   * 專案對話中 document.title 可能是專案名稱，而不是目前對話名稱；
+   * 因此 tooltip 標題會優先使用連到目前 conversation ID 的頁面連結文字。
    */
-  function getTitleFromCurrentPage(conversationId) {
-    const browserTitle = cleanBrowserTitle(document.title);
-
-    if (browserTitle) {
-      return browserTitle;
-    }
-
+  function getTitleFromConversationLink(conversationId) {
     if (!conversationId) {
       return '';
     }
-
     try {
       const escapedId = cssAttributeEscape(conversationId);
       const links = document.querySelectorAll(`a[href*="/c/${escapedId}"]`);
-
       for (const link of links) {
         const text = String(link.textContent || '')
           .replace(/\s+/g, ' ')
           .trim();
-
         if (
           text &&
           text.length <= 160 &&
@@ -656,37 +562,56 @@
     } catch {
       // DOM 查找只是輔助，不成功也不影響匯出。
     }
-
     return '';
   }
-
+  function getTitleFromCapturedRawJson(conversationId) {
+    const capture = capturedRawByConversationId.get(conversationId);
+    if (!capture || !capture.rawText) {
+      return '';
+    }
+    try {
+      const conversation = JSON.parse(capture.rawText);
+      return getConversationTitle(conversation, '');
+    } catch {
+      return '';
+    }
+  }
+  /*
+   * 優先從目前頁面取得即時標題。
+   *
+   * 取值順序：
+   *   1. 連到目前 conversation ID 的頁面連結文字
+   *   2. document.title
+   *   3. 空字串
+   */
+  function getTitleFromCurrentPage(conversationId) {
+    const linkTitle = getTitleFromConversationLink(conversationId);
+    if (linkTitle) {
+      return linkTitle;
+    }
+    return cleanBrowserTitle(document.title);
+  }
   /*
    * tooltip 顯示用標題。
    *
-   * 優先使用目前頁面上的即時標題；
-   * 若沒有，再退回已捕捉 raw JSON 中的 title。
+   * 取值順序：
+   *   1. 連到目前 conversation ID 的頁面連結文字
+   *   2. 已捕捉 raw JSON 中的 title
+   *   3. document.title
+   *
+   * 這樣可避免專案對話中 tooltip 誤顯示專案名稱。
    */
   function getKnownConversationTitle(conversationId) {
-    const liveTitle = getTitleFromCurrentPage(conversationId);
-
-    if (liveTitle) {
-      return liveTitle;
+    const linkTitle = getTitleFromConversationLink(conversationId);
+    if (linkTitle) {
+      return linkTitle;
     }
-
-    const capture = capturedRawByConversationId.get(conversationId);
-
-    if (capture && capture.rawText) {
-      try {
-        const conversation = JSON.parse(capture.rawText);
-        return getConversationTitle(conversation, '');
-      } catch {
-        return '';
-      }
+    const capturedTitle = getTitleFromCapturedRawJson(conversationId);
+    if (capturedTitle) {
+      return capturedTitle;
     }
-
-    return '';
+    return cleanBrowserTitle(document.title);
   }
-
   function tryGetTitleFromRawJson(rawText, conversationId) {
     try {
       const data = tryParseJson(rawText);
@@ -695,22 +620,18 @@
       return conversationId || 'chatgpt-conversation';
     }
   }
-
   function buildRawFilename(rawText, conversationId, timestamp = getTimestampString()) {
     const title = sanitizeFilenamePart(tryGetTitleFromRawJson(rawText, conversationId));
     return `${title}-${timestamp}.json`;
   }
-
   function buildTextdocsFilename(rawText, conversationId, timestamp = getTimestampString()) {
     const title = sanitizeFilenamePart(tryGetTitleFromRawJson(rawText, conversationId));
     return `${title}-${timestamp}.textdocs.json`;
   }
-
   function buildHandoffFilename(rawText, conversationId, timestamp = getTimestampString()) {
     const title = sanitizeFilenamePart(tryGetTitleFromRawJson(rawText, conversationId));
     return `${title}-${timestamp}.handoff.json`;
   }
-
   /*
    * 下載文字檔。
    */
@@ -718,23 +639,18 @@
     const blob = new Blob([text], {
       type: mimeType
     });
-
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
-
     link.href = url;
     link.download = filename;
     document.body.appendChild(link);
     link.click();
-
     link.remove();
     URL.revokeObjectURL(url);
   }
-
   // ============================================================
   // 四、捕捉與重新抓取 ChatGPT 原始 conversation JSON
   // ============================================================
-
   /*
    * 判斷哪些 header 適合重用。
    *
@@ -748,15 +664,12 @@
    */
   function shouldReplayHeader(name) {
     const lowerName = String(name || '').toLowerCase();
-
     if (!lowerName) {
       return false;
     }
-
     if (lowerName.startsWith('sec-')) {
       return false;
     }
-
     const forbiddenOrUnhelpful = new Set([
       'accept-encoding',
       'access-control-request-headers',
@@ -780,18 +693,14 @@
       'user-agent',
       'via'
     ]);
-
     return !forbiddenOrUnhelpful.has(lowerName);
   }
-
   function copyHeadersFrom(headersLike, targetHeaders) {
     if (!headersLike) {
       return;
     }
-
     try {
       const sourceHeaders = new Headers(headersLike);
-
       sourceHeaders.forEach((value, key) => {
         if (shouldReplayHeader(key)) {
           targetHeaders.set(key, value);
@@ -801,32 +710,25 @@
       // 某些非標準 headers 物件可能無法被 Headers 建構式處理，忽略即可。
     }
   }
-
   /*
    * 從原始 fetch 呼叫中取出可安全重用的 headers。
    */
   function getReplayHeaders(input, init) {
     const headers = new Headers();
-
     if (input && typeof input === 'object' && 'headers' in input) {
       copyHeadersFrom(input.headers, headers);
     }
-
     if (init && init.headers) {
       copyHeadersFrom(init.headers, headers);
     }
-
     if (!headers.has('accept')) {
       headers.set('accept', 'application/json');
     }
-
     return headers;
   }
-
   function hasReusableAuthHeaders(headers) {
     return headers.has('authorization') && headers.has('x-oai-is');
   }
-
   /*
    * 保存最近一次 backend API 請求樣板。
    *
@@ -835,17 +737,14 @@
    */
   function captureReplayTemplate(input, init) {
     const headers = getReplayHeaders(input, init);
-
     if (!hasReusableAuthHeaders(headers)) {
       return;
     }
-
     latestReplayRequestTemplate = {
       headers,
       capturedAt: Date.now()
     };
   }
-
   /*
    * 記住某個 conversation_id 的重抓請求資訊。
    */
@@ -853,33 +752,25 @@
     if (!conversationId) {
       return;
     }
-
     const requestUrl = getRequestUrl(input);
-
     if (!requestUrl) {
       return;
     }
-
     const headers = getReplayHeaders(input, init);
-
     if (!hasReusableAuthHeaders(headers)) {
       return;
     }
-
     const replayRequest = {
       url: new URL(requestUrl, location.origin).href,
       headers,
       capturedAt: Date.now()
     };
-
     replayRequestByConversationId.set(conversationId, replayRequest);
-
     latestReplayRequestTemplate = {
       headers: new Headers(replayRequest.headers),
       capturedAt: replayRequest.capturedAt
     };
   }
-
   /*
    * 把 raw JSON 暫存到記憶體。
    */
@@ -888,15 +779,12 @@
       rawText,
       capturedAt: Date.now()
     });
-
     logInfo('已捕捉 conversation JSON。', {
       conversationId,
       length: rawText.length
     });
-
     ensureButtonsSoon();
   }
-
   /*
    * 快速判斷一段文字是否像完整 conversation JSON。
    *
@@ -908,14 +796,11 @@
    */
   function looksLikeConversationObject(rawText) {
     const trimmed = String(rawText || '').trim();
-
     if (!trimmed.startsWith('{')) {
       return false;
     }
-
     try {
       const data = JSON.parse(trimmed);
-
       return Boolean(
         data &&
         typeof data === 'object' &&
@@ -926,7 +811,6 @@
       return false;
     }
   }
-
   /*
    * 解析並驗證 raw conversation JSON。
    *
@@ -938,29 +822,23 @@
    */
   function parseAndValidateRawConversation(rawText, expectedConversationId) {
     let conversation;
-
     try {
       conversation = JSON.parse(rawText);
     } catch (error) {
       throw new Error(`raw JSON 解析失敗：${toErrorMessage(error)}`);
     }
-
     if (!conversation || typeof conversation !== 'object' || Array.isArray(conversation)) {
       throw new Error('raw JSON 不是有效的 conversation 物件。');
     }
-
     if (!conversation.mapping || typeof conversation.mapping !== 'object' || Array.isArray(conversation.mapping)) {
       throw new Error('raw JSON 不包含有效的 mapping 物件。');
     }
-
     if (typeof conversation.current_node !== 'string' || !conversation.current_node) {
       throw new Error('raw JSON 不包含有效的 current_node。');
     }
-
     if (typeof conversation.conversation_id !== 'string' || !conversation.conversation_id) {
       throw new Error('raw JSON 不包含有效的 conversation_id。');
     }
-
     if (expectedConversationId && conversation.conversation_id !== expectedConversationId) {
       throw new Error(
         '下載中止：目前網址的 conversation ID 與 raw JSON 內的 conversation_id 不一致。\n\n' +
@@ -969,10 +847,8 @@
         '這通常表示頁面剛切換對話，或捕捉到舊對話資料。請稍等一秒後再試。'
       );
     }
-
     return conversation;
   }
-
   /*
    * 從 ChatGPT 自己成功取得的 response 複製一份 raw JSON。
    *
@@ -984,15 +860,11 @@
     if (!conversationId || !response || !response.ok) {
       return;
     }
-
     const contentType = response.headers.get('content-type') || '';
-
     if (!contentType.includes('application/json')) {
       return;
     }
-
     const clonedResponse = response.clone();
-
     window.setTimeout(() => {
       clonedResponse
         .text()
@@ -1000,13 +872,11 @@
           if (!looksLikeConversationObject(rawText)) {
             return;
           }
-
           try {
             parseAndValidateRawConversation(rawText, conversationId);
           } catch {
             return;
           }
-
           rememberRawConversation(conversationId, rawText);
         })
         .catch((error) => {
@@ -1016,7 +886,6 @@
         });
     }, 0);
   }
-
   /*
    * 包裝 window.fetch。
    *
@@ -1032,41 +901,32 @@
    */
   function installFetchInterceptor() {
     const originalFetch = window.fetch;
-
     if (typeof originalFetch !== 'function') {
       return;
     }
-
     if (originalFetch.__chatgptConversationHandoffExporterWrapped) {
       return;
     }
-
     function interceptedFetch(input, init) {
       const requestUrl = getRequestUrl(input);
       const exactConversationId = getConversationIdFromExactApiUrl(requestUrl);
       const scopedConversationId = getConversationIdFromScopedApiUrl(requestUrl);
-
       if (isReusableBackendApiRequest(requestUrl)) {
         captureReplayTemplate(input, init);
       }
-
       if (scopedConversationId) {
         captureReplayRequest(scopedConversationId, input, init);
       }
-
       return originalFetch.apply(this, arguments).then((response) => {
         if (exactConversationId) {
           captureConversationResponse(exactConversationId, response);
         }
-
         return response;
       });
     }
-
     interceptedFetch.__chatgptConversationHandoffExporterWrapped = true;
     window.fetch = interceptedFetch;
   }
-
   /*
    * 建立目前 conversation ID 專用的 conversation endpoint。
    */
@@ -1076,14 +936,12 @@
       location.origin
     ).href;
   }
-
   function buildTextdocsApiUrl(conversationId) {
     return new URL(
       `/backend-api/conversation/${encodeURIComponent(conversationId)}/textdocs`,
       location.origin
     ).href;
   }
-
   /*
    * 將可重用 headers 調整成指定 ChatGPT backend endpoint 專用。
    *
@@ -1099,36 +957,29 @@
     headers.set('accept', 'application/json');
     headers.set('x-openai-target-path', targetPath);
     headers.set('x-openai-target-route', targetRoute);
-
     /*
      * GET 請求不需要 content-type。
      * 若 request template 來自 POST endpoint，留下 content-type 可能造成誤導。
      */
     headers.delete('content-type');
-
     return headers;
   }
-
   function applyConversationTargetHeaders(headers, conversationId) {
     const targetPath = `/backend-api/conversation/${encodeURIComponent(conversationId)}`;
-
     return applyTargetHeaders(
       headers,
       targetPath,
       '/backend-api/conversation/{conversation_id}'
     );
   }
-
   function applyTextdocsTargetHeaders(headers, conversationId) {
     const targetPath = `/backend-api/conversation/${encodeURIComponent(conversationId)}/textdocs`;
-
     return applyTargetHeaders(
       headers,
       targetPath,
       '/backend-api/conversation/{conversation_id}/textdocs'
     );
   }
-
   /*
    * 取得目前 conversation ID 可用的重抓請求資訊。
    *
@@ -1139,7 +990,6 @@
    */
   function getReplayRequestForConversation(conversationId) {
     const replayRequest = replayRequestByConversationId.get(conversationId);
-
     if (replayRequest) {
       return {
         url: buildConversationApiUrl(conversationId),
@@ -1147,18 +997,15 @@
         capturedAt: replayRequest.capturedAt
       };
     }
-
     if (!latestReplayRequestTemplate) {
       return null;
     }
-
     return {
       url: buildConversationApiUrl(conversationId),
       headers: applyConversationTargetHeaders(new Headers(latestReplayRequestTemplate.headers), conversationId),
       capturedAt: latestReplayRequestTemplate.capturedAt
     };
   }
-
   /*
    * 取得目前 conversation ID 的 textdocs endpoint 請求資訊。
    *
@@ -1167,7 +1014,6 @@
    */
   function getReplayRequestForTextdocs(conversationId) {
     const replayRequest = replayRequestByConversationId.get(conversationId);
-
     if (replayRequest) {
       return {
         url: buildTextdocsApiUrl(conversationId),
@@ -1175,18 +1021,15 @@
         capturedAt: replayRequest.capturedAt
       };
     }
-
     if (!latestReplayRequestTemplate) {
       return null;
     }
-
     return {
       url: buildTextdocsApiUrl(conversationId),
       headers: applyTextdocsTargetHeaders(new Headers(latestReplayRequestTemplate.headers), conversationId),
       capturedAt: latestReplayRequestTemplate.capturedAt
     };
   }
-
   /*
    * 使用先前捕捉的 request context 即時重新抓最新 raw JSON。
    *
@@ -1194,90 +1037,104 @@
    */
   async function refetchLatestConversationRaw(conversationId) {
     const replayRequest = getReplayRequestForConversation(conversationId);
-
     if (!replayRequest) {
       throw new Error(
         '目前無法取得此對話的 JSON 請求資訊。\n\n' +
         '請確認對話內容已載入完成，或重新進入此對話頁後再試一次。'
       );
     }
-
     replayRequestByConversationId.set(conversationId, replayRequest);
-
     const response = await fetch(replayRequest.url, {
       method: 'GET',
       credentials: 'include',
       cache: 'no-store',
       headers: new Headers(replayRequest.headers)
     });
-
     if (!response.ok) {
       throw new Error(`即時重新抓取失敗：HTTP ${response.status} ${response.statusText}`);
     }
-
     const contentType = response.headers.get('content-type') || '';
-
     if (!contentType.includes('application/json')) {
       throw new Error(
         '即時重新抓取失敗：回應不是 JSON。\n\n' +
         `Content-Type: ${contentType || '未知'}`
       );
     }
-
     const rawText = await response.text();
-
     if (!looksLikeConversationObject(rawText)) {
       throw new Error(
         '即時重新抓取失敗：回應不是完整 conversation JSON 物件。\n\n' +
         `內容長度：${rawText ? rawText.length : 0}`
       );
     }
-
     parseAndValidateRawConversation(rawText, conversationId);
     rememberRawConversation(conversationId, rawText);
-
     return rawText;
   }
-
+  function isObjectRecord(value) {
+    return Boolean(value && typeof value === 'object' && !Array.isArray(value));
+  }
+  function getTextdocsArrayFromParsedJson(parsed) {
+    if (Array.isArray(parsed)) {
+      return parsed;
+    }
+    if (!isObjectRecord(parsed)) {
+      return [];
+    }
+    const candidateKeys = ['textdocs', 'items', 'data', 'documents'];
+    for (const key of candidateKeys) {
+      if (Array.isArray(parsed[key])) {
+        return parsed[key];
+      }
+    }
+    return [];
+  }
+  function normalizeTextdocComment(comment) {
+    if (!isObjectRecord(comment)) {
+      return null;
+    }
+    return {
+      ...comment,
+      content: typeof comment.content === 'string' ? comment.content : ''
+    };
+  }
+  function normalizeTextdoc(textdoc, index) {
+    if (!isObjectRecord(textdoc)) {
+      logWarn('略過格式不支援的 textdoc 項目。', {
+        index: index + 1
+      });
+      return null;
+    }
+    const normalized = {
+      ...textdoc,
+      id: typeof textdoc.id === 'string' && textdoc.id.trim() ? textdoc.id : null,
+      content: typeof textdoc.content === 'string' ? textdoc.content : ''
+    };
+    if (!Array.isArray(textdoc.comments)) {
+      normalized.comments = [];
+      return normalized;
+    }
+    normalized.comments = textdoc.comments
+      .map(normalizeTextdocComment)
+      .filter(Boolean);
+    return normalized;
+  }
   function parseAndValidateTextdocsRaw(rawText) {
-    let textdocs;
-
+    let parsed;
     try {
-      textdocs = JSON.parse(rawText);
+      parsed = JSON.parse(rawText);
     } catch (error) {
       throw new Error(`textdocs JSON 解析失敗：${toErrorMessage(error)}`);
     }
-
-    if (!Array.isArray(textdocs)) {
-      throw new Error('textdocs JSON 不是有效的陣列。');
-    }
-
-    for (const [index, textdoc] of textdocs.entries()) {
-      if (!textdoc || typeof textdoc !== 'object' || Array.isArray(textdoc)) {
-        throw new Error(`第 ${index + 1} 個 textdoc 不是有效物件。`);
-      }
-
-      if (typeof textdoc.id !== 'string' || !textdoc.id) {
-        throw new Error(`第 ${index + 1} 個 textdoc 缺少有效 id。`);
-      }
-
-      if (typeof textdoc.content !== 'string') {
-        throw new Error(`第 ${index + 1} 個 textdoc 缺少有效 content。`);
-      }
-
-      if (textdoc.comments !== undefined && !Array.isArray(textdoc.comments)) {
-        throw new Error(`第 ${index + 1} 個 textdoc 的 comments 不是陣列。`);
-      }
-    }
-
-    return textdocs;
+    const textdocs = getTextdocsArrayFromParsedJson(parsed);
+    return textdocs
+      .map(normalizeTextdoc)
+      .filter(Boolean);
   }
-
   function warnAndReturnEmptyTextdocs(message, data = null) {
     logWarn(message, data);
     return '[]';
   }
-
   /*
    * 即時抓取目前對話的 textdocs JSON。
    *
@@ -1286,16 +1143,13 @@
    */
   async function refetchTextdocsRaw(conversationId) {
     const replayRequest = getReplayRequestForTextdocs(conversationId);
-
     if (!replayRequest) {
       return warnAndReturnEmptyTextdocs(
         '目前無法取得此對話的 textdocs 請求資訊，改以空 textdocs 繼續。',
         { conversationId }
       );
     }
-
     let response;
-
     try {
       response = await fetch(replayRequest.url, {
         method: 'GET',
@@ -1309,11 +1163,9 @@
         message: toErrorMessage(error)
       });
     }
-
     if (response.status === 204 || response.status === 205 || response.status === 404) {
       return '[]';
     }
-
     if (!response.ok) {
       return warnAndReturnEmptyTextdocs('textdocs endpoint 回應非成功狀態，改以空 textdocs 繼續。', {
         conversationId,
@@ -1321,22 +1173,17 @@
         statusText: response.statusText || ''
       });
     }
-
     const rawText = await response.text();
-
     if (!rawText.trim()) {
       return '[]';
     }
-
     const contentType = response.headers.get('content-type') || '';
-
     if (!contentType.includes('application/json')) {
       return warnAndReturnEmptyTextdocs('textdocs endpoint 回應不是 JSON，改以空 textdocs 繼續。', {
         conversationId,
         contentType: contentType || '未知'
       });
     }
-
     try {
       parseAndValidateTextdocsRaw(rawText);
     } catch (error) {
@@ -1345,14 +1192,11 @@
         message: toErrorMessage(error)
       });
     }
-
     return rawText;
   }
-
   async function getLatestTextdocsRaw(conversationId) {
     return refetchTextdocsRaw(conversationId);
   }
-
   /*
    * 取得最新 raw JSON。
    *
@@ -1363,28 +1207,23 @@
   async function getLatestRawText(conversationId) {
     const replayRequest = replayRequestByConversationId.get(conversationId);
     const capture = capturedRawByConversationId.get(conversationId);
-
     if (replayRequest) {
       return refetchLatestConversationRaw(conversationId);
     }
-
     if (capture) {
       parseAndValidateRawConversation(capture.rawText, conversationId);
       return capture.rawText;
     }
-
     throw new Error(
       '目前無法取得此對話的 JSON 請求資訊。\n\n' +
       '請確認對話內容已載入完成，或重新進入此對話頁後再試一次。'
     );
   }
-
   /*
    * 取得目前頁面的 conversation 狀態。
    */
   function getCurrentState() {
     const conversationId = getConversationIdFromUrl();
-
     if (!conversationId) {
       return {
         conversationId: null,
@@ -1392,18 +1231,15 @@
         replayRequest: null
       };
     }
-
     return {
       conversationId,
       capture: capturedRawByConversationId.get(conversationId) || null,
       replayRequest: replayRequestByConversationId.get(conversationId) || null
     };
   }
-
   // ============================================================
   // 五、handoff JSON 轉換邏輯
   // ============================================================
-
   /*
    * 將 ChatGPT content.parts 中的文字片段合併。
    *
@@ -1417,42 +1253,32 @@
     if (!Array.isArray(parts)) {
       return '';
     }
-
     const texts = [];
-
     for (const part of parts) {
       if (typeof part === 'string') {
         if (part.trim()) {
           texts.push(part);
         }
-
         continue;
       }
-
       if (!part || typeof part !== 'object') {
         continue;
       }
-
       const partContentType = part.content_type;
-
       if (partContentType === 'image_asset_pointer' || partContentType === 'asset_pointer') {
         continue;
       }
-
       if (typeof part.text === 'string' && part.text.trim()) {
         texts.push(part.text);
         continue;
       }
-
       if (typeof part.content === 'string' && part.content.trim()) {
         texts.push(part.content);
         continue;
       }
     }
-
     return texts.join('\n');
   }
-
   /*
    * 將 ChatGPT message.content 正規化成純文字。
    */
@@ -1461,16 +1287,12 @@
       if (typeof content === 'string' && content.trim()) {
         return content.trim();
       }
-
       return null;
     }
-
     const contentType = content.content_type;
-
     if (EXCLUDED_CONTENT_TYPES.has(contentType)) {
       return null;
     }
-
     /*
      * assistant 的 code / execution_output / tether_browsing_display
      * 通常是工具呼叫、中間輸出或瀏覽工具顯示資料。
@@ -1481,31 +1303,24 @@
     ) {
       return null;
     }
-
     if (contentType === 'text' || contentType === 'multimodal_text') {
       const text = flattenTextLikeParts(content.parts);
       return text.trim() || null;
     }
-
     if (contentType === 'code' || contentType === 'execution_output') {
       if (typeof content.text === 'string' && content.text.trim()) {
         return content.text.trim();
       }
-
       return null;
     }
-
     if (contentType === 'tether_browsing_display') {
       if (typeof content.summary === 'string' && content.summary.trim()) {
         return content.summary.trim();
       }
-
       return null;
     }
-
     return null;
   }
-
   /*
    * 移除 ChatGPT 內嵌引用標記。
    */
@@ -1516,17 +1331,13 @@
       .replace(/\n{3,}/g, '\n\n')
       .trim();
   }
-
   function looksLikeAssistantToolOperation(text) {
     const stripped = String(text || '').trim();
-
     if (!stripped) {
       return false;
     }
-
     return ASSISTANT_TOOL_OPERATION_PATTERN.test(stripped);
   }
-
   /*
    * 引用來源 attribution 可能是字串，也可能是物件。
    */
@@ -1534,10 +1345,8 @@
     if (attribution && typeof attribution === 'object') {
       return attribution.name || attribution.display_name || attribution.url || null;
     }
-
     return typeof attribution === 'string' && attribution.trim() ? attribution : null;
   }
-
   function buildCiteSource(source) {
     const rawPubDate =
       typeof source.pub_date === 'string' && source.pub_date.trim()
@@ -1545,7 +1354,6 @@
         : typeof source.published_at === 'string' && source.published_at.trim()
           ? source.published_at
           : source.time;
-
     return {
       url: typeof source.url === 'string' ? source.url : null,
       title: typeof source.title === 'string' ? source.title : null,
@@ -1554,7 +1362,6 @@
       attribution: normalizeAttribution(source.attribution)
     };
   }
-
   function citeSourceKey(source) {
     return JSON.stringify([
       source.url,
@@ -1564,19 +1371,16 @@
       source.attribution
     ]);
   }
-
   /*
    * 去除重複引用來源。
    */
   function dedupeCiteSources(values) {
     const result = [];
     const seen = new Set();
-
     for (const value of values) {
       if (!value || typeof value !== 'object') {
         continue;
       }
-
       const normalized = {
         url: typeof value.url === 'string' && value.url.trim() ? value.url : null,
         title: typeof value.title === 'string' && value.title.trim() ? value.title : null,
@@ -1587,7 +1391,6 @@
             ? value.attribution
             : null
       };
-
       if (
         normalized.url === null &&
         normalized.title === null &&
@@ -1597,20 +1400,15 @@
       ) {
         continue;
       }
-
       const key = citeSourceKey(normalized);
-
       if (seen.has(key)) {
         continue;
       }
-
       seen.add(key);
       result.push(normalized);
     }
-
     return result;
   }
-
   /*
    * 從 assistant 訊息 metadata 中抽出引用來源。
    *
@@ -1623,19 +1421,15 @@
    */
   function extractAssistantCiteSources(message) {
     const metadata = message && typeof message.metadata === 'object' ? message.metadata : null;
-
     if (!metadata) {
       return [];
     }
-
     const sources = [];
-
     if (Array.isArray(metadata.content_references)) {
       for (const ref of metadata.content_references) {
         if (!ref || typeof ref !== 'object') {
           continue;
         }
-
         if (Array.isArray(ref.items)) {
           for (const item of ref.items) {
             if (item && typeof item === 'object') {
@@ -1643,7 +1437,6 @@
             }
           }
         }
-
         if (Array.isArray(ref.safe_urls)) {
           for (const url of ref.safe_urls) {
             if (typeof url === 'string') {
@@ -1653,13 +1446,11 @@
         }
       }
     }
-
     if (Array.isArray(metadata.search_result_groups)) {
       for (const group of metadata.search_result_groups) {
         if (!group || typeof group !== 'object' || !Array.isArray(group.entries)) {
           continue;
         }
-
         for (const entry of group.entries) {
           if (entry && typeof entry === 'object') {
             sources.push(buildCiteSource(entry));
@@ -1667,7 +1458,6 @@
         }
       }
     }
-
     if (Array.isArray(metadata.citations)) {
       for (const citation of metadata.citations) {
         if (citation && typeof citation === 'object') {
@@ -1675,7 +1465,6 @@
         }
       }
     }
-
     if (Array.isArray(metadata.safe_urls)) {
       for (const url of metadata.safe_urls) {
         if (typeof url === 'string') {
@@ -1683,20 +1472,15 @@
         }
       }
     }
-
     return dedupeCiteSources(sources);
   }
-
   function getMapping(conversation) {
     const mapping = conversation.mapping;
-
     if (!mapping || typeof mapping !== 'object' || Array.isArray(mapping)) {
       throw new Error('conversation JSON 不包含有效的 mapping 物件。');
     }
-
     return mapping;
   }
-
   /*
    * ChatGPT 原始 conversation JSON 是樹狀結構。
    *
@@ -1707,92 +1491,67 @@
     if (!currentNode) {
       return [];
     }
-
     const path = [];
     const seen = new Set();
     let nodeId = currentNode;
-
     while (nodeId) {
       if (seen.has(nodeId)) {
         throw new Error(`偵測到循環 parent chain：${nodeId}`);
       }
-
       seen.add(nodeId);
       path.push(nodeId);
-
       const node = mapping[nodeId];
-
       if (!node || typeof node !== 'object') {
         break;
       }
-
       nodeId = typeof node.parent === 'string' && node.parent ? node.parent : null;
     }
-
     path.reverse();
     return path;
   }
-
   /*
    * 從一個 mapping node 中抽出 handoff message。
    */
   function extractMessageItem(node) {
     const message = node && typeof node.message === 'object' ? node.message : null;
-
     if (!message) {
       return null;
     }
-
     const author = message.author && typeof message.author === 'object' ? message.author : null;
-
     if (!author) {
       return null;
     }
-
     const role = author.role;
-
     if (!ALLOWED_ROLES.has(role)) {
       return null;
     }
-
     const metadata = message.metadata && typeof message.metadata === 'object' ? message.metadata : null;
-
     if (metadata && metadata.is_visually_hidden_from_conversation === true) {
       return null;
     }
-
     const text = normalizeContentToText(message.content, role);
-
     if (!text) {
       return null;
     }
-
     const item = {
       role,
       content: text
     };
-
     if (role === 'assistant') {
       item.content = removeInlineMarks(text);
-
       if (!item.content) {
         return null;
       }
-
       if (looksLikeAssistantToolOperation(item.content)) {
         return null;
       }
-
       const citeSources = extractAssistantCiteSources(message);
-
       if (citeSources.length > 0) {
         item.cite_sources = citeSources;
       }
     }
-
     return item;
   }
-
   function getTextdocCommentTargetText(textdocContent, start, end) {
     if (
       typeof textdocContent !== 'string' ||
@@ -1806,26 +1565,19 @@
     ) {
       return null;
     }
-
     return textdocContent.slice(start, end);
   }
-
   function getCanvasCommand(message) {
     const metadata = message && typeof message.metadata === 'object' ? message.metadata : null;
-
     if (metadata && typeof metadata.command === 'string' && metadata.command.trim()) {
       return metadata.command.trim();
     }
-
     const author = message && typeof message.author === 'object' ? message.author : null;
-
     if (author && typeof author.name === 'string' && author.name.startsWith('canmore.')) {
       return author.name.slice('canmore.'.length);
     }
-
     return null;
   }
-
   /*
    * 從 raw conversation JSON 中整理畫布生命週期資訊。
    *
@@ -1842,22 +1594,17 @@
   function extractTextdocLifecycle(conversation, pathNodeIds) {
     const mapping = getMapping(conversation);
     const lifecycleById = new Map();
-
     for (const nodeId of pathNodeIds) {
       const node = mapping[nodeId];
-
       if (!node || typeof node !== 'object') {
         continue;
       }
-
       const message = node.message && typeof node.message === 'object' ? node.message : null;
       const metadata = message && typeof message.metadata === 'object' ? message.metadata : null;
       const canvas = metadata && typeof metadata.canvas === 'object' ? metadata.canvas : null;
-
       if (!canvas || typeof canvas.textdoc_id !== 'string' || !canvas.textdoc_id) {
         continue;
       }
-
       const textdocId = canvas.textdoc_id;
       const command = getCanvasCommand(message);
       const eventTime = toReadableTime(message.create_time);
@@ -1865,9 +1612,7 @@
         typeof message.create_time === 'number' && Number.isFinite(message.create_time)
           ? message.create_time
           : null;
-
       let lifecycle = lifecycleById.get(textdocId);
-
       if (!lifecycle) {
         lifecycle = {
           created_at: null,
@@ -1879,17 +1624,14 @@
           last_canvas_event_at: null,
           last_canvas_event_time_value: null
         };
-
         lifecycleById.set(textdocId, lifecycle);
       }
-
       if (Number.isFinite(canvas.version)) {
         lifecycle.latest_observed_version =
           lifecycle.latest_observed_version === null
             ? canvas.version
             : Math.max(lifecycle.latest_observed_version, canvas.version);
       }
-
       if (
         eventTime &&
         (
@@ -1899,21 +1641,17 @@
         )
       ) {
         lifecycle.last_canvas_event_at = eventTime;
-
         if (eventTimeValue !== null) {
           lifecycle.last_canvas_event_time_value = eventTimeValue;
         }
       }
-
       if (command === 'create_textdoc') {
         if (!lifecycle.created_at && eventTime) {
           lifecycle.created_at = eventTime;
         }
-
         if (typeof canvas.create_source === 'string' && canvas.create_source.trim()) {
           lifecycle.create_source = canvas.create_source;
         }
-
         if (Number.isFinite(canvas.version)) {
           lifecycle.created_version = canvas.version;
         }
@@ -1923,38 +1661,29 @@
         lifecycle.comment_event_count += 1;
       }
     }
-
     return lifecycleById;
   }
-
   function buildTextdocLifecycleSummary(textdoc, lifecycle) {
     const summary = {};
-
     if (Number.isFinite(textdoc.version)) {
       summary.latest_version = textdoc.version;
     } else if (lifecycle && Number.isFinite(lifecycle.latest_observed_version)) {
       summary.latest_version = lifecycle.latest_observed_version;
     }
-
     if (lifecycle && Number.isFinite(lifecycle.created_version)) {
       summary.created_version = lifecycle.created_version;
     }
-
     if (lifecycle && lifecycle.update_count > 0) {
       summary.update_count = lifecycle.update_count;
     }
-
     if (lifecycle && lifecycle.comment_event_count > 0) {
       summary.comment_event_count = lifecycle.comment_event_count;
     }
-
     if (lifecycle && lifecycle.last_canvas_event_at) {
       summary.last_canvas_event_at = lifecycle.last_canvas_event_at;
     }
-
     return summary;
   }
-
   function isNonEmptyObject(value) {
     return Boolean(
       value &&
@@ -1963,12 +1692,10 @@
       Object.keys(value).length > 0
     );
   }
-
   function buildHandoffTextdocs(textdocs, lifecycleById = new Map()) {
     if (!Array.isArray(textdocs)) {
       return [];
     }
-
     const orderedTextdocs = textdocs
       .map((textdoc, originalIndex) => {
         const sourceId = typeof textdoc.id === 'string' ? textdoc.id : null;
@@ -1977,7 +1704,6 @@
           lifecycle && lifecycle.created_at
             ? getTimeSortValue(lifecycle.created_at)
             : getTimeSortValue(textdoc && textdoc.updated_at);
-
         return {
           textdoc,
           originalIndex,
@@ -1988,51 +1714,38 @@
         if (left.sortValue !== right.sortValue) {
           return left.sortValue - right.sortValue;
         }
-
         return left.originalIndex - right.originalIndex;
       });
-
     return orderedTextdocs.map(({ textdoc }, index) => {
       const sourceId = typeof textdoc.id === 'string' ? textdoc.id : null;
       const lifecycle = sourceId ? lifecycleById.get(sourceId) : null;
-
       const result = {
         id: `td${String(index + 1).padStart(2, '0')}`,
         version: Number.isFinite(textdoc.version) ? textdoc.version : null,
         title: typeof textdoc.title === 'string' ? textdoc.title : null,
         textdoc_type: typeof textdoc.textdoc_type === 'string' ? textdoc.textdoc_type : null
       };
-
       if (lifecycle && lifecycle.created_at) {
         result.created_at = lifecycle.created_at;
       }
-
       if (typeof textdoc.updated_at === 'string' && textdoc.updated_at.trim()) {
         result.updated_at = toReadableTime(textdoc.updated_at);
       }
-
       if (lifecycle && lifecycle.create_source) {
         result.create_source = lifecycle.create_source;
       }
-
       const lifecycleSummary = buildTextdocLifecycleSummary(textdoc, lifecycle);
-
       if (Object.keys(lifecycleSummary).length > 0) {
         result.lifecycle = lifecycleSummary;
       }
-
       result.content = typeof textdoc.content === 'string' ? textdoc.content : '';
-
       if (isNonEmptyObject(textdoc.metadata)) {
         result.metadata = textdoc.metadata;
       }
-
       const comments = Array.isArray(textdoc.comments) ? textdoc.comments : [];
-
       result.comments = comments.map((comment, commentIndex) => {
         const start = Number.isInteger(comment && comment.start) ? comment.start : null;
         const end = Number.isInteger(comment && comment.end) ? comment.end : null;
-
         return {
           id: `tdc${String(commentIndex + 1).padStart(2, '0')}`,
           start,
@@ -2041,11 +1754,9 @@
           content: comment && typeof comment.content === 'string' ? comment.content : ''
         };
       });
-
       return result;
     });
   }
-
   /*
    * 建立 handoff JSON。
    *
@@ -2066,26 +1777,19 @@
     const currentNode = conversation.current_node;
     const pathNodeIds = resolveMainPath(mapping, currentNode);
     const textdocLifecycleById = extractTextdocLifecycle(conversation, pathNodeIds);
-
     const messages = [];
     let userIndex = 0;
     let assistantIndex = 0;
-
     for (const nodeId of pathNodeIds) {
       const node = mapping[nodeId];
-
       if (!node || typeof node !== 'object') {
         continue;
       }
-
       const item = extractMessageItem(node);
-
       if (!item) {
         continue;
       }
-
       let messageId;
-
       if (item.role === 'user') {
         userIndex += 1;
         messageId = `u${String(userIndex).padStart(2, '0')}`;
@@ -2095,13 +1799,11 @@
       } else {
         continue;
       }
-
       messages.push({
         id: messageId,
         ...item
       });
     }
-
     return {
       title: conversation.title ?? null,
       create_time: toReadableTime(conversation.create_time),
@@ -2111,7 +1813,6 @@
       textdocs: buildHandoffTextdocs(textdocs, textdocLifecycleById)
     };
   }
-
   /*
    * 檢查 handoff 轉換結果是否合理。
    *
@@ -2119,50 +1820,40 @@
    */
   function validateHandoffOrThrow(handoff, sourceConversation) {
     const problems = [];
-
     if (!handoff || typeof handoff !== 'object') {
       problems.push('handoff 不是有效物件。');
     }
-
     if (!Array.isArray(handoff.messages)) {
       problems.push('handoff.messages 不是陣列。');
     } else {
       if (handoff.messages.length === 0) {
         problems.push('handoff.messages 為空。');
       }
-
       if (!handoff.messages.some((message) => message && message.role === 'user')) {
         problems.push('handoff.messages 不包含任何 user 訊息。');
       }
-
       for (const [index, message] of handoff.messages.entries()) {
         if (!message || typeof message !== 'object') {
           problems.push(`第 ${index + 1} 則訊息不是有效物件。`);
           continue;
         }
-
         if (typeof message.id !== 'string' || !message.id) {
           problems.push(`第 ${index + 1} 則訊息缺少 id。`);
         }
-
         if (message.role !== 'user' && message.role !== 'assistant') {
           problems.push(`第 ${index + 1} 則訊息 role 不合法：${String(message.role)}`);
         }
-
         if (typeof message.content !== 'string' || !message.content.trim()) {
           problems.push(`第 ${index + 1} 則訊息 content 為空。`);
         }
       }
     }
-
     if (!Array.isArray(handoff.textdocs)) {
       problems.push('handoff.textdocs 不是陣列。');
     }
-
     if (!handoff.conversation_id) {
       problems.push('handoff 缺少 conversation_id。');
     }
-
     if (
       sourceConversation &&
       sourceConversation.conversation_id &&
@@ -2172,57 +1863,43 @@
         `handoff.conversation_id 與 raw JSON 不一致：${handoff.conversation_id} !== ${sourceConversation.conversation_id}`
       );
     }
-
     if (problems.length > 0) {
       throw new Error(`交接 JSON 轉換結果檢查失敗：\n\n- ${problems.join('\n- ')}`);
     }
   }
-
   // ============================================================
   // 六、按鈕 UI、tooltip 與頁面導航處理
   // ============================================================
-
   function setButtonText(buttonId, text) {
     const button = document.querySelector(`#${buttonId}`);
-
     if (!button) {
       return;
     }
-
     const label = button.querySelector('[data-export-label]');
-
     if (label) {
       label.textContent = text;
     }
   }
-
   function setButtonTooltip(buttonId, text) {
     const button = document.querySelector(`#${buttonId}`);
-
     if (!button) {
       return;
     }
-
     button.title = text;
   }
-
   function setButtonBusy(buttonId, isBusy) {
     const button = document.querySelector(`#${buttonId}`);
-
     if (!button) {
       return;
     }
-
     button.disabled = isBusy;
     button.style.opacity = isBusy ? '0.65' : '';
     button.style.cursor = isBusy ? 'wait' : '';
   }
-
   function setAllButtonsBusy(isBusy) {
     setButtonBusy(RAW_BUTTON_ID, isBusy);
     setButtonBusy(HANDOFF_BUTTON_ID, isBusy);
   }
-
   /*
    * 建立按鈕 tooltip。
    *
@@ -2232,26 +1909,20 @@
   function buildBaseTooltip({ actionName, conversationId, capture, replayRequest }) {
     const title = conversationId ? getKnownConversationTitle(conversationId) : '';
     const lines = [actionName];
-
     if (title) {
       lines.push(`對話標題：${title}`);
     }
-
     if (conversationId) {
       lines.push(`Conversation ID：${conversationId}`);
     }
-
     if (replayRequest) {
       lines.push(`最近一次捕捉請求資訊：${getDisplayDateTime(new Date(replayRequest.capturedAt))}`);
     }
-
     if (capture) {
       lines.push(`最近一次捕捉 JSON：${getDisplayDateTime(new Date(capture.capturedAt))}`);
     }
-
     return lines.join('\n');
   }
-
   /*
    * 根據目前頁面狀態更新按鈕文字與 tooltip。
    *
@@ -2260,7 +1931,6 @@
    */
   function updateButtonState() {
     const { conversationId, capture, replayRequest } = getCurrentState();
-
     if (!isConversationPage() || !conversationId) {
       setButtonText(RAW_BUTTON_ID, '下載原始 JSON');
       setButtonText(HANDOFF_BUTTON_ID, '下載交接 JSON');
@@ -2269,13 +1939,10 @@
       setAllButtonsBusy(false);
       return;
     }
-
     setButtonText(RAW_BUTTON_ID, '下載原始 JSON');
     setButtonText(HANDOFF_BUTTON_ID, '下載交接 JSON');
-
     const rawActionName = '下載目前對話的原始 raw conversation JSON';
     const handoffActionName = '產出並下載目前對話的交接 handoff JSON';
-
     setButtonTooltip(
       RAW_BUTTON_ID,
       buildBaseTooltip({
@@ -2285,7 +1952,6 @@
         replayRequest
       })
     );
-
     setButtonTooltip(
       HANDOFF_BUTTON_ID,
       buildBaseTooltip({
@@ -2296,31 +1962,25 @@
       })
     );
   }
-
   function removeButtonsIfNeeded() {
     const rawButton = document.querySelector(`#${RAW_BUTTON_ID}`);
     const handoffButton = document.querySelector(`#${HANDOFF_BUTTON_ID}`);
-
     if (rawButton) {
       rawButton.remove();
     }
-
     if (handoffButton) {
       handoffButton.remove();
     }
   }
-
   /*
    * 建立和 ChatGPT header action 風格接近的按鈕。
    */
   function createHeaderButton({ id, label, ariaLabel, testId, iconSvg, onClick }) {
     const button = document.createElement('button');
-
     button.id = id;
     button.type = 'button';
     button.setAttribute('aria-label', ariaLabel);
     button.setAttribute('data-testid', testId);
-
     /*
      * 這裡沿用 ChatGPT 既有按鈕 class，讓樣式與「分享」按鈕一致。
      * 若 ChatGPT 未來改 class，按鈕可能仍存在，但外觀可能需要調整。
@@ -2339,14 +1999,12 @@
       'rounded-lg',
       'max-sm:hidden'
     ].join(' ');
-
     button.innerHTML = `
       <div class="flex w-full items-center justify-center gap-1.5">
         ${iconSvg || ''}
         <span data-export-label>${label}</span>
       </div>
     `;
-
     /*
      * 滑鼠移入或鍵盤 focus 時重新整理 tooltip。
      * 這能讓剛改名的對話標題較快反映到 title。
@@ -2354,16 +2012,12 @@
     button.addEventListener('mouseenter', () => {
       updateButtonState();
     });
-
     button.addEventListener('focus', () => {
       updateButtonState();
     });
-
     button.addEventListener('click', onClick);
-
     return button;
   }
-
   /*
    * 點擊「下載原始 JSON」。
    *
@@ -2371,40 +2025,31 @@
    */
   async function handleDownloadRawClick() {
     const { conversationId } = getCurrentState();
-
     if (!conversationId) {
       alert('找不到 conversation ID。請確認目前頁面是 ChatGPT 對話頁。');
       return;
     }
-
     try {
       setAllButtonsBusy(true);
       setButtonText(RAW_BUTTON_ID, '抓取中…');
-
       const exportTimestamp = getTimestampString();
       const rawText = await getLatestRawText(conversationId);
       const conversation = parseAndValidateRawConversation(rawText, conversationId);
-
       const prettyRawText = JSON.stringify(conversation, null, 4);
       const filename = buildRawFilename(rawText, conversationId, exportTimestamp);
-
       downloadTextFile(prettyRawText, filename);
-
       try {
         const textdocsRawText = await getLatestTextdocsRaw(conversationId);
         const textdocs = parseAndValidateTextdocsRaw(textdocsRawText);
-
         if (textdocs.length > 0) {
           const prettyTextdocsText = JSON.stringify(textdocs, null, 4);
           const textdocsFilename = buildTextdocsFilename(rawText, conversationId, exportTimestamp);
-
           downloadTextFile(prettyTextdocsText, textdocsFilename);
         }
       } catch (textdocsError) {
         logWarn('原始 JSON 已下載，但 textdocs JSON 下載失敗。', {
           message: toErrorMessage(textdocsError)
         });
-
         alert(
           '原始 JSON 已成功下載，但 textdocs JSON 下載失敗。\n\n' +
           '這不影響原始 conversation JSON。若這段對話有畫布內容，請稍後再試。\n\n' +
@@ -2419,7 +2064,6 @@
       updateButtonState();
     }
   }
-
   /*
    * 點擊「下載交接 JSON」。
    *
@@ -2433,28 +2077,22 @@
    */
   async function handleDownloadHandoffClick() {
     const { conversationId } = getCurrentState();
-
     if (!conversationId) {
       alert('找不到 conversation ID。請確認目前頁面是 ChatGPT 對話頁。');
       return;
     }
-
     try {
       setAllButtonsBusy(true);
       setButtonText(HANDOFF_BUTTON_ID, '產出中…');
-
       const exportTimestamp = getTimestampString();
       const rawText = await getLatestRawText(conversationId);
       const conversation = parseAndValidateRawConversation(rawText, conversationId);
       const textdocsRawText = await getLatestTextdocsRaw(conversationId);
       const textdocs = parseAndValidateTextdocsRaw(textdocsRawText);
       const handoff = buildHandoff(conversation, textdocs);
-
       validateHandoffOrThrow(handoff, conversation);
-
       const handoffText = JSON.stringify(handoff, null, 4);
       const filename = buildHandoffFilename(rawText, conversationId, exportTimestamp);
-
       downloadTextFile(handoffText, filename);
     } catch (error) {
       logError('下載交接 JSON 失敗。', error);
@@ -2464,7 +2102,6 @@
       updateButtonState();
     }
   }
-
   /*
    * 將兩個按鈕插入 ChatGPT 對話頁 header。
    *
@@ -2476,21 +2113,16 @@
       removeButtonsIfNeeded();
       return;
     }
-
     const rawButtonExists = Boolean(document.querySelector(`#${RAW_BUTTON_ID}`));
     const handoffButtonExists = Boolean(document.querySelector(`#${HANDOFF_BUTTON_ID}`));
-
     if (rawButtonExists && handoffButtonExists) {
       updateButtonState();
       return;
     }
-
     const headerActions = document.querySelector('#conversation-header-actions');
-
     if (!headerActions) {
       return;
     }
-
     if (!rawButtonExists) {
       const rawButton = createHeaderButton({
         id: RAW_BUTTON_ID,
@@ -2500,16 +2132,13 @@
         iconSvg: RAW_JSON_ICON_SVG,
         onClick: handleDownloadRawClick
       });
-
       const shareButton = headerActions.querySelector('[data-testid="share-chat-button"]');
-
       if (shareButton) {
         shareButton.insertAdjacentElement('afterend', rawButton);
       } else {
         headerActions.prepend(rawButton);
       }
     }
-
     if (!handoffButtonExists) {
       const handoffButton = createHeaderButton({
         id: HANDOFF_BUTTON_ID,
@@ -2519,19 +2148,15 @@
         iconSvg: HANDOFF_ICON_SVG,
         onClick: handleDownloadHandoffClick
       });
-
       const rawButton = document.querySelector(`#${RAW_BUTTON_ID}`);
-
       if (rawButton) {
         rawButton.insertAdjacentElement('afterend', handoffButton);
       } else {
         headerActions.prepend(handoffButton);
       }
     }
-
     updateButtonState();
   }
-
   /*
    * 節流插入按鈕。
    *
@@ -2541,13 +2166,11 @@
     if (ensureTimer !== null) {
       return;
     }
-
     ensureTimer = window.setTimeout(() => {
       ensureTimer = null;
       insertButtonsOnce();
     }, 300);
   }
-
   /*
    * 偵測 SPA path 是否改變。
    */
@@ -2555,11 +2178,9 @@
     if (location.pathname === lastPathname) {
       return;
     }
-
     lastPathname = location.pathname;
     ensureButtonsSoon();
   }
-
   /*
    * 包裝 history.pushState / replaceState。
    *
@@ -2569,24 +2190,20 @@
   function installHistoryListener() {
     const originalPushState = history.pushState;
     const originalReplaceState = history.replaceState;
-
     history.pushState = function () {
       const result = originalPushState.apply(this, arguments);
       ensureButtonsSoon();
       return result;
     };
-
     history.replaceState = function () {
       const result = originalReplaceState.apply(this, arguments);
       ensureButtonsSoon();
       return result;
     };
-
     window.addEventListener('popstate', () => {
       ensureButtonsSoon();
     });
   }
-
   /*
    * 低頻輪詢。
    *
@@ -2600,7 +2217,6 @@
   function startLightPolling() {
     window.setInterval(() => {
       handleRouteMaybeChanged();
-
       if (isConversationPage()) {
         insertButtonsOnce();
       } else {
@@ -2608,7 +2224,6 @@
       }
     }, 1000);
   }
-
   /*
    * 監聽 document.title 變化。
    *
@@ -2617,22 +2232,18 @@
    */
   function installTitleObserver() {
     const titleElement = document.querySelector('title');
-
     if (!titleElement) {
       return;
     }
-
     const observer = new MutationObserver(() => {
       ensureButtonsSoon();
     });
-
     observer.observe(titleElement, {
       childList: true,
       subtree: true,
       characterData: true
     });
   }
-
   /*
    * 啟動 UI 相關邏輯。
    */
@@ -2640,26 +2251,21 @@
     if (uiStarted) {
       return;
     }
-
     uiStarted = true;
-
     installHistoryListener();
     installTitleObserver();
     ensureButtonsSoon();
     startLightPolling();
   }
-
   // ============================================================
   // 七、啟動腳本
   // ============================================================
-
   /*
    * 越早包裝 fetch，越有機會捕捉到 ChatGPT 載入對話時的原始 JSON。
    *
    * UI 插入則等 DOM 可用後再開始。
    */
   installFetchInterceptor();
-
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', startUi, { once: true });
   } else {
