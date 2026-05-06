@@ -2,7 +2,7 @@
 // @name         ChatGPT 對話 JSON 與交接檔匯出工具
 // @name:en      ChatGPT Conversation Handoff Exporter
 // @namespace    https://github.com/SunnyLeu/ChatGPT-Conversation-Handoff-Exporter
-// @version      1.1.4
+// @version      1.1.5
 // @description  在 ChatGPT 對話頁新增按鈕，可下載目前對話的格式化原始 JSON，或直接產出精簡交接用 handoff JSON。
 // @description:en Export the current ChatGPT conversation as formatted raw JSON or compact handoff JSON.
 // @author       SunnyLeu
@@ -60,7 +60,7 @@
    *   - 多次包裝 window.fetch
    *   - 重複的 timer / listener
    */
-  const INSTALL_FLAG = '__chatgptConversationHandoffExporterInstalled_v114';
+  const INSTALL_FLAG = '__chatgptConversationHandoffExporterInstalled_v115';
   /*
    * 兩個按鈕的 DOM id。
    *
@@ -139,6 +139,7 @@
   let lastPathname = location.pathname;
   let ensureTimer = null;
   let uiStarted = false;
+  let activeExportState = null;
   /*
    * ChatGPT 回覆中的內嵌引用標記，例如：
    *   citeturn0search0
@@ -1900,6 +1901,27 @@
     setButtonBusy(RAW_BUTTON_ID, isBusy);
     setButtonBusy(HANDOFF_BUTTON_ID, isBusy);
   }
+  function setExportInProgress(buttonId, text) {
+    activeExportState = {
+      buttonId,
+      text
+    };
+    setAllButtonsBusy(true);
+    setButtonText(buttonId, text);
+  }
+  function applyExportInProgressState() {
+    if (!activeExportState) {
+      return false;
+    }
+    setAllButtonsBusy(true);
+    setButtonText(activeExportState.buttonId, activeExportState.text);
+    return true;
+  }
+  function clearExportInProgress() {
+    activeExportState = null;
+    setAllButtonsBusy(false);
+    updateButtonState();
+  }
   /*
    * 建立按鈕 tooltip。
    *
@@ -1931,16 +1953,22 @@
    */
   function updateButtonState() {
     const { conversationId, capture, replayRequest } = getCurrentState();
+    const isExporting = applyExportInProgressState();
     if (!isConversationPage() || !conversationId) {
-      setButtonText(RAW_BUTTON_ID, '下載原始 JSON');
-      setButtonText(HANDOFF_BUTTON_ID, '下載交接 JSON');
-      setButtonTooltip(RAW_BUTTON_ID, '');
-      setButtonTooltip(HANDOFF_BUTTON_ID, '');
-      setAllButtonsBusy(false);
+      if (!isExporting) {
+        setButtonText(RAW_BUTTON_ID, '下載原始 JSON');
+        setButtonText(HANDOFF_BUTTON_ID, '下載交接 JSON');
+        setButtonTooltip(RAW_BUTTON_ID, '');
+        setButtonTooltip(HANDOFF_BUTTON_ID, '');
+        setAllButtonsBusy(false);
+      }
       return;
     }
-    setButtonText(RAW_BUTTON_ID, '下載原始 JSON');
-    setButtonText(HANDOFF_BUTTON_ID, '下載交接 JSON');
+    if (!isExporting) {
+      setButtonText(RAW_BUTTON_ID, '下載原始 JSON');
+      setButtonText(HANDOFF_BUTTON_ID, '下載交接 JSON');
+      setAllButtonsBusy(false);
+    }
     const rawActionName = '下載目前對話的原始 raw conversation JSON';
     const handoffActionName = '產出並下載目前對話的交接 handoff JSON';
     setButtonTooltip(
@@ -2030,8 +2058,7 @@
       return;
     }
     try {
-      setAllButtonsBusy(true);
-      setButtonText(RAW_BUTTON_ID, '抓取中…');
+      setExportInProgress(RAW_BUTTON_ID, '抓取中…');
       const exportTimestamp = getTimestampString();
       const rawText = await getLatestRawText(conversationId);
       const conversation = parseAndValidateRawConversation(rawText, conversationId);
@@ -2060,8 +2087,7 @@
       logError('下載原始 JSON 失敗。', error);
       showErrorAlert(error);
     } finally {
-      setAllButtonsBusy(false);
-      updateButtonState();
+      clearExportInProgress();
     }
   }
   /*
@@ -2082,8 +2108,7 @@
       return;
     }
     try {
-      setAllButtonsBusy(true);
-      setButtonText(HANDOFF_BUTTON_ID, '產出中…');
+      setExportInProgress(HANDOFF_BUTTON_ID, '產出中…');
       const exportTimestamp = getTimestampString();
       const rawText = await getLatestRawText(conversationId);
       const conversation = parseAndValidateRawConversation(rawText, conversationId);
@@ -2098,8 +2123,7 @@
       logError('下載交接 JSON 失敗。', error);
       showErrorAlert(error);
     } finally {
-      setAllButtonsBusy(false);
-      updateButtonState();
+      clearExportInProgress();
     }
   }
   /*
