@@ -88,6 +88,8 @@ Tampermonkey 會依照其自身設定定期檢查更新；也可以在 Tampermon
 
 > 瀏覽器可能會在第一次下載多個檔案時詢問是否允許 `chatgpt.com` 下載多個檔案。這是瀏覽器的正常安全提示。
 
+若 textdocs endpoint 無法取得、回傳空內容，或格式與預期不同，工具會以空陣列 `[]` 處理 textdocs，並繼續完成主要對話 JSON / handoff JSON 匯出。
+
 ## 交接 JSON 格式
 
 交接 JSON 是從 ChatGPT 原始 conversation JSON 與 textdocs JSON 轉換而來的精簡格式，目標是讓新的 ChatGPT 對話能快速理解前一段對話的實際進度、訊息脈絡與畫布內容。
