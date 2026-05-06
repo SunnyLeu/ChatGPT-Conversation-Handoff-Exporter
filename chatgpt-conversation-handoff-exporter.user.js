@@ -2,15 +2,11 @@
 // @name         ChatGPT 對話 JSON 與交接檔匯出工具
 // @name:en      ChatGPT Conversation Handoff Exporter
 // @namespace    https://github.com/SunnyLeu/ChatGPT-Conversation-Handoff-Exporter
-// @version      1.0.2
+// @version      1.1.0
 // @description  在 ChatGPT 對話頁新增按鈕，可下載目前對話的格式化原始 JSON，或直接產出精簡交接用 handoff JSON。
 // @description:en Export the current ChatGPT conversation as formatted raw JSON or compact handoff JSON.
 // @author       SunnyLeu
 // @license      MIT
-// @homepageURL  https://github.com/SunnyLeu/ChatGPT-Conversation-Handoff-Exporter
-// @supportURL   https://github.com/SunnyLeu/ChatGPT-Conversation-Handoff-Exporter/issues
-// @updateURL    https://raw.githubusercontent.com/SunnyLeu/ChatGPT-Conversation-Handoff-Exporter/main/chatgpt-conversation-handoff-exporter.user.js
-// @downloadURL  https://raw.githubusercontent.com/SunnyLeu/ChatGPT-Conversation-Handoff-Exporter/main/chatgpt-conversation-handoff-exporter.user.js
 // @match        https://chatgpt.com/*
 // @run-at       document-start
 // @grant        none
@@ -64,7 +60,7 @@
    *   - 多次包裝 window.fetch
    *   - 重複的 timer / listener
    */
-  const INSTALL_FLAG = '__chatgptConversationHandoffExporterInstalled_v102';
+  const INSTALL_FLAG = '__chatgptConversationHandoffExporterInstalled_v110';
 
   /*
    * 兩個按鈕的 DOM id。
@@ -467,6 +463,35 @@
     return date.toISOString().replace('Z', '+00:00');
   }
 
+  function normalizeIsoTimeString(value) {
+    const stripped = String(value || '').trim();
+    const match = stripped.match(
+      /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d+))?(Z|[+-]\d{2}:\d{2})$/i
+    );
+
+    if (!match) {
+      return stripped;
+    }
+
+    const base = match[1];
+    const milliseconds = String(match[2] || '000').slice(0, 3).padEnd(3, '0');
+    const offset = match[3].toUpperCase() === 'Z' ? '+00:00' : match[3];
+
+    return `${base}.${milliseconds}${offset}`;
+  }
+
+  function getTimeSortValue(value) {
+    const normalized = toReadableTime(value);
+
+    if (!normalized) {
+      return Number.POSITIVE_INFINITY;
+    }
+
+    const timestamp = Date.parse(normalized);
+
+    return Number.isFinite(timestamp) ? timestamp : Number.POSITIVE_INFINITY;
+  }
+
   /*
    * 將 conversation JSON 裡的時間值轉成可讀字串。
    *
@@ -499,7 +524,7 @@
         }
       }
 
-      return stripped;
+      return normalizeIsoTimeString(stripped);
     }
 
     return null;
@@ -667,14 +692,19 @@
     }
   }
 
-  function buildRawFilename(rawText, conversationId) {
+  function buildRawFilename(rawText, conversationId, timestamp = getTimestampString()) {
     const title = sanitizeFilenamePart(tryGetTitleFromRawJson(rawText, conversationId));
-    return `${title}-${getTimestampString()}.json`;
+    return `${title}-${timestamp}.json`;
   }
 
-  function buildHandoffFilename(rawText, conversationId) {
+  function buildTextdocsFilename(rawText, conversationId, timestamp = getTimestampString()) {
     const title = sanitizeFilenamePart(tryGetTitleFromRawJson(rawText, conversationId));
-    return `${title}-${getTimestampString()}.handoff.json`;
+    return `${title}-${timestamp}.textdocs.json`;
+  }
+
+  function buildHandoffFilename(rawText, conversationId, timestamp = getTimestampString()) {
+    const title = sanitizeFilenamePart(tryGetTitleFromRawJson(rawText, conversationId));
+    return `${title}-${timestamp}.handoff.json`;
   }
 
   /*
@@ -1043,8 +1073,15 @@
     ).href;
   }
 
+  function buildTextdocsApiUrl(conversationId) {
+    return new URL(
+      `/backend-api/conversation/${encodeURIComponent(conversationId)}/textdocs`,
+      location.origin
+    ).href;
+  }
+
   /*
-   * 將可重用 headers 調整成目前 conversation endpoint 專用。
+   * 將可重用 headers 調整成指定 ChatGPT backend endpoint 專用。
    *
    * 某些 ChatGPT backend 請求會帶有 x-openai-target-path /
    * x-openai-target-route 這類路由提示 header。
@@ -1052,15 +1089,12 @@
    * 若直接重用其他 endpoint 的 request template，這些 header 可能仍指向
    * 原本的 API 路徑，導致實際請求 URL 與 target headers 不一致。
    *
-   * 因此在按下匯出按鈕、準備抓目前 conversation JSON 時，
-   * 需要把它們改成目前 conversation ID 對應的 endpoint。
+   * 因此在按下匯出按鈕、準備抓目前資料時，需要把它們改成目標 endpoint。
    */
-  function applyConversationTargetHeaders(headers, conversationId) {
-    const targetPath = `/backend-api/conversation/${encodeURIComponent(conversationId)}`;
-
+  function applyTargetHeaders(headers, targetPath, targetRoute) {
     headers.set('accept', 'application/json');
     headers.set('x-openai-target-path', targetPath);
-    headers.set('x-openai-target-route', '/backend-api/conversation/{conversation_id}');
+    headers.set('x-openai-target-route', targetRoute);
 
     /*
      * GET 請求不需要 content-type。
@@ -1071,11 +1105,31 @@
     return headers;
   }
 
+  function applyConversationTargetHeaders(headers, conversationId) {
+    const targetPath = `/backend-api/conversation/${encodeURIComponent(conversationId)}`;
+
+    return applyTargetHeaders(
+      headers,
+      targetPath,
+      '/backend-api/conversation/{conversation_id}'
+    );
+  }
+
+  function applyTextdocsTargetHeaders(headers, conversationId) {
+    const targetPath = `/backend-api/conversation/${encodeURIComponent(conversationId)}/textdocs`;
+
+    return applyTargetHeaders(
+      headers,
+      targetPath,
+      '/backend-api/conversation/{conversation_id}/textdocs'
+    );
+  }
+
   /*
    * 取得目前 conversation ID 可用的重抓請求資訊。
    *
    * 優先使用此 conversation ID 專屬 request context。
-   * 若沒有，改用最近一次 conversation API 請求樣板。
+   * 若沒有，改用最近一次 ChatGPT backend API 請求樣板。
    *
    * 這個函式只在使用者按下匯出按鈕後的抓取流程中使用。
    */
@@ -1097,6 +1151,34 @@
     return {
       url: buildConversationApiUrl(conversationId),
       headers: applyConversationTargetHeaders(new Headers(latestReplayRequestTemplate.headers), conversationId),
+      capturedAt: latestReplayRequestTemplate.capturedAt
+    };
+  }
+
+  /*
+   * 取得目前 conversation ID 的 textdocs endpoint 請求資訊。
+   *
+   * textdocs 使用同一套 request context，但 target path / route 必須改成
+   * /backend-api/conversation/{conversation_id}/textdocs。
+   */
+  function getReplayRequestForTextdocs(conversationId) {
+    const replayRequest = replayRequestByConversationId.get(conversationId);
+
+    if (replayRequest) {
+      return {
+        url: buildTextdocsApiUrl(conversationId),
+        headers: applyTextdocsTargetHeaders(new Headers(replayRequest.headers), conversationId),
+        capturedAt: replayRequest.capturedAt
+      };
+    }
+
+    if (!latestReplayRequestTemplate) {
+      return null;
+    }
+
+    return {
+      url: buildTextdocsApiUrl(conversationId),
+      headers: applyTextdocsTargetHeaders(new Headers(latestReplayRequestTemplate.headers), conversationId),
       capturedAt: latestReplayRequestTemplate.capturedAt
     };
   }
@@ -1151,6 +1233,89 @@
     rememberRawConversation(conversationId, rawText);
 
     return rawText;
+  }
+
+  function parseAndValidateTextdocsRaw(rawText) {
+    let textdocs;
+
+    try {
+      textdocs = JSON.parse(rawText);
+    } catch (error) {
+      throw new Error(`textdocs JSON 解析失敗：${toErrorMessage(error)}`);
+    }
+
+    if (!Array.isArray(textdocs)) {
+      throw new Error('textdocs JSON 不是有效的陣列。');
+    }
+
+    for (const [index, textdoc] of textdocs.entries()) {
+      if (!textdoc || typeof textdoc !== 'object' || Array.isArray(textdoc)) {
+        throw new Error(`第 ${index + 1} 個 textdoc 不是有效物件。`);
+      }
+
+      if (typeof textdoc.id !== 'string' || !textdoc.id) {
+        throw new Error(`第 ${index + 1} 個 textdoc 缺少有效 id。`);
+      }
+
+      if (typeof textdoc.content !== 'string') {
+        throw new Error(`第 ${index + 1} 個 textdoc 缺少有效 content。`);
+      }
+
+      if (textdoc.comments !== undefined && !Array.isArray(textdoc.comments)) {
+        throw new Error(`第 ${index + 1} 個 textdoc 的 comments 不是陣列。`);
+      }
+    }
+
+    return textdocs;
+  }
+
+  /*
+   * 即時抓取目前對話的 textdocs JSON。
+   *
+   * 不是所有對話都有畫布。若 endpoint 回傳 404，視為沒有 textdocs。
+   */
+  async function refetchTextdocsRaw(conversationId) {
+    const replayRequest = getReplayRequestForTextdocs(conversationId);
+
+    if (!replayRequest) {
+      throw new Error(
+        '目前無法取得此對話的 textdocs 請求資訊。\n\n' +
+        '請確認對話內容已載入完成，或重新進入此對話頁後再試一次。'
+      );
+    }
+
+    const response = await fetch(replayRequest.url, {
+      method: 'GET',
+      credentials: 'include',
+      cache: 'no-store',
+      headers: new Headers(replayRequest.headers)
+    });
+
+    if (response.status === 404) {
+      return '[]';
+    }
+
+    if (!response.ok) {
+      throw new Error(`即時重新抓取 textdocs 失敗：HTTP ${response.status} ${response.statusText}`);
+    }
+
+    const contentType = response.headers.get('content-type') || '';
+
+    if (!contentType.includes('application/json')) {
+      throw new Error(
+        '即時重新抓取 textdocs 失敗：回應不是 JSON。\n\n' +
+        `Content-Type: ${contentType || '未知'}`
+      );
+    }
+
+    const rawText = await response.text();
+    parseAndValidateTextdocsRaw(rawText);
+
+    return rawText;
+  }
+
+  async function getLatestTextdocsRaw(conversationId) {
+    return refetchTextdocsRaw(conversationId);
   }
 
   /*
@@ -1593,6 +1758,250 @@
     return item;
   }
 
+  function getTextdocCommentTargetText(textdocContent, start, end) {
+    if (
+      typeof textdocContent !== 'string' ||
+      typeof start !== 'number' ||
+      typeof end !== 'number' ||
+      !Number.isInteger(start) ||
+      !Number.isInteger(end) ||
+      start < 0 ||
+      end < start ||
+      end > textdocContent.length
+    ) {
+      return null;
+    }
+
+    return textdocContent.slice(start, end);
+  }
+
+  function getCanvasCommand(message) {
+    const metadata = message && typeof message.metadata === 'object' ? message.metadata : null;
+
+    if (metadata && typeof metadata.command === 'string' && metadata.command.trim()) {
+      return metadata.command.trim();
+    }
+
+    const author = message && typeof message.author === 'object' ? message.author : null;
+
+    if (author && typeof author.name === 'string' && author.name.startsWith('canmore.')) {
+      return author.name.slice('canmore.'.length);
+    }
+
+    return null;
+  }
+
+  /*
+   * 從 raw conversation JSON 中整理畫布生命週期資訊。
+   *
+   * 這裡只整理對 handoff 有幫助的摘要：
+   *   - 建立時間
+   *   - 建立來源
+   *   - 建立版本
+   *   - 更新次數
+   *   - 加註解事件次數
+   *   - 最後一次 canvas tool event 時間
+   *
+   * 不輸出 request_id、turn_exchange_id、async_source 等內部追蹤欄位。
+   */
+  function extractTextdocLifecycle(conversation, pathNodeIds) {
+    const mapping = getMapping(conversation);
+    const lifecycleById = new Map();
+
+    for (const nodeId of pathNodeIds) {
+      const node = mapping[nodeId];
+
+      if (!node || typeof node !== 'object') {
+        continue;
+      }
+
+      const message = node.message && typeof node.message === 'object' ? node.message : null;
+      const metadata = message && typeof message.metadata === 'object' ? message.metadata : null;
+      const canvas = metadata && typeof metadata.canvas === 'object' ? metadata.canvas : null;
+
+      if (!canvas || typeof canvas.textdoc_id !== 'string' || !canvas.textdoc_id) {
+        continue;
+      }
+
+      const textdocId = canvas.textdoc_id;
+      const command = getCanvasCommand(message);
+      const eventTime = toReadableTime(message.create_time);
+      const eventTimeValue =
+        typeof message.create_time === 'number' && Number.isFinite(message.create_time)
+          ? message.create_time
+          : null;
+
+      let lifecycle = lifecycleById.get(textdocId);
+
+      if (!lifecycle) {
+        lifecycle = {
+          created_at: null,
+          create_source: null,
+          created_version: null,
+          latest_observed_version: null,
+          update_count: 0,
+          comment_event_count: 0,
+          last_canvas_event_at: null,
+          last_canvas_event_time_value: null
+        };
+
+        lifecycleById.set(textdocId, lifecycle);
+      }
+
+      if (Number.isFinite(canvas.version)) {
+        lifecycle.latest_observed_version =
+          lifecycle.latest_observed_version === null
+            ? canvas.version
+            : Math.max(lifecycle.latest_observed_version, canvas.version);
+      }
+
+      if (
+        eventTime &&
+        (
+          lifecycle.last_canvas_event_time_value === null ||
+          eventTimeValue === null ||
+          eventTimeValue >= lifecycle.last_canvas_event_time_value
+        )
+      ) {
+        lifecycle.last_canvas_event_at = eventTime;
+
+        if (eventTimeValue !== null) {
+          lifecycle.last_canvas_event_time_value = eventTimeValue;
+        }
+      }
+
+      if (command === 'create_textdoc') {
+        if (!lifecycle.created_at && eventTime) {
+          lifecycle.created_at = eventTime;
+        }
+
+        if (typeof canvas.create_source === 'string' && canvas.create_source.trim()) {
+          lifecycle.create_source = canvas.create_source;
+        }
+
+        if (Number.isFinite(canvas.version)) {
+          lifecycle.created_version = canvas.version;
+        }
+      } else if (command === 'update_textdoc') {
+        lifecycle.update_count += 1;
+      } else if (command === 'comment_textdoc') {
+        lifecycle.comment_event_count += 1;
+      }
+    }
+
+    return lifecycleById;
+  }
+
+  function buildTextdocLifecycleSummary(textdoc, lifecycle) {
+    const summary = {};
+
+    if (Number.isFinite(textdoc.version)) {
+      summary.latest_version = textdoc.version;
+    } else if (lifecycle && Number.isFinite(lifecycle.latest_observed_version)) {
+      summary.latest_version = lifecycle.latest_observed_version;
+    }
+
+    if (lifecycle && Number.isFinite(lifecycle.created_version)) {
+      summary.created_version = lifecycle.created_version;
+    }
+
+    if (lifecycle && lifecycle.update_count > 0) {
+      summary.update_count = lifecycle.update_count;
+    }
+
+    if (lifecycle && lifecycle.comment_event_count > 0) {
+      summary.comment_event_count = lifecycle.comment_event_count;
+    }
+
+    if (lifecycle && lifecycle.last_canvas_event_at) {
+      summary.last_canvas_event_at = lifecycle.last_canvas_event_at;
+    }
+
+    return summary;
+  }
+
+  function buildHandoffTextdocs(textdocs, lifecycleById = new Map()) {
+    if (!Array.isArray(textdocs)) {
+      return [];
+    }
+
+    const orderedTextdocs = textdocs
+      .map((textdoc, originalIndex) => {
+        const sourceId = typeof textdoc.id === 'string' ? textdoc.id : null;
+        const lifecycle = sourceId ? lifecycleById.get(sourceId) : null;
+        const sortValue =
+          lifecycle && lifecycle.created_at
+            ? getTimeSortValue(lifecycle.created_at)
+            : getTimeSortValue(textdoc && textdoc.updated_at);
+
+        return {
+          textdoc,
+          originalIndex,
+          sortValue
+        };
+      })
+      .sort((left, right) => {
+        if (left.sortValue !== right.sortValue) {
+          return left.sortValue - right.sortValue;
+        }
+
+        return left.originalIndex - right.originalIndex;
+      });
+
+    return orderedTextdocs.map(({ textdoc }, index) => {
+      const sourceId = typeof textdoc.id === 'string' ? textdoc.id : null;
+      const lifecycle = sourceId ? lifecycleById.get(sourceId) : null;
+
+      const result = {
+        id: `td${String(index + 1).padStart(2, '0')}`,
+        version: Number.isFinite(textdoc.version) ? textdoc.version : null,
+        title: typeof textdoc.title === 'string' ? textdoc.title : null,
+        textdoc_type: typeof textdoc.textdoc_type === 'string' ? textdoc.textdoc_type : null
+      };
+
+      if (lifecycle && lifecycle.created_at) {
+        result.created_at = lifecycle.created_at;
+      }
+
+      if (typeof textdoc.updated_at === 'string' && textdoc.updated_at.trim()) {
+        result.updated_at = toReadableTime(textdoc.updated_at);
+      }
+
+      if (lifecycle && lifecycle.create_source) {
+        result.create_source = lifecycle.create_source;
+      }
+
+      const lifecycleSummary = buildTextdocLifecycleSummary(textdoc, lifecycle);
+
+      if (Object.keys(lifecycleSummary).length > 0) {
+        result.lifecycle = lifecycleSummary;
+      }
+
+      result.content = typeof textdoc.content === 'string' ? textdoc.content : '';
+
+      if (textdoc.metadata !== null && textdoc.metadata !== undefined) {
+        result.metadata = textdoc.metadata;
+      }
+
+      const comments = Array.isArray(textdoc.comments) ? textdoc.comments : [];
+
+      result.comments = comments.map((comment, commentIndex) => {
+        const start = Number.isInteger(comment && comment.start) ? comment.start : null;
+        const end = Number.isInteger(comment && comment.end) ? comment.end : null;
+
+        return {
+          id: `tdc${String(commentIndex + 1).padStart(2, '0')}`,
+          start,
+          end,
+          target_text: getTextdocCommentTargetText(result.content, start, end),
+          content: comment && typeof comment.content === 'string' ? comment.content : ''
+        };
+      });
+
+      return result;
+    });
+  }
+
   /*
    * 建立 handoff JSON。
    *
@@ -1608,10 +2017,11 @@
    *     ]
    *   }
    */
-  function buildHandoff(conversation) {
+  function buildHandoff(conversation, textdocs = []) {
     const mapping = getMapping(conversation);
     const currentNode = conversation.current_node;
     const pathNodeIds = resolveMainPath(mapping, currentNode);
+    const textdocLifecycleById = extractTextdocLifecycle(conversation, pathNodeIds);
 
     const messages = [];
     let userIndex = 0;
@@ -1653,7 +2063,8 @@
       create_time: toReadableTime(conversation.create_time),
       update_time: toReadableTime(conversation.update_time),
       conversation_id: conversation.conversation_id ?? null,
-      messages
+      messages,
+      textdocs: buildHandoffTextdocs(textdocs, textdocLifecycleById)
     };
   }
 
@@ -1698,6 +2109,10 @@
           problems.push(`第 ${index + 1} 則訊息 content 為空。`);
         }
       }
+    }
+
+    if (!Array.isArray(handoff.textdocs)) {
+      problems.push('handoff.textdocs 不是陣列。');
     }
 
     if (!handoff.conversation_id) {
@@ -1922,12 +2337,23 @@
       setAllButtonsBusy(true);
       setButtonText(RAW_BUTTON_ID, '抓取中…');
 
+      const exportTimestamp = getTimestampString();
       const rawText = await getLatestRawText(conversationId);
       const conversation = parseAndValidateRawConversation(rawText, conversationId);
+      const textdocsRawText = await getLatestTextdocsRaw(conversationId);
+      const textdocs = parseAndValidateTextdocsRaw(textdocsRawText);
+
       const prettyRawText = JSON.stringify(conversation, null, 4);
-      const filename = buildRawFilename(rawText, conversationId);
+      const filename = buildRawFilename(rawText, conversationId, exportTimestamp);
 
       downloadTextFile(prettyRawText, filename);
+
+      if (textdocs.length > 0) {
+        const prettyTextdocsText = JSON.stringify(textdocs, null, 4);
+        const textdocsFilename = buildTextdocsFilename(rawText, conversationId, exportTimestamp);
+
+        downloadTextFile(prettyTextdocsText, textdocsFilename);
+      }
     } catch (error) {
       logError('下載原始 JSON 失敗。', error);
       showErrorAlert(error);
@@ -1943,9 +2369,10 @@
    * 流程：
    *   1. 取得最新 raw JSON。
    *   2. 驗證 raw JSON 與目前 conversation ID 一致。
-   *   3. 轉換成 handoff JSON。
-   *   4. 檢查 handoff 結果合理性。
-   *   5. 以 4 空白縮排下載。
+   *   3. 取得目前對話的 textdocs JSON。
+   *   4. 轉換成 handoff JSON。
+   *   5. 檢查 handoff 結果合理性。
+   *   6. 以 4 空白縮排下載。
    */
   async function handleDownloadHandoffClick() {
     const { conversationId } = getCurrentState();
@@ -1959,14 +2386,17 @@
       setAllButtonsBusy(true);
       setButtonText(HANDOFF_BUTTON_ID, '產出中…');
 
+      const exportTimestamp = getTimestampString();
       const rawText = await getLatestRawText(conversationId);
       const conversation = parseAndValidateRawConversation(rawText, conversationId);
-      const handoff = buildHandoff(conversation);
+      const textdocsRawText = await getLatestTextdocsRaw(conversationId);
+      const textdocs = parseAndValidateTextdocsRaw(textdocsRawText);
+      const handoff = buildHandoff(conversation, textdocs);
 
       validateHandoffOrThrow(handoff, conversation);
 
       const handoffText = JSON.stringify(handoff, null, 4);
-      const filename = buildHandoffFilename(rawText, conversationId);
+      const filename = buildHandoffFilename(rawText, conversationId, exportTimestamp);
 
       downloadTextFile(handoffText, filename);
     } catch (error) {
