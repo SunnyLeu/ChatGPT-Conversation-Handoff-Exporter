@@ -2,7 +2,7 @@
 // @name         ChatGPT 對話 JSON 與交接檔匯出工具
 // @name:en      ChatGPT Conversation Handoff Exporter
 // @namespace    https://github.com/SunnyLeu/ChatGPT-Conversation-Handoff-Exporter
-// @version      1.1.5
+// @version      1.1.6
 // @description  在 ChatGPT 對話頁新增按鈕，可下載目前對話的格式化原始 JSON，或直接產出精簡交接用 handoff JSON。
 // @description:en Export the current ChatGPT conversation as formatted raw JSON or compact handoff JSON.
 // @author       SunnyLeu
@@ -60,7 +60,7 @@
    *   - 多次包裝 window.fetch
    *   - 重複的 timer / listener
    */
-  const INSTALL_FLAG = '__chatgptConversationHandoffExporterInstalled_v115';
+  const INSTALL_FLAG = '__chatgptConversationHandoffExporterInstalled_v116';
   /*
    * 兩個按鈕的 DOM id。
    *
@@ -1347,6 +1347,81 @@
     );
   }
   /*
+   * 取得目前對話的 raw JSON 與已驗證 conversation 物件。
+   *
+   * 匯出流程會先通過這個 helper，避免 raw JSON 取得、解析與 ID 驗證邏輯
+   * 分散在不同 click handler 中。
+   */
+  async function getLatestConversationSnapshot(conversationId) {
+    const rawText = await getLatestRawText(conversationId);
+    const conversation = parseAndValidateRawConversation(rawText, conversationId);
+
+    return {
+      rawText,
+      conversation
+    };
+  }
+  /*
+   * 取得目前對話的 textdocs 陣列。
+   *
+   * textdocs 是附加資料，因此這個 helper 採容錯策略：
+   * 若 endpoint 無法取得、回應格式異常或解析失敗，會回傳空陣列，
+   * 讓 raw JSON 與 handoff 主體仍可完成匯出。
+   */
+  async function getLatestTextdocs(conversationId) {
+    try {
+      const textdocsRawText = await getLatestTextdocsRaw(conversationId);
+      return parseAndValidateTextdocsRaw(textdocsRawText);
+    } catch (error) {
+      logWarn('textdocs 解析失敗，改以空 textdocs 繼續。', {
+        conversationId,
+        message: toErrorMessage(error)
+      });
+      return [];
+    }
+  }
+  /*
+   * 下載已驗證的 raw conversation JSON。
+   *
+   * 這裡只負責格式化與下載，不重新解析或重抓資料。
+   */
+  function downloadRawConversation({ rawText, conversation }, conversationId, exportTimestamp) {
+    const prettyRawText = JSON.stringify(conversation, null, 4);
+    const filename = buildRawFilename(rawText, conversationId, exportTimestamp);
+
+    downloadTextFile(prettyRawText, filename);
+  }
+  /*
+   * 若目前對話有 textdocs，下載正規化後的 textdocs JSON。
+   *
+   * 沒有 textdocs 時不下載額外檔案，避免產生無意義的空 JSON 檔。
+   */
+  function downloadTextdocsIfPresent(textdocs, rawText, conversationId, exportTimestamp) {
+    if (!Array.isArray(textdocs) || textdocs.length === 0) {
+      return;
+    }
+
+    const prettyTextdocsText = JSON.stringify(textdocs, null, 4);
+    const textdocsFilename = buildTextdocsFilename(rawText, conversationId, exportTimestamp);
+
+    downloadTextFile(prettyTextdocsText, textdocsFilename);
+  }
+  /*
+   * 建立並下載 handoff JSON。
+   *
+   * 這個 helper 只處理 handoff 轉換、結果檢查與下載，
+   * raw JSON / textdocs 的取得由上層匯出流程負責。
+   */
+  function downloadHandoff({ rawText, conversation }, textdocs, conversationId, exportTimestamp) {
+    const handoff = buildHandoff(conversation, textdocs);
+    validateHandoffOrThrow(handoff, conversation);
+
+    const handoffText = JSON.stringify(handoff, null, 4);
+    const filename = buildHandoffFilename(rawText, conversationId, exportTimestamp);
+
+    downloadTextFile(handoffText, filename);
+  }
+  /*
    * 取得目前頁面的 conversation 狀態。
    */
   function getCurrentState() {
@@ -2121,6 +2196,37 @@
     updateButtonState();
   }
   /*
+   * 執行單一匯出流程。
+   *
+   * 這裡集中處理：
+   *   - conversation ID 檢查
+   *   - 匯出中按鈕文字
+   *   - busy 狀態
+   *   - 錯誤 log 與 alert
+   *   - 流程結束後恢復 UI
+   *
+   * 實際的 raw / handoff 匯出邏輯由 operation callback 提供，
+   * 讓兩個按鈕共用相同的 UI 狀態管理，避免日後出現行為不一致。
+   */
+  async function runExportFlow({ buttonId, busyText, errorLogMessage, operation }) {
+    const { conversationId } = getCurrentState();
+
+    if (!conversationId) {
+      alert('找不到 conversation ID。請確認目前頁面是 ChatGPT 對話頁。');
+      return;
+    }
+
+    try {
+      setExportInProgress(buttonId, busyText);
+      await operation(conversationId);
+    } catch (error) {
+      logError(errorLogMessage, error);
+      showErrorAlert(error);
+    } finally {
+      clearExportInProgress();
+    }
+  }
+  /*
    * 建立按鈕 tooltip。
    *
    * 兩個按鈕會使用不同 actionName，避免 title 看起來像共用同一段說明。
@@ -2250,84 +2356,63 @@
     return button;
   }
   /*
+   * 執行「下載原始 JSON」的實際匯出工作。
+   *
+   * 流程刻意拆成三步：
+   *   1. 取得並驗證 conversation raw JSON。
+   *   2. 立即下載 raw JSON。
+   *   3. 再嘗試下載 textdocs。
+   *
+   * 這樣即使 textdocs 取得失敗，也不會影響最重要的 raw JSON。
+   */
+  async function exportRawConversationFiles(conversationId) {
+    const exportTimestamp = getTimestampString();
+    const snapshot = await getLatestConversationSnapshot(conversationId);
+
+    downloadRawConversation(snapshot, conversationId, exportTimestamp);
+
+    const textdocs = await getLatestTextdocs(conversationId);
+    downloadTextdocsIfPresent(textdocs, snapshot.rawText, conversationId, exportTimestamp);
+  }
+  /*
+   * 執行「下載交接 JSON」的實際匯出工作。
+   *
+   * handoff 需要同時整合對話主分支與 textdocs。
+   * textdocs 若不可取得會被視為空陣列，讓主要對話脈絡仍可交接。
+   */
+  async function exportHandoffFile(conversationId) {
+    const exportTimestamp = getTimestampString();
+    const snapshot = await getLatestConversationSnapshot(conversationId);
+    const textdocs = await getLatestTextdocs(conversationId);
+
+    downloadHandoff(snapshot, textdocs, conversationId, exportTimestamp);
+  }
+  /*
    * 點擊「下載原始 JSON」。
    *
    * raw JSON 會輸出為 4 空白縮排，方便閱讀與版本管理。
    */
   async function handleDownloadRawClick() {
-    const { conversationId } = getCurrentState();
-    if (!conversationId) {
-      alert('找不到 conversation ID。請確認目前頁面是 ChatGPT 對話頁。');
-      return;
-    }
-    try {
-      setExportInProgress(RAW_BUTTON_ID, '抓取中…');
-      const exportTimestamp = getTimestampString();
-      const rawText = await getLatestRawText(conversationId);
-      const conversation = parseAndValidateRawConversation(rawText, conversationId);
-      const prettyRawText = JSON.stringify(conversation, null, 4);
-      const filename = buildRawFilename(rawText, conversationId, exportTimestamp);
-      downloadTextFile(prettyRawText, filename);
-      try {
-        const textdocsRawText = await getLatestTextdocsRaw(conversationId);
-        const textdocs = parseAndValidateTextdocsRaw(textdocsRawText);
-        if (textdocs.length > 0) {
-          const prettyTextdocsText = JSON.stringify(textdocs, null, 4);
-          const textdocsFilename = buildTextdocsFilename(rawText, conversationId, exportTimestamp);
-          downloadTextFile(prettyTextdocsText, textdocsFilename);
-        }
-      } catch (textdocsError) {
-        logWarn('原始 JSON 已下載，但 textdocs JSON 下載失敗。', {
-          message: toErrorMessage(textdocsError)
-        });
-        alert(
-          '原始 JSON 已成功下載，但 textdocs JSON 下載失敗。\n\n' +
-          '這不影響原始 conversation JSON。若這段對話有畫布內容，請稍後再試。\n\n' +
-          `textdocs 錯誤：${toErrorMessage(textdocsError)}`
-        );
-      }
-    } catch (error) {
-      logError('下載原始 JSON 失敗。', error);
-      showErrorAlert(error);
-    } finally {
-      clearExportInProgress();
-    }
+    await runExportFlow({
+      buttonId: RAW_BUTTON_ID,
+      busyText: '抓取中…',
+      errorLogMessage: '下載原始 JSON 失敗。',
+      operation: exportRawConversationFiles
+    });
   }
   /*
    * 點擊「下載交接 JSON」。
    *
-   * 流程：
-   *   1. 取得最新 raw JSON。
-   *   2. 驗證 raw JSON 與目前 conversation ID 一致。
-   *   3. 取得目前對話的 textdocs JSON。
-   *   4. 轉換成 handoff JSON。
-   *   5. 檢查 handoff 結果合理性。
-   *   6. 以 4 空白縮排下載。
+   * UI 狀態與錯誤處理由 runExportFlow() 統一處理，
+   * 實際轉換與下載工作交給 exportHandoffFile()。
    */
   async function handleDownloadHandoffClick() {
-    const { conversationId } = getCurrentState();
-    if (!conversationId) {
-      alert('找不到 conversation ID。請確認目前頁面是 ChatGPT 對話頁。');
-      return;
-    }
-    try {
-      setExportInProgress(HANDOFF_BUTTON_ID, '產出中…');
-      const exportTimestamp = getTimestampString();
-      const rawText = await getLatestRawText(conversationId);
-      const conversation = parseAndValidateRawConversation(rawText, conversationId);
-      const textdocsRawText = await getLatestTextdocsRaw(conversationId);
-      const textdocs = parseAndValidateTextdocsRaw(textdocsRawText);
-      const handoff = buildHandoff(conversation, textdocs);
-      validateHandoffOrThrow(handoff, conversation);
-      const handoffText = JSON.stringify(handoff, null, 4);
-      const filename = buildHandoffFilename(rawText, conversationId, exportTimestamp);
-      downloadTextFile(handoffText, filename);
-    } catch (error) {
-      logError('下載交接 JSON 失敗。', error);
-      showErrorAlert(error);
-    } finally {
-      clearExportInProgress();
-    }
+    await runExportFlow({
+      buttonId: HANDOFF_BUTTON_ID,
+      busyText: '產出中…',
+      errorLogMessage: '下載交接 JSON 失敗。',
+      operation: exportHandoffFile
+    });
   }
   /*
    * 將兩個按鈕插入 ChatGPT 對話頁 header。
