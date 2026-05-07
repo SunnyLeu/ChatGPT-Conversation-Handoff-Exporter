@@ -2,7 +2,7 @@
 // @name         ChatGPT 對話 JSON 與交接檔匯出工具
 // @name:en      ChatGPT Conversation Handoff Exporter
 // @namespace    https://github.com/SunnyLeu/ChatGPT-Conversation-Handoff-Exporter
-// @version      1.1.7
+// @version      1.1.8
 // @description  在 ChatGPT 對話頁新增按鈕，可下載目前對話的格式化原始 JSON，或直接產出精簡交接用 handoff JSON。
 // @description:en Export the current ChatGPT conversation as formatted raw JSON or compact handoff JSON.
 // @author       SunnyLeu
@@ -60,7 +60,7 @@
    *   - 多次包裝 window.fetch
    *   - 重複的 timer / listener
    */
-  const INSTALL_FLAG = '__chatgptConversationHandoffExporterInstalled_v117';
+  const INSTALL_FLAG = '__chatgptConversationHandoffExporterInstalled_v118';
   /*
    * 兩個按鈕的 DOM id。
    *
@@ -274,6 +274,38 @@
       return error.message;
     }
     return String(error);
+  }
+  /*
+   * 依 HTTP 狀態碼補上使用者可採取的處理建議。
+   *
+   * 這些訊息只顯示在錯誤提示中，不會改變匯出流程本身。
+   */
+  function getHttpStatusSuggestion(status) {
+    if (status === 401 || status === 403) {
+      return '建議：重新整理頁面確認登入狀態仍有效；若仍失敗，請重新登入 ChatGPT 後再試。';
+    }
+    if (status === 404) {
+      return '建議：確認目前頁面仍是同一個對話，或重新整理此對話頁後再試。';
+    }
+    if (status === 408 || status === 425 || status === 429) {
+      return '建議：稍候片刻再試，避免在短時間內連續重複匯出。';
+    }
+    if (status >= 500) {
+      return '建議：ChatGPT 後端可能暫時異常，請稍後再試。';
+    }
+    return '建議：重新整理頁面，等待對話內容載入完成後再試。';
+  }
+  /*
+   * 建立缺少 request context 時的錯誤訊息。
+   *
+   * 常見原因是腳本尚未攔截到 ChatGPT 自己發出的 backend API 請求。
+   */
+  function buildMissingRequestContextMessage(dataName) {
+    return (
+      `目前無法取得此對話的 ${dataName} 請求資訊。\n\n` +
+      '建議：先等待對話內容完全載入，再按一次匯出按鈕。\n' +
+      '如果仍然失敗，請重新整理頁面，或重新進入這段對話後再試。'
+    );
   }
   /*
    * 顯示使用者可理解的錯誤訊息。
@@ -531,12 +563,6 @@
     return sanitized || 'chatgpt-conversation';
   }
   /*
-   * 集中 JSON.parse 呼叫點，方便未來需要加強錯誤處理時調整。
-   */
-  function tryParseJson(rawText) {
-    return JSON.parse(rawText);
-  }
-  /*
    * 從 conversation 物件取得標題。
    */
   function getConversationTitle(conversation, fallback = 'chatgpt-conversation') {
@@ -631,21 +657,6 @@
     }
   }
   /*
-   * 優先從目前頁面取得即時標題。
-   *
-   * 取值順序：
-   *   1. 連到目前 conversation ID 的頁面連結文字
-   *   2. document.title
-   *   3. 空字串
-   */
-  function getTitleFromCurrentPage(conversationId) {
-    const linkTitle = getTitleFromConversationLink(conversationId);
-    if (linkTitle) {
-      return linkTitle;
-    }
-    return cleanBrowserTitle(document.title);
-  }
-  /*
    * tooltip 顯示用標題。
    *
    * 取值順序：
@@ -673,7 +684,7 @@
    */
   function tryGetTitleFromRawJson(rawText, conversationId) {
     try {
-      const data = tryParseJson(rawText);
+      const data = JSON.parse(rawText);
       return getConversationTitle(data, conversationId || 'chatgpt-conversation');
     } catch {
       return conversationId || 'chatgpt-conversation';
@@ -922,7 +933,8 @@
         '下載中止：目前網址的 conversation ID 與 raw JSON 內的 conversation_id 不一致。\n\n' +
         `目前網址 ID：${expectedConversationId}\n` +
         `raw JSON ID：${conversation.conversation_id}\n\n` +
-        '這通常表示頁面剛切換對話，或捕捉到舊對話資料。請稍等一秒後再試。'
+        '這通常表示頁面剛切換對話，或捕捉到上一段對話資料。\n' +
+        '建議：確認目前仍停留在要匯出的對話，等待內容載入完成後再按一次。'
       );
     }
     return conversation;
@@ -1130,10 +1142,7 @@
   async function refetchLatestConversationRaw(conversationId) {
     const replayRequest = getReplayRequestForConversation(conversationId);
     if (!replayRequest) {
-      throw new Error(
-        '目前無法取得此對話的 JSON 請求資訊。\n\n' +
-        '請確認對話內容已載入完成，或重新進入此對話頁後再試一次。'
-      );
+      throw new Error(buildMissingRequestContextMessage('conversation JSON'));
     }
     replayRequestByConversationId.set(conversationId, replayRequest);
     const response = await fetch(replayRequest.url, {
@@ -1143,20 +1152,25 @@
       headers: new Headers(replayRequest.headers)
     });
     if (!response.ok) {
-      throw new Error(`即時重新抓取失敗：HTTP ${response.status} ${response.statusText}`);
+      throw new Error(
+        `即時重新抓取 conversation JSON 失敗：HTTP ${response.status} ${response.statusText || ''}\n\n` +
+        getHttpStatusSuggestion(response.status)
+      );
     }
     const contentType = response.headers.get('content-type') || '';
     if (!contentType.includes('application/json')) {
       throw new Error(
-        '即時重新抓取失敗：回應不是 JSON。\n\n' +
-        `Content-Type: ${contentType || '未知'}`
+        '即時重新抓取 conversation JSON 失敗：回應不是 JSON。\n\n' +
+        `Content-Type: ${contentType || '未知'}\n\n` +
+        '建議：重新整理頁面並確認對話已正常載入。若仍持續發生，可能是 ChatGPT 前端或內部 endpoint 格式已變更。'
       );
     }
     const rawText = await response.text();
     if (!looksLikeConversationObject(rawText)) {
       throw new Error(
-        '即時重新抓取失敗：回應不是完整 conversation JSON 物件。\n\n' +
-        `內容長度：${rawText ? rawText.length : 0}`
+        '即時重新抓取 conversation JSON 失敗：回應不是完整 conversation JSON 物件。\n\n' +
+        `內容長度：${rawText ? rawText.length : 0}\n\n` +
+        '建議：確認目前頁面是完整對話頁，等待載入完成後再試；若仍失敗，請重新整理或稍後再試。'
       );
     }
     parseAndValidateRawConversation(rawText, conversationId);
@@ -1317,14 +1331,6 @@
     return rawText;
   }
   /*
-   * 取得最新 textdocs 原始 JSON。
-   *
-   * 目前直接重新抓取 endpoint，並由 refetchTextdocsRaw() 負責容錯。
-   */
-  async function getLatestTextdocsRaw(conversationId) {
-    return refetchTextdocsRaw(conversationId);
-  }
-  /*
    * 取得最新 raw JSON。
    *
    * 優先順序：
@@ -1370,7 +1376,7 @@
    */
   async function getLatestTextdocs(conversationId) {
     try {
-      const textdocsRawText = await getLatestTextdocsRaw(conversationId);
+      const textdocsRawText = await refetchTextdocsRaw(conversationId);
       return parseAndValidateTextdocsRaw(textdocsRawText);
     } catch (error) {
       logWarn('textdocs 解析失敗，改以空 textdocs 繼續。', {
@@ -2231,7 +2237,11 @@
     const { conversationId } = getCurrentState();
 
     if (!conversationId) {
-      alert('找不到 conversation ID。請確認目前頁面是 ChatGPT 對話頁。');
+      alert(
+        '找不到 conversation ID。\n\n' +
+        '請確認目前頁面是 ChatGPT 對話頁，且網址包含 /c/{conversation_id}。\n' +
+        '如果你剛切換頁面，請等待頁面載入完成後再試。'
+      );
       return;
     }
 
