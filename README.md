@@ -1,18 +1,23 @@
 # ChatGPT Conversation Handoff Exporter
 
-Tampermonkey userscript，用來在 ChatGPT 對話頁匯出目前對話的原始 JSON，或直接產出精簡交接用 JSON。
+Tampermonkey userscript，用來在 ChatGPT 網頁版對話頁匯出目前對話的原始 JSON，或直接產出精簡交接用 handoff JSON。
 
-## 功能
+這個工具的目標是取代手動從 DevTools 複製長 JSON response 的流程，讓使用者可以在目前正在看的單一對話中，透過頁面右上角按鈕匯出資料。
+
+## 功能特色
 
 - 在 ChatGPT 對話頁右上角新增兩個按鈕：
   - **下載原始 JSON**
   - **下載交接 JSON**
+- 支援一般對話網址與 GPT / project 內的對話網址。
+- 點擊按鈕時會即時重新抓取目前對話的最新 raw conversation JSON。
 - 原始 JSON 會以 4 空白縮排輸出，方便閱讀與保存。
 - 若對話包含畫布 / textdocs，下載原始 JSON 時會一併下載 textdocs 原始 JSON。
 - 交接 JSON 會保留目前主分支上的可見 `user` / `assistant` 訊息。
 - 交接 JSON 會包含畫布 / textdocs 的內容、註解與精簡生命週期資訊。
-- 支援一般對話網址與 GPT/project 內的對話網址。
-- 點擊按鈕時會即時重新抓取目前對話的最新 raw JSON。
+- textdocs 抓取失敗、回傳空內容，或格式與預期不同時，會以空陣列 `[]` 處理，並繼續完成主要匯出。
+- 匯出過程中，按鈕會顯示目前進度，例如正在擷取原始 JSON、正在擷取 textdocs、正在產出交接 JSON。
+- 錯誤提示會盡量提供可操作建議，例如重新整理頁面、重新登入、等待對話載入完成或稍後再試。
 - 不需要手動複製 DevTools response。
 - 不需要執行 Python 腳本。
 - 透過 Tampermonkey metadata 支援自動更新。
@@ -59,10 +64,12 @@ Tampermonkey 會依照其自身設定定期檢查更新；也可以在 Tampermon
 
 ## 使用方式
 
-進入任一 ChatGPT 對話頁後，右上角會出現：
+進入任一 ChatGPT 對話頁後，右上角會出現兩個按鈕：
 
 - **下載原始 JSON**
 - **下載交接 JSON**
+
+### 下載原始 JSON
 
 點擊 **下載原始 JSON** 會下載目前對話的原始 conversation JSON：
 
@@ -76,7 +83,9 @@ Tampermonkey 會依照其自身設定定期檢查更新；也可以在 Tampermon
 {對話標題}-{yyyyMMddHHmmss}.textdocs.json
 ```
 
-如果該對話沒有畫布 / textdocs，則只會下載原始 conversation JSON。
+如果該對話沒有畫布 / textdocs，或 textdocs endpoint 無法取得可用內容，則只會下載原始 conversation JSON。
+
+### 下載交接 JSON
 
 點擊 **下載交接 JSON** 會下載：
 
@@ -86,9 +95,51 @@ Tampermonkey 會依照其自身設定定期檢查更新；也可以在 Tampermon
 
 交接 JSON 會把對話訊息與畫布 / textdocs 整合在同一份檔案中。
 
+### 匯出進度
+
+按下匯出按鈕後，按鈕文字會顯示目前處理階段，例如：
+
+- 正在擷取原始 JSON…
+- 正在下載原始 JSON…
+- 正在擷取 textdocs…
+- 正在下載 textdocs…
+- 正在產出交接 JSON…
+- 正在下載交接 JSON…
+
+這些文字只代表瀏覽器端流程已執行到對應階段；實際下載檔案是否已寫入下載資料夾，仍以瀏覽器下載管理器為準。
+
 > 瀏覽器可能會在第一次下載多個檔案時詢問是否允許 `chatgpt.com` 下載多個檔案。這是瀏覽器的正常安全提示。
 
-若 textdocs endpoint 無法取得、回傳空內容，或格式與預期不同，工具會以空陣列 `[]` 處理 textdocs，並繼續完成主要對話 JSON / handoff JSON 匯出。
+## 匯出行為與容錯
+
+### 對話資料
+
+工具會優先使用 ChatGPT 頁面自己發出的 backend API 請求資訊，重新抓取目前對話的最新 raw JSON。
+
+若目前尚未捕捉到可重用請求資訊，工具會提示使用者等待對話載入完成、重新整理頁面，或重新進入該對話後再試。
+
+### textdocs / 畫布資料
+
+textdocs 是附加資料，不應阻斷主要對話匯出。
+
+以下情況會以空陣列 `[]` 處理 textdocs，並繼續完成主要匯出：
+
+- textdocs endpoint 無法取得。
+- endpoint 回傳 `204`、`205`、`404`。
+- endpoint 回傳空內容。
+- endpoint 回傳非 JSON。
+- endpoint 回傳格式與預期不同。
+- 單一 textdoc 項目格式不完整或不支援。
+
+### 錯誤提示
+
+匯出失敗時，工具會盡量提供具體建議：
+
+- `401` / `403`：可能是登入狀態失效，可重新整理或重新登入後再試。
+- `404`：可能已切換對話或目前 conversation ID 不一致，可確認頁面後再試。
+- `408` / `425` / `429`：可能需要稍候片刻再試。
+- `5xx`：可能是 ChatGPT 後端暫時異常，可稍後再試。
+- 非 JSON 或非完整 conversation JSON：可重新整理頁面，等待對話載入完成後再試。
 
 ## 交接 JSON 格式
 
@@ -164,6 +215,8 @@ Tampermonkey 會依照其自身設定定期檢查更新；也可以在 Tampermon
 }
 ```
 
+## 欄位說明
+
 ### 頂層欄位
 
 | 欄位              | 型別             | 說明                                                                                                 |
@@ -173,7 +226,7 @@ Tampermonkey 會依照其自身設定定期檢查更新；也可以在 Tampermon
 | `update_time`     | `string \| null` | 對話最後更新時間。格式同 `create_time`。                                                             |
 | `conversation_id` | `string \| null` | ChatGPT 原始 conversation ID。通常會對應網址中的 `/c/{conversation_id}`。                            |
 | `messages`        | `array`          | 精簡後的訊息陣列，只保留目前主分支上的可見 `user` / `assistant` 訊息。                               |
-| `textdocs`        | `array`          | 畫布 / textdocs 陣列。若對話沒有畫布，會輸出空陣列 `[]`。                                            |
+| `textdocs`        | `array`          | 畫布 / textdocs 陣列。若沒有可用畫布資料，會輸出空陣列 `[]`。                                        |
 
 ### `messages[]` 單一訊息欄位
 
@@ -206,8 +259,8 @@ Tampermonkey 會依照其自身設定定期檢查更新；也可以在 Tampermon
 | `updated_at`    | `string`，選填   | 畫布最後更新時間。來自 textdocs endpoint。時間會整理成毫秒 3 位與 `+00:00` UTC offset 格式。   |
 | `create_source` | `string`，選填   | 畫布建立來源，例如 `model`。                                                                   |
 | `lifecycle`     | `object`，選填   | 畫布生命週期摘要，例如目前版本、建立版本、更新次數、註解事件次數、最後一次 canvas event 時間。 |
-| `content`       | `string`         | 畫布完整內容。                                                                                 |
-| `metadata`      | `object`，選填   | 若 textdocs endpoint 回傳非空 metadata，會保留。                                               |
+| `content`       | `string`         | 畫布完整內容。若 endpoint 缺少內容，會使用空字串。                                             |
+| `metadata`      | `object`，選填   | 若 textdocs endpoint 回傳非空 metadata，會保留。空物件不會輸出。                               |
 | `comments`      | `array`          | 畫布註解陣列。若沒有註解，會是空陣列 `[]`。                                                    |
 
 ### `textdocs[].lifecycle` 欄位
@@ -230,9 +283,10 @@ Tampermonkey 會依照其自身設定定期檢查更新；也可以在 Tampermon
 | `target_text` | `string \| null` | 根據 `start` / `end` 從 `content` 擷取出的目標文字。若位置無效，會是 `null`。 |
 | `content`     | `string`         | 註解內容。                                                                    |
 
-### 訊息順序與主分支
+## 訊息順序與主分支
 
-ChatGPT 原始 conversation JSON 的 `mapping` 是樹狀結構，不是單純的訊息陣列。  
+ChatGPT 原始 conversation JSON 的 `mapping` 是樹狀結構，不是單純的訊息陣列。
+
 本工具會從 `current_node` 沿著 `parent` 一路回推，取得目前 UI 實際採用的主分支，再依順序輸出到 `messages`。
 
 這代表：
@@ -286,8 +340,10 @@ textdocs 內容只會在使用者按下 **下載原始 JSON** 或 **下載交接
 
 ## 限制
 
-本腳本依賴 ChatGPT 網頁版目前的 DOM 與內部請求格式。  
-若 ChatGPT 前端改版，腳本可能需要更新。
+- 本腳本依賴 ChatGPT 網頁版目前的 DOM 與內部請求格式。
+- 若 ChatGPT 前端或內部 endpoint 改版，腳本可能需要更新。
+- 本腳本不是 OpenAI 官方 API，也不是官方匯出功能。
+- 本工具主要面向可安裝 Tampermonkey / userscript 的桌面瀏覽器環境。
 
 ## License
 
