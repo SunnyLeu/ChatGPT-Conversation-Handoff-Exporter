@@ -2,7 +2,7 @@
 // @name         ChatGPT 對話 JSON 與交接檔匯出工具
 // @name:en      ChatGPT Conversation Handoff Exporter
 // @namespace    https://github.com/SunnyLeu/ChatGPT-Conversation-Handoff-Exporter
-// @version      1.1.8
+// @version      1.1.9
 // @description  在 ChatGPT 對話頁新增按鈕，可下載目前對話的格式化原始 JSON，或直接產出精簡交接用 handoff JSON。
 // @description:en Export the current ChatGPT conversation as formatted raw JSON or compact handoff JSON.
 // @author       SunnyLeu
@@ -60,7 +60,7 @@
    *   - 多次包裝 window.fetch
    *   - 重複的 timer / listener
    */
-  const INSTALL_FLAG = '__chatgptConversationHandoffExporterInstalled_v118';
+  const INSTALL_FLAG = '__chatgptConversationHandoffExporterInstalled_v119';
   /*
    * 兩個按鈕的 DOM id。
    *
@@ -178,13 +178,13 @@
   ]);
   /*
    * 某些 assistant 訊息其實是工具操作內容，而不是一般可讀回覆。
-   * 例如 web 搜尋工具的 search_query / open / find 等。
    *
-   * 這些內容若輸出到 handoff，會讓新對話看到內部工具呼叫細節，
-   * 因此要排除。
+   * 這裡先處理較明顯的非 canmore 工具 payload，例如 web 搜尋、
+   * 商品查詢、天氣、計算器等工具呼叫。畫布 / textdocs 相關工具
+   * 會另外透過 recipient 與 JSON payload 結構判斷。
    */
   const ASSISTANT_TOOL_OPERATION_PATTERN =
-    /(^|\n)\s*\{?\s*"?(search_query|open|find|click|image_query|product_query|sports|finance|weather|calculator|time)"?\s*:/i;
+    /(^|\n)\s*\{?\s*\"?(search_query|open|find|click|image_query|product_query|sports|finance|weather|calculator|time)\"?\s*:/i;
   /*
    * 兩個按鈕使用的 inline SVG。
    *
@@ -1546,16 +1546,71 @@
       .trim();
   }
   /*
-   * 判斷 assistant 訊息是否比較像工具操作 payload。
+   * 判斷 assistant 訊息是否送往工具 recipient。
+   *
+   * 真正顯示給使用者看的 assistant 訊息通常會送往 all；
+   * canmore.create_textdoc、canmore.update_textdoc、web.run 等 recipient
+   * 代表這則訊息是工具呼叫，不應輸出到 handoff messages。
+   */
+  function hasAssistantToolRecipient(message) {
+    const recipient = message && typeof message.recipient === 'string'
+      ? message.recipient.trim()
+      : '';
+
+    return Boolean(recipient && recipient !== 'all');
+  }
+
+  /*
+   * 判斷 JSON 物件是否像 canmore / textdoc 工具 payload。
+   *
+   * 這裡只檢查整段 assistant 內容能被解析成 JSON 物件的情況，
+   * 避免誤刪一般回覆中夾帶的 JSON 範例。
+   */
+  function looksLikeCanmoreToolPayloadObject(value) {
+    if (!isObjectRecord(value)) {
+      return false;
+    }
+
+    if (Array.isArray(value.updates) || Array.isArray(value.comments)) {
+      return true;
+    }
+
+    if (
+      typeof value.name === 'string' &&
+      typeof value.type === 'string' &&
+      typeof value.content === 'string'
+    ) {
+      return value.type === 'document' || value.type.startsWith('code/');
+    }
+
+    return false;
+  }
+
+  /*
+   * 判斷 assistant 文字內容是否像工具操作 payload。
    *
    * 這類內容不是給使用者閱讀的自然語言回覆，因此不輸出到 handoff。
    */
   function looksLikeAssistantToolOperation(text) {
     const stripped = String(text || '').trim();
+
     if (!stripped) {
       return false;
     }
-    return ASSISTANT_TOOL_OPERATION_PATTERN.test(stripped);
+
+    if (ASSISTANT_TOOL_OPERATION_PATTERN.test(stripped)) {
+      return true;
+    }
+
+    if (!stripped.startsWith('{') || !stripped.endsWith('}')) {
+      return false;
+    }
+
+    try {
+      return looksLikeCanmoreToolPayloadObject(JSON.parse(stripped));
+    } catch {
+      return false;
+    }
   }
   /*
    * 引用來源 attribution 可能是字串，也可能是物件。
@@ -1757,6 +1812,9 @@
     }
     const role = author.role;
     if (!ALLOWED_ROLES.has(role)) {
+      return null;
+    }
+    if (role === 'assistant' && hasAssistantToolRecipient(message)) {
       return null;
     }
     const metadata = message.metadata && typeof message.metadata === 'object' ? message.metadata : null;
