@@ -2,7 +2,7 @@
 // @name         ChatGPT 對話 JSON 與交接檔匯出工具
 // @name:en      ChatGPT Conversation Handoff Exporter
 // @namespace    https://github.com/SunnyLeu/ChatGPT-Conversation-Handoff-Exporter
-// @version      1.1.9
+// @version      1.1.10
 // @description  在 ChatGPT 對話頁新增按鈕，可下載目前對話的格式化原始 JSON，或直接產出精簡交接用 handoff JSON。
 // @description:en Export the current ChatGPT conversation as formatted raw JSON or compact handoff JSON.
 // @author       SunnyLeu
@@ -60,7 +60,7 @@
    *   - 多次包裝 window.fetch
    *   - 重複的 timer / listener
    */
-  const INSTALL_FLAG = '__chatgptConversationHandoffExporterInstalled_v119';
+  const INSTALL_FLAG = '__chatgptConversationHandoffExporterInstalled_v1110';
   /*
    * 兩個按鈕的 DOM id。
    *
@@ -649,9 +649,14 @@
     if (!capture || !capture.rawText) {
       return '';
     }
+    if (typeof capture.title === 'string' && capture.title.trim()) {
+      return capture.title.trim();
+    }
     try {
       const conversation = JSON.parse(capture.rawText);
-      return getConversationTitle(conversation, '');
+      const title = getConversationTitle(conversation, '');
+      capture.title = title;
+      return title;
     } catch {
       return '';
     }
@@ -731,6 +736,34 @@
   // 四、捕捉與重新抓取 ChatGPT 原始 conversation JSON
   // ============================================================
   /*
+   * 不適合手動重用的 request headers。
+   *
+   * 這個集合固定不變，放在函式外可避免每次複製 headers 時重複建立 Set。
+   */
+  const FORBIDDEN_REPLAY_HEADERS = new Set([
+    'accept-encoding',
+    'access-control-request-headers',
+    'access-control-request-method',
+    'connection',
+    'content-length',
+    'cookie',
+    'cookie2',
+    'date',
+    'expect',
+    'host',
+    'keep-alive',
+    'origin',
+    'permissions-policy',
+    'priority',
+    'referer',
+    'te',
+    'trailer',
+    'transfer-encoding',
+    'upgrade',
+    'user-agent',
+    'via'
+  ]);
+  /*
    * 判斷哪些 header 適合重用。
    *
    * 不重用的 header 類型：
@@ -749,30 +782,7 @@
     if (lowerName.startsWith('sec-')) {
       return false;
     }
-    const forbiddenOrUnhelpful = new Set([
-      'accept-encoding',
-      'access-control-request-headers',
-      'access-control-request-method',
-      'connection',
-      'content-length',
-      'cookie',
-      'cookie2',
-      'date',
-      'expect',
-      'host',
-      'keep-alive',
-      'origin',
-      'permissions-policy',
-      'priority',
-      'referer',
-      'te',
-      'trailer',
-      'transfer-encoding',
-      'upgrade',
-      'user-agent',
-      'via'
-    ]);
-    return !forbiddenOrUnhelpful.has(lowerName);
+    return !FORBIDDEN_REPLAY_HEADERS.has(lowerName);
   }
   /*
    * 複製可安全重用的 request headers。
@@ -862,11 +872,15 @@
   }
   /*
    * 把 raw JSON 暫存到記憶體。
+   *
+   * title 會一併快取，避免 tooltip 更新時重複解析大型 raw JSON。
    */
-  function rememberRawConversation(conversationId, rawText) {
+  function rememberRawConversation(conversationId, rawText, conversation = null) {
+    const title = conversation ? getConversationTitle(conversation, '') : '';
     capturedRawByConversationId.set(conversationId, {
       rawText,
-      capturedAt: Date.now()
+      capturedAt: Date.now(),
+      title
     });
     logInfo('已捕捉 conversation JSON。', {
       conversationId,
@@ -962,12 +976,13 @@
           if (!looksLikeConversationObject(rawText)) {
             return;
           }
+          let conversation;
           try {
-            parseAndValidateRawConversation(rawText, conversationId);
+            conversation = parseAndValidateRawConversation(rawText, conversationId);
           } catch {
             return;
           }
-          rememberRawConversation(conversationId, rawText);
+          rememberRawConversation(conversationId, rawText, conversation);
         })
         .catch((error) => {
           logWarn('捕捉 conversation JSON 失敗。', {
@@ -1173,8 +1188,8 @@
         '建議：確認目前頁面是完整對話頁，等待載入完成後再試；若仍失敗，請重新整理或稍後再試。'
       );
     }
-    parseAndValidateRawConversation(rawText, conversationId);
-    rememberRawConversation(conversationId, rawText);
+    const conversation = parseAndValidateRawConversation(rawText, conversationId);
+    rememberRawConversation(conversationId, rawText, conversation);
     return rawText;
   }
   /*
@@ -2196,7 +2211,7 @@
       return;
     }
     const label = button.querySelector('[data-export-label]');
-    if (label) {
+    if (label && label.textContent !== text) {
       label.textContent = text;
     }
   }
@@ -2208,7 +2223,9 @@
     if (!button) {
       return;
     }
-    button.title = text;
+    if (button.title !== text) {
+      button.title = text;
+    }
   }
   /*
    * 設定單一按鈕的 busy 狀態。
@@ -2220,9 +2237,17 @@
     if (!button) {
       return;
     }
-    button.disabled = isBusy;
-    button.style.opacity = isBusy ? '0.65' : '';
-    button.style.cursor = isBusy ? 'wait' : '';
+    const opacity = isBusy ? '0.65' : '';
+    const cursor = isBusy ? 'wait' : '';
+    if (button.disabled !== isBusy) {
+      button.disabled = isBusy;
+    }
+    if (button.style.opacity !== opacity) {
+      button.style.opacity = opacity;
+    }
+    if (button.style.cursor !== cursor) {
+      button.style.cursor = cursor;
+    }
   }
   /*
    * 同步設定兩個匯出按鈕的 busy 狀態。
