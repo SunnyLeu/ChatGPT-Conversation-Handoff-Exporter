@@ -2,7 +2,7 @@
 // @name         ChatGPT 對話 JSON 與交接檔匯出工具
 // @name:en      ChatGPT Conversation Handoff Exporter
 // @namespace    https://github.com/SunnyLeu/ChatGPT-Conversation-Handoff-Exporter
-// @version      1.1.10
+// @version      1.1.11
 // @description  在 ChatGPT 對話頁新增按鈕，可下載目前對話的格式化原始 JSON，或直接產出精簡交接用 handoff JSON。
 // @description:en Export the current ChatGPT conversation as formatted raw JSON or compact handoff JSON.
 // @author       SunnyLeu
@@ -60,7 +60,7 @@
    *   - 多次包裝 window.fetch
    *   - 重複的 timer / listener
    */
-  const INSTALL_FLAG = '__chatgptConversationHandoffExporterInstalled_v1110';
+  const INSTALL_FLAG = '__chatgptConversationHandoffExporterInstalled_v1111';
   /*
    * 兩個按鈕的 DOM id。
    *
@@ -226,16 +226,44 @@
    */
   const LOG_PREFIX = '[ChatGPT 對話匯出工具]';
   /*
+   * 建立 Console log 使用的本機時間戳記。
+   *
+   * 格式：
+   *   [yyyy/MM/dd HH:mm:ss]
+   *
+   * 這裡使用瀏覽器本機時間，方便使用者直接對照操作時間與頁面事件。
+   */
+  function getLogTimestampPrefix(date = new Date()) {
+    const year = date.getFullYear();
+    const month = String(date.getMonth() + 1).padStart(2, '0');
+    const day = String(date.getDate()).padStart(2, '0');
+    const hour = String(date.getHours()).padStart(2, '0');
+    const minute = String(date.getMinutes()).padStart(2, '0');
+    const second = String(date.getSeconds()).padStart(2, '0');
+
+    return `[${year}/${month}/${day} ${hour}:${minute}:${second}]`;
+  }
+  /*
+   * 建立 Console log 前綴。
+   *
+   * 每次輸出時即時計算時間，避免長時間頁面停留後仍使用舊時間。
+   */
+  function getLogPrefix() {
+    return `${getLogTimestampPrefix()} ${LOG_PREFIX}`;
+  }
+  /*
    * 輸出一般狀態訊息。
    *
    * 只允許輸出安全摘要，不應傳入 raw JSON、headers、cookie 或 token。
    */
   function logInfo(message, data = null) {
+    const prefix = getLogPrefix();
+
     if (data === null || data === undefined) {
-      console.info(LOG_PREFIX, message);
+      console.info(prefix, message);
       return;
     }
-    console.info(LOG_PREFIX, message, data);
+    console.info(prefix, message, data);
   }
   /*
    * 輸出可恢復的警告訊息。
@@ -243,11 +271,13 @@
    * 例如 textdocs 取得失敗但主要匯出仍可繼續時，使用 warning 而不是 error。
    */
   function logWarn(message, data = null) {
+    const prefix = getLogPrefix();
+
     if (data === null || data === undefined) {
-      console.warn(LOG_PREFIX, message);
+      console.warn(prefix, message);
       return;
     }
-    console.warn(LOG_PREFIX, message, data);
+    console.warn(prefix, message, data);
   }
   /*
    * 輸出需要使用者注意的錯誤摘要。
@@ -255,11 +285,13 @@
    * 只保留錯誤名稱與訊息，避免把 response body 或請求內容印到 Console。
    */
   function logError(message, error = null) {
+    const prefix = getLogPrefix();
+
     if (!error) {
-      console.error(LOG_PREFIX, message);
+      console.error(prefix, message);
       return;
     }
-    console.error(LOG_PREFIX, message, {
+    console.error(prefix, message, {
       name: error.name || 'Error',
       message: error.message || String(error)
     });
