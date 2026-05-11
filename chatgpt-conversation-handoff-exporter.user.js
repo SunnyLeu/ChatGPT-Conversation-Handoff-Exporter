@@ -2,7 +2,7 @@
 // @name         ChatGPT 對話 JSON 與交接檔匯出工具
 // @name:en      ChatGPT Conversation Handoff Exporter
 // @namespace    https://github.com/SunnyLeu/ChatGPT-Conversation-Handoff-Exporter
-// @version      1.1.12
+// @version      1.1.13
 // @description  在 ChatGPT 對話頁新增按鈕，可下載目前對話的格式化原始 JSON，或直接產出精簡交接用 handoff JSON。
 // @description:en Export the current ChatGPT conversation as formatted raw JSON or compact handoff JSON.
 // @author       SunnyLeu
@@ -60,7 +60,7 @@
    *   - 多次包裝 window.fetch
    *   - 重複的 timer / listener
    */
-  const INSTALL_FLAG = '__chatgptConversationHandoffExporterInstalled_v1112';
+  const INSTALL_FLAG = '__chatgptConversationHandoffExporterInstalled_v1113';
   /*
    * 兩個按鈕的 DOM id。
    *
@@ -2466,6 +2466,7 @@
     button.type = 'button';
     button.setAttribute('aria-label', ariaLabel);
     button.setAttribute('data-testid', testId);
+    button.setAttribute('data-cgpt-export-button', 'true');
     /*
      * 這裡沿用 ChatGPT 既有按鈕 class，讓樣式與「分享」按鈕一致。
      * 若 ChatGPT 未來改 class，按鈕可能仍存在，但外觀可能需要調整。
