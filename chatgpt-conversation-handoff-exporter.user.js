@@ -2,7 +2,7 @@
 // @name         ChatGPT 對話 JSON 與交接檔匯出工具
 // @name:en      ChatGPT Conversation Handoff Exporter
 // @namespace    https://github.com/SunnyLeu/ChatGPT-Conversation-Handoff-Exporter
-// @version      1.1.13
+// @version      1.1.14
 // @description  在 ChatGPT 對話頁新增按鈕，可下載目前對話的格式化原始 JSON，或直接產出精簡交接用 handoff JSON。
 // @description:en Export the current ChatGPT conversation as formatted raw JSON or compact handoff JSON.
 // @author       SunnyLeu
@@ -60,7 +60,7 @@
    *   - 多次包裝 window.fetch
    *   - 重複的 timer / listener
    */
-  const INSTALL_FLAG = '__chatgptConversationHandoffExporterInstalled_v1113';
+  const INSTALL_FLAG = '__chatgptConversationHandoffExporterInstalled_v1114';
   /*
    * 兩個按鈕的 DOM id。
    *
@@ -2448,6 +2448,8 @@
    * ChatGPT 是 SPA，網址切換時不一定重新載入頁面，因此需要主動清理舊 UI。
    */
   function removeButtonsIfNeeded() {
+    stopObservingExportButtonsShareState();
+
     const rawButton = document.querySelector(`#${RAW_BUTTON_ID}`);
     const handoffButton = document.querySelector(`#${HANDOFF_BUTTON_ID}`);
     if (rawButton) {
@@ -2619,9 +2621,18 @@
    */
   function getOrCreateExportButton(config) {
     const existingButton = document.querySelector(`#${config.id}`);
+
     if (existingButton) {
+      /*
+       * 若舊版腳本已建立按鈕，這裡補上新版 CSS 需要的識別屬性。
+       * 這可避免 SPA 頁面中舊按鈕被重用時，CSS selector 無法命中。
+       */
+      existingButton.setAttribute('data-cgpt-export-button', 'true');
+      existingButton.setAttribute('data-testid', config.testId);
+      existingButton.setAttribute('aria-label', config.ariaLabel);
       return existingButton;
     }
+
     return createHeaderButton(config);
   }
   /*
@@ -2676,6 +2687,179 @@
     rawButton.insertAdjacentElement('afterend', handoffButton);
   }
   /*
+   * 匯出按鈕 compact 狀態同步用的暫存資源。
+   */
+  let exportButtonShareMirrorTimer = null;
+  let exportButtonShareMirrorObserver = null;
+  let exportButtonShareMirrorResizeHandler = null;
+
+  /*
+   * 將 compact 狀態寫入兩顆匯出按鈕。
+   *
+   * data-cgpt-export-compact 只作為狀態標記，樣式由外部 CSS 決定。
+   */
+  function setExportButtonsCompact(rawButton, handoffButton, isCompact) {
+    const value = isCompact ? 'true' : 'false';
+
+    if (rawButton.getAttribute('data-cgpt-export-compact') !== value) {
+      rawButton.setAttribute('data-cgpt-export-compact', value);
+    }
+    if (handoffButton.getAttribute('data-cgpt-export-compact') !== value) {
+      handoffButton.setAttribute('data-cgpt-export-compact', value);
+    }
+  }
+
+  /*
+   * 在指定 root 底下尋找包含特定文字的文字節點。
+   */
+  function findTextNode(root, text) {
+    if (!root) {
+      return null;
+    }
+
+    const walker = document.createTreeWalker(
+      root,
+      NodeFilter.SHOW_TEXT,
+      {
+        acceptNode(node) {
+          return node.nodeValue && node.nodeValue.includes(text)
+            ? NodeFilter.FILTER_ACCEPT
+            : NodeFilter.FILTER_REJECT;
+        }
+      }
+    );
+
+    return walker.nextNode();
+  }
+
+  /*
+   * 判斷 ChatGPT 原生「分享」按鈕的文字是否實際可見。
+   */
+  function isShareButtonTextVisible(headerActions) {
+    const shareButton = headerActions?.querySelector('[data-testid="share-chat-button"]');
+
+    if (!shareButton) {
+      return false;
+    }
+
+    const shareTextNode = findTextNode(shareButton, '分享');
+
+    if (!shareTextNode) {
+      return false;
+    }
+
+    const parentElement = shareTextNode.parentElement;
+
+    if (!parentElement) {
+      return false;
+    }
+
+    const buttonStyle = getComputedStyle(shareButton);
+    const parentStyle = getComputedStyle(parentElement);
+
+    if (
+      buttonStyle.display === 'none' ||
+      buttonStyle.visibility === 'hidden' ||
+      parentStyle.display === 'none' ||
+      parentStyle.visibility === 'hidden'
+    ) {
+      return false;
+    }
+
+    if (Number.parseFloat(parentStyle.fontSize) <= 1) {
+      return false;
+    }
+
+    const range = document.createRange();
+    range.selectNodeContents(shareTextNode);
+
+    const rects = Array.from(range.getClientRects());
+    range.detach();
+
+    return rects.some((rect) => rect.width > 1 && rect.height > 1);
+  }
+
+  /*
+   * 將匯出按鈕的 compact 狀態同步到分享按鈕文字顯示狀態。
+   */
+  function syncExportButtonsWithShareButton(headerActions, rawButton, handoffButton) {
+    if (!headerActions || !rawButton || !handoffButton) {
+      return;
+    }
+
+    if (exportButtonShareMirrorTimer !== null) {
+      cancelAnimationFrame(exportButtonShareMirrorTimer);
+    }
+
+    exportButtonShareMirrorTimer = requestAnimationFrame(() => {
+      exportButtonShareMirrorTimer = null;
+
+      const shareTextVisible = isShareButtonTextVisible(headerActions);
+
+      setExportButtonsCompact(rawButton, handoffButton, !shareTextVisible);
+    });
+  }
+
+  /*
+   * 停止同步分享按鈕文字狀態，並清除 observer、listener 與 pending frame。
+   */
+  function stopObservingExportButtonsShareState() {
+    if (exportButtonShareMirrorTimer !== null) {
+      cancelAnimationFrame(exportButtonShareMirrorTimer);
+      exportButtonShareMirrorTimer = null;
+    }
+
+    if (exportButtonShareMirrorObserver) {
+      exportButtonShareMirrorObserver.disconnect();
+      exportButtonShareMirrorObserver = null;
+    }
+
+    if (exportButtonShareMirrorResizeHandler) {
+      window.removeEventListener('resize', exportButtonShareMirrorResizeHandler);
+      exportButtonShareMirrorResizeHandler = null;
+    }
+  }
+
+  /*
+   * 開始觀察 header action 狀態，使匯出按鈕 compact 狀態能跟著分享按鈕同步。
+   */
+  function observeExportButtonsShareState(headerActions, rawButton, handoffButton) {
+    if (!headerActions || !rawButton || !handoffButton) {
+      return;
+    }
+
+    stopObservingExportButtonsShareState();
+
+    exportButtonShareMirrorObserver = new MutationObserver(() => {
+      syncExportButtonsWithShareButton(headerActions, rawButton, handoffButton);
+    });
+
+    exportButtonShareMirrorObserver.observe(headerActions, {
+      attributes: true,
+      childList: true,
+      subtree: true,
+      characterData: true,
+      attributeFilter: [
+        'class',
+        'style',
+        'hidden',
+        'aria-hidden',
+        'data-state',
+        'data-fixed-header'
+      ]
+    });
+
+    exportButtonShareMirrorResizeHandler = () => {
+      syncExportButtonsWithShareButton(headerActions, rawButton, handoffButton);
+    };
+
+    window.addEventListener('resize', exportButtonShareMirrorResizeHandler, {
+      passive: true
+    });
+
+    syncExportButtonsWithShareButton(headerActions, rawButton, handoffButton);
+  }
+  /*
    * 將兩個按鈕插入 ChatGPT 對話頁 header。
    *
    * 這個函式同時負責建立、去重、搬移與狀態更新。
@@ -2714,6 +2898,7 @@
 
     placeExportButtons(headerActions, rawButton, handoffButton);
     updateButtonState();
+    observeExportButtonsShareState(headerActions, rawButton, handoffButton);
   }
   /*
    * 節流插入按鈕。
