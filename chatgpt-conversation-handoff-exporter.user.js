@@ -2,7 +2,7 @@
 // @name         ChatGPT 對話 JSON 與交接檔匯出工具
 // @name:en      ChatGPT Conversation Handoff Exporter
 // @namespace    https://github.com/SunnyLeu/ChatGPT-Conversation-Handoff-Exporter
-// @version      1.1.11
+// @version      1.1.12
 // @description  在 ChatGPT 對話頁新增按鈕，可下載目前對話的格式化原始 JSON，或直接產出精簡交接用 handoff JSON。
 // @description:en Export the current ChatGPT conversation as formatted raw JSON or compact handoff JSON.
 // @author       SunnyLeu
@@ -60,7 +60,7 @@
    *   - 多次包裝 window.fetch
    *   - 重複的 timer / listener
    */
-  const INSTALL_FLAG = '__chatgptConversationHandoffExporterInstalled_v1111';
+  const INSTALL_FLAG = '__chatgptConversationHandoffExporterInstalled_v1112';
   /*
    * 兩個按鈕的 DOM id。
    *
@@ -2624,21 +2624,50 @@
     return createHeaderButton(config);
   }
   /*
-   * 將匯出按鈕移到正確順序。
+   * 找出 element 在 parent 底下對應的直接子元素。
+   *
+   * ChatGPT header 的 action 可能包在多層 div 裡，例如更多選單按鈕通常
+   * 不會直接掛在 #conversation-header-actions 底下。
+   *
+   * 插入匯出按鈕時，若直接對深層 button 操作，可能會把按鈕塞進錯誤 wrapper。
+   * 因此這裡先往上找到 action 容器底下的直接子元素，再用該節點決定插入位置。
+   */
+  function getDirectChildWithin(parent, element) {
+    if (!parent || !element) {
+      return null;
+    }
+
+    let current = element;
+
+    while (current && current.parentElement && current.parentElement !== parent) {
+      current = current.parentElement;
+    }
+
+    return current && current.parentElement === parent ? current : null;
+  }
+  /*
+   * 將匯出按鈕放到 ChatGPT header 的適當位置。
    *
    * 目標順序：
    *   分享 → 下載原始 JSON → 下載交接 JSON → 更多選單
    *
-   * 若找不到分享按鈕或更多選單，仍會把兩顆匯出按鈕插入 action 容器中，避免按鈕消失。
+   * 使用 header action 的直接子元素作為插入錨點，避免匯出按鈕被放到
+   * ChatGPT 原生按鈕的內層 wrapper 裡。
+   *
+   * 若找不到分享按鈕或更多選單，仍會把兩顆匯出按鈕插入 action 容器中，
+   * 避免 ChatGPT DOM 結構小幅變動時按鈕直接消失。
    */
   function placeExportButtons(headerActions, rawButton, handoffButton) {
     const shareButton = headerActions.querySelector('[data-testid="share-chat-button"]');
     const optionsButton = headerActions.querySelector('[data-testid="conversation-options-button"]');
 
-    if (shareButton) {
-      shareButton.insertAdjacentElement('afterend', rawButton);
-    } else if (optionsButton && optionsButton.parentElement) {
-      optionsButton.parentElement.insertAdjacentElement('beforebegin', rawButton);
+    const shareAction = getDirectChildWithin(headerActions, shareButton);
+    const optionsAction = getDirectChildWithin(headerActions, optionsButton);
+
+    if (shareAction) {
+      shareAction.insertAdjacentElement('afterend', rawButton);
+    } else if (optionsAction) {
+      optionsAction.insertAdjacentElement('beforebegin', rawButton);
     } else {
       headerActions.append(rawButton);
     }
