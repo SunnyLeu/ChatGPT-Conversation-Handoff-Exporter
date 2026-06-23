@@ -2,7 +2,7 @@
 // @name         ChatGPT 對話 JSON 與交接檔匯出工具
 // @name:en      ChatGPT Conversation Handoff Exporter
 // @namespace    https://github.com/SunnyLeu/ChatGPT-Conversation-Handoff-Exporter
-// @version      1.1.16.1
+// @version      1.1.16.2
 // @description  在 ChatGPT 對話頁新增按鈕，可下載目前對話的格式化原始 JSON，或直接產出精簡交接用 handoff JSON。
 // @description:en Export the current ChatGPT conversation as formatted raw JSON or compact handoff JSON.
 // @author       SunnyLeu
@@ -60,7 +60,7 @@
    *   - 多次包裝 window.fetch
    *   - 重複的 timer / listener
    */
-  const INSTALL_FLAG = '__chatgptConversationHandoffExporterInstalled_v11161';
+  const INSTALL_FLAG = '__chatgptConversationHandoffExporterInstalled_v11162';
   /*
    * 匯出按鈕事件綁定標記。
    *
@@ -68,7 +68,7 @@
    * click listener 是否屬於目前腳本，必要時重建按鈕以避免殘留
    * listener 或 conversation 狀態。
    */
-  const EXPORT_BUTTON_LISTENER_VERSION = '1.1.16.1';
+  const EXPORT_BUTTON_LISTENER_VERSION = '1.1.16.2';
   /*
    * 兩個按鈕的 DOM id。
    *
@@ -355,23 +355,6 @@
   // 三、網址、標題、時間與檔名處理
   // ============================================================
   /*
-   * 判斷目前頁面是否是 ChatGPT 對話頁。
-   *
-   * 支援：
-   *   https://chatgpt.com/c/{conversation_id}
-   *   https://chatgpt.com/g/.../c/{conversation_id}
-   */
-  function isConversationPage() {
-    return /\/c\/[^/?#]+/.test(location.pathname);
-  }
-  /*
-   * 從目前網址取得 conversation ID。
-   */
-  function getConversationIdFromUrl() {
-    const match = location.pathname.match(/\/c\/([^/?#]+)/);
-    return match ? decodeURIComponent(match[1]) : null;
-  }
-  /*
    * 檢查字串是否符合 ChatGPT conversation ID 常見的 UUID 格式。
    *
    * 這只是格式檢查，不代表該 ID 一定存在或可存取。
@@ -380,6 +363,45 @@
     return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
       String(value || '')
     );
+  }
+  /*
+   * 從目前網址取得 /c/ 後方的原始 ID。
+   *
+   * 這個值可能是正式 conversation UUID，也可能是 ChatGPT 前端在
+   * 建立分支對話前使用的暫存 ID。呼叫端必須再檢查是否可匯出。
+   */
+  function getRawConversationIdFromUrl() {
+    const match = location.pathname.match(/\/c\/([^/?#]+)/);
+    return match ? decodeURIComponent(match[1]) : null;
+  }
+  /*
+   * 判斷 ID 是否可作為匯出用 conversation ID。
+   *
+   * 只有正式 UUID 會對應可重新抓取的 backend conversation JSON。
+   * 例如 WEB: 開頭的前端暫存 ID 不應顯示匯出按鈕，也不應送往
+   * /backend-api/conversation/{conversation_id}。
+   */
+  function isExportableConversationId(value) {
+    return looksLikeUuid(value);
+  }
+  /*
+   * 從目前網址取得可匯出的 conversation ID。
+   */
+  function getConversationIdFromUrl() {
+    const conversationId = getRawConversationIdFromUrl();
+    return isExportableConversationId(conversationId) ? conversationId : null;
+  }
+  /*
+   * 判斷目前頁面是否是可匯出的 ChatGPT 對話頁。
+   *
+   * 支援：
+   *   https://chatgpt.com/c/{conversation_id}
+   *   https://chatgpt.com/g/.../c/{conversation_id}
+   *
+   * 不支援尚未建立完成的前端暫存對話 ID。
+   */
+  function isConversationPage() {
+    return Boolean(getConversationIdFromUrl());
   }
   /*
    * 從 ChatGPT 原始 conversation endpoint 取得 conversation ID。
@@ -2456,10 +2478,15 @@
     }
     const conversationId = getConversationIdFromUrl();
     if (!conversationId) {
+      const rawConversationId = getRawConversationIdFromUrl();
+      const temporaryIdMessage = rawConversationId && !isExportableConversationId(rawConversationId)
+        ? `目前網址中的 ID「${rawConversationId}」尚不是可匯出的正式 conversation ID。\n\n`
+        : '';
       alert(
-        '找不到 conversation ID。\n\n' +
-        '請確認目前頁面是 ChatGPT 對話頁，且網址包含 /c/{conversation_id}。\n' +
-        '如果你剛切換頁面，請等待頁面載入完成後再試。'
+        '目前不是可匯出的 ChatGPT 對話頁。\n\n' +
+        temporaryIdMessage +
+        '請確認目前頁面是已建立完成的 ChatGPT 對話，且網址包含正式 UUID 格式的 /c/{conversation_id}。\n' +
+        '如果你剛點選「在新聊天中分支」，請先等待新聊天建立完成後再試。'
       );
       return;
     }
