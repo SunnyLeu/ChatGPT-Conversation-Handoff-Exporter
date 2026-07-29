@@ -2,7 +2,7 @@
 // @name         ChatGPT 對話 JSON 與交接檔匯出工具
 // @name:en      ChatGPT Conversation Handoff Exporter
 // @namespace    https://github.com/SunnyLeu/ChatGPT-Conversation-Handoff-Exporter
-// @version      1.1.16.2
+// @version      1.1.16.3
 // @description  在 ChatGPT 對話頁新增按鈕，可下載目前對話的格式化原始 JSON，或直接產出精簡交接用 handoff JSON。
 // @description:en Export the current ChatGPT conversation as formatted raw JSON or compact handoff JSON.
 // @author       SunnyLeu
@@ -60,7 +60,7 @@
    *   - 多次包裝 window.fetch
    *   - 重複的 timer / listener
    */
-  const INSTALL_FLAG = '__chatgptConversationHandoffExporterInstalled_v11162';
+  const INSTALL_FLAG = '__chatgptConversationHandoffExporterInstalled_v11163';
   /*
    * 匯出按鈕事件綁定標記。
    *
@@ -68,7 +68,7 @@
    * click listener 是否屬於目前腳本，必要時重建按鈕以避免殘留
    * listener 或 conversation 狀態。
    */
-  const EXPORT_BUTTON_LISTENER_VERSION = '1.1.16.2';
+  const EXPORT_BUTTON_LISTENER_VERSION = '1.1.16.3';
   /*
    * 兩個按鈕的 DOM id。
    *
@@ -80,6 +80,21 @@
    */
   const RAW_BUTTON_ID = 'cgpt-export-raw-json-button';
   const HANDOFF_BUTTON_ID = 'cgpt-export-handoff-json-button';
+  /*
+   * Header action 共用 selector 與寬度門檻。
+   *
+   * HEADER_EXPANDED_MIN_WIDTH：
+   *   只有 page header 的實際可用寬度達到這個門檻，才嘗試顯示
+   *   「分享／下載原始 JSON／下載交接 JSON」三個文字標籤。
+   *
+   * HEADER_LAYOUT_HYSTERESIS：
+   *   compact 狀態需要多出少量寬度才會切回 expanded，避免瀏覽器縮放、
+   *   字型載入或捲軸變化讓按鈕在臨界值附近反覆跳動。
+   */
+  const SHARE_BUTTON_SELECTOR = '[data-testid="share-chat-button"]';
+  const HEADER_ACTIONS_SELECTOR = '#conversation-header-actions';
+  const HEADER_EXPANDED_MIN_WIDTH = 960;
+  const HEADER_LAYOUT_HYSTERESIS = 32;
   /*
    * 若目前頁面已經安裝過本腳本，就直接結束。
    */
@@ -2583,7 +2598,7 @@
    * ChatGPT 是 SPA，網址切換時不一定重新載入頁面，因此需要主動清理既有 UI 狀態。
    */
   function removeButtonsIfNeeded() {
-    stopObservingExportButtonsShareState();
+    stopObservingHeaderActionLayout();
     const rawButton = document.querySelector(`#${RAW_BUTTON_ID}`);
     const handoffButton = document.querySelector(`#${HANDOFF_BUTTON_ID}`);
     if (rawButton) {
@@ -2816,32 +2831,48 @@
    * 避免 ChatGPT DOM 結構小幅變動時按鈕直接消失。
    */
   function placeExportButtons(headerActions, rawButton, handoffButton) {
-    const shareButton = headerActions.querySelector('[data-testid="share-chat-button"]');
+    const shareButton = headerActions.querySelector(SHARE_BUTTON_SELECTOR);
     const optionsButton = headerActions.querySelector('[data-testid="conversation-options-button"]');
     const shareAction = getDirectChildWithin(headerActions, shareButton);
     const optionsAction = getDirectChildWithin(headerActions, optionsButton);
     if (shareAction) {
-      shareAction.insertAdjacentElement('afterend', rawButton);
+      if (shareAction.nextElementSibling !== rawButton) {
+        shareAction.insertAdjacentElement('afterend', rawButton);
+      }
     } else if (optionsAction) {
-      optionsAction.insertAdjacentElement('beforebegin', rawButton);
-    } else {
+      if (optionsAction.previousElementSibling !== rawButton) {
+        optionsAction.insertAdjacentElement('beforebegin', rawButton);
+      }
+    } else if (rawButton.parentElement !== headerActions) {
       headerActions.append(rawButton);
     }
-    rawButton.insertAdjacentElement('afterend', handoffButton);
+    if (rawButton.nextElementSibling !== handoffButton) {
+      rawButton.insertAdjacentElement('afterend', handoffButton);
+    }
   }
   /*
-   * 匯出按鈕 compact 狀態同步用的暫存資源。
-   */
-  let exportButtonShareMirrorTimer = null;
-  let exportButtonShareMirrorObserver = null;
-  let exportButtonShareMirrorResizeHandler = null;
-  /*
-   * 將 compact 狀態寫入兩顆匯出按鈕。
+   * Header action 版面同步用的暫存資源。
    *
-   * data-cgpt-export-compact 只作為狀態標記，樣式由外部 CSS 決定。
+   * MutationObserver：監看 ChatGPT React 重建分享按鈕、文字節點或 wrapper。
+   * ResizeObserver：監看 page header 與右側 action 區實際寬度。
+   * window resize：作為舊環境與瀏覽器縮放的輕量備援。
    */
-  function setExportButtonsCompact(rawButton, handoffButton, isCompact) {
+  let headerActionLayoutTimer = null;
+  let headerActionLayoutObserver = null;
+  let headerActionLayoutResizeObserver = null;
+  let headerActionLayoutResizeHandler = null;
+  let observedHeaderActionLayoutTargets = null;
+  /*
+   * 將 compact 狀態同步寫入 action 容器與兩顆匯出按鈕。
+   *
+   * data-cgpt-header-compact：三顆主要按鈕共用的版面狀態。
+   * data-cgpt-export-compact：保留既有 CSS 相依介面，避免舊規則失效。
+   */
+  function setHeaderActionsCompact(headerActions, rawButton, handoffButton, isCompact) {
     const value = isCompact ? 'true' : 'false';
+    if (headerActions.getAttribute('data-cgpt-header-compact') !== value) {
+      headerActions.setAttribute('data-cgpt-header-compact', value);
+    }
     if (rawButton.getAttribute('data-cgpt-export-compact') !== value) {
       rawButton.setAttribute('data-cgpt-export-compact', value);
     }
@@ -2850,105 +2881,349 @@
     }
   }
   /*
-   * 在指定 root 底下尋找包含特定文字的文字節點。
+   * 正規化文字，供原生分享標籤比對使用。
    */
-  function findTextNode(root, text) {
-    if (!root) {
+  function normalizeUiText(value) {
+    return String(value || '').replace(/\s+/g, ' ').trim();
+  }
+  /*
+   * 判斷 element 是否為可接管顯示狀態的原生分享文字元素。
+   *
+   * 只接受 span / div / p 等文字容器，不把 button、SVG、aria-hidden 或
+   * sr-only 輔助文字當成可見標籤，避免誤改圖示或無障礙節點。
+   */
+  function isUsableNativeShareLabelElement(element, shareButton) {
+    if (!element || !shareButton || !shareButton.contains(element)) {
+      return false;
+    }
+    if (element.matches('[data-cgpt-share-label="fallback"]')) {
+      return false;
+    }
+    if (element.closest('svg, [aria-hidden="true"]')) {
+      return false;
+    }
+    if (element.matches('.sr-only, [hidden]') || element.closest('.sr-only, [hidden]')) {
+      return false;
+    }
+    if (!element.matches('span, div, p, strong, em')) {
+      return false;
+    }
+    if (element.querySelector('svg')) {
+      return false;
+    }
+    return normalizeUiText(element.textContent) !== '';
+  }
+  /*
+   * 尋找 ChatGPT 原生分享文字容器。
+   *
+   * 優先沿用先前已標記的 native 節點，再搜尋常見文字容器。若 ChatGPT
+   * 日後重新加入「分享」文字，這裡會找到它並撤回 userscript fallback。
+   */
+  function findNativeShareLabelElement(shareButton, expectedText) {
+    const candidates = [
+      ...shareButton.querySelectorAll('[data-cgpt-share-label="native"]'),
+      ...shareButton.querySelectorAll('span, div, p, strong, em')
+    ];
+    const seen = new Set();
+    const usableCandidates = [];
+    for (const candidate of candidates) {
+      if (seen.has(candidate)) {
+        continue;
+      }
+      seen.add(candidate);
+      if (!isUsableNativeShareLabelElement(candidate, shareButton)) {
+        continue;
+      }
+      const candidateText = normalizeUiText(candidate.textContent);
+      if (
+        candidateText === expectedText ||
+        expectedText.includes(candidateText) ||
+        candidateText.includes(expectedText)
+      ) {
+        return candidate;
+      }
+      usableCandidates.push(candidate);
+    }
+    return usableCandidates.length === 1 ? usableCandidates[0] : null;
+  }
+  /*
+   * 極少數 DOM 可能把原生分享文字直接放在 button 的文字節點中。
+   * 這時只包住既有文字節點，不複製內容，讓 CSS 仍能安全切換 compact。
+   */
+  function wrapDirectNativeShareTextNode(shareButton) {
+    const directTextNode = Array.from(shareButton.childNodes).find((node) => {
+      return node.nodeType === Node.TEXT_NODE && normalizeUiText(node.nodeValue) !== '';
+    });
+    if (!directTextNode) {
       return null;
     }
-    const walker = document.createTreeWalker(
-      root,
-      NodeFilter.SHOW_TEXT,
-      {
-        acceptNode(node) {
-          return node.nodeValue && node.nodeValue.includes(text)
-            ? NodeFilter.FILTER_ACCEPT
-            : NodeFilter.FILTER_REJECT;
-        }
-      }
-    );
-    return walker.nextNode();
+    const wrapper = document.createElement('span');
+    wrapper.setAttribute('data-cgpt-share-label', 'native');
+    wrapper.setAttribute('data-cgpt-share-label-wrapper', 'true');
+    directTextNode.replaceWith(wrapper);
+    wrapper.append(directTextNode);
+    return wrapper;
   }
   /*
-   * 判斷 ChatGPT 原生「分享」按鈕的文字是否實際可見。
+   * 讓分享按鈕永遠只有一個可控制的文字標籤。
+   *
+   * - 原生文字存在：標記為 native，移除所有 fallback。
+   * - 原生文字不存在：建立或重用唯一 fallback。
+   * - 重複 fallback：只保留第一個，其餘移除。
+   *
+   * fallback 使用 aria-hidden，因為按鈕本身已有 aria-label；這可避免
+   * 螢幕閱讀器把可見文字與 aria-label 重複朗讀。
    */
-  function isShareButtonTextVisible(headerActions) {
-    const shareButton = headerActions?.querySelector('[data-testid="share-chat-button"]');
+  function reconcileShareButtonLabel(headerActions) {
+    const shareButton = headerActions?.querySelector(SHARE_BUTTON_SELECTOR);
     if (!shareButton) {
-      return false;
+      return null;
     }
-    const shareTextNode = findTextNode(shareButton, '分享');
-    if (!shareTextNode) {
-      return false;
+    const expectedText = normalizeUiText(shareButton.getAttribute('aria-label')) || '分享';
+    const fallbackLabels = Array.from(
+      shareButton.querySelectorAll('[data-cgpt-share-label="fallback"]')
+    );
+    for (const duplicateFallback of fallbackLabels.slice(1)) {
+      duplicateFallback.remove();
     }
-    const parentElement = shareTextNode.parentElement;
-    if (!parentElement) {
-      return false;
+    const nativeLabel =
+      findNativeShareLabelElement(shareButton, expectedText) ||
+      wrapDirectNativeShareTextNode(shareButton);
+    for (const markedNative of shareButton.querySelectorAll('[data-cgpt-share-label="native"]')) {
+      if (markedNative !== nativeLabel) {
+        markedNative.removeAttribute('data-cgpt-share-label');
+      }
     }
-    const buttonStyle = getComputedStyle(shareButton);
-    const parentStyle = getComputedStyle(parentElement);
+    if (nativeLabel) {
+      nativeLabel.setAttribute('data-cgpt-share-label', 'native');
+      fallbackLabels[0]?.remove();
+      return nativeLabel;
+    }
+    let fallbackLabel = fallbackLabels[0];
+    if (!fallbackLabel) {
+      fallbackLabel = document.createElement('span');
+      fallbackLabel.setAttribute('data-cgpt-share-label', 'fallback');
+      fallbackLabel.setAttribute('aria-hidden', 'true');
+      shareButton.append(fallbackLabel);
+    }
+    if (fallbackLabel.textContent !== expectedText) {
+      fallbackLabel.textContent = expectedText;
+    }
+    return fallbackLabel;
+  }
+  /*
+   * 移除 userscript 自己加入的分享 fallback 與共用 compact 狀態。
+   *
+   * 只刪除帶有 fallback marker 的節點，不碰 ChatGPT 原生文字。
+   */
+  function cleanupHeaderActionLayoutDom() {
+    for (const fallbackLabel of document.querySelectorAll('[data-cgpt-share-label="fallback"]')) {
+      fallbackLabel.remove();
+    }
+    for (const wrapper of document.querySelectorAll('[data-cgpt-share-label-wrapper="true"]')) {
+      wrapper.replaceWith(...wrapper.childNodes);
+    }
+    for (const nativeLabel of document.querySelectorAll('[data-cgpt-share-label="native"]')) {
+      nativeLabel.removeAttribute('data-cgpt-share-label');
+    }
+    for (const headerActions of document.querySelectorAll(`${HEADER_ACTIONS_SELECTOR}[data-cgpt-header-compact]`)) {
+      headerActions.removeAttribute('data-cgpt-header-compact');
+    }
+  }
+  /*
+   * 取得 page header 左右主要區塊，供 expanded 狀態的實際碰撞檢查使用。
+   */
+  function getHeaderLayoutParts(headerActions) {
+    const pageHeader = headerActions?.closest('header#page-header');
+    if (!pageHeader) {
+      return null;
+    }
+    const rightActions = headerActions.closest('[data-testid="thread-header-right-actions"]');
+    const rightActionsContainer = headerActions.closest(
+      '[data-testid="thread-header-right-actions-container"]'
+    );
+    const rightRegion = getDirectChildWithin(
+      pageHeader,
+      rightActionsContainer || rightActions || headerActions
+    );
+    const leftRegion = Array.from(pageHeader.children).find((child) => {
+      if (child === rightRegion) {
+        return false;
+      }
+      const style = getComputedStyle(child);
+      const rect = child.getBoundingClientRect();
+      return style.position !== 'absolute' && style.display !== 'none' && rect.width > 0 && rect.height > 0;
+    }) || null;
+    return {
+      pageHeader,
+      rightActions,
+      rightActionsContainer,
+      rightRegion,
+      leftRegion
+    };
+  }
+  /*
+   * 判斷離屏 expanded clone 是否造成實際裁切或左右區塊重疊。
+   *
+   * 實際 Header 不會在測量過程中切換尺寸，避免畫面閃動與 ResizeObserver
+   * 回授迴圈。
+   */
+  function isExpandedHeaderLayoutConflicting(parts, headerActions) {
+    const measurableContainers = [
+      headerActions,
+      parts.rightActions,
+      parts.rightActionsContainer
+    ].filter(Boolean);
+    if (measurableContainers.some((element) => element.clientWidth > 0 && element.scrollWidth > element.clientWidth + 1)) {
+      return true;
+    }
+    const headerRect = parts.pageHeader.getBoundingClientRect();
+    const rightRect = (parts.rightRegion || headerActions).getBoundingClientRect();
+    const headerStyle = getComputedStyle(parts.pageHeader);
+    const paddingStart = Number.parseFloat(headerStyle.paddingInlineStart) || 0;
+    const paddingEnd = Number.parseFloat(headerStyle.paddingInlineEnd) || 0;
     if (
-      buttonStyle.display === 'none' ||
-      buttonStyle.visibility === 'hidden' ||
-      parentStyle.display === 'none' ||
-      parentStyle.visibility === 'hidden'
+      rightRect.left < headerRect.left + paddingStart - 1 ||
+      rightRect.right > headerRect.right - paddingEnd + 1
     ) {
-      return false;
+      return true;
     }
-    if (Number.parseFloat(parentStyle.fontSize) <= 1) {
-      return false;
+    if (parts.leftRegion && parts.rightRegion) {
+      const leftRect = parts.leftRegion.getBoundingClientRect();
+      const directRightRect = parts.rightRegion.getBoundingClientRect();
+      if (leftRect.right > directRightRect.left + 1) {
+        return true;
+      }
     }
-    const range = document.createRange();
-    range.selectNodeContents(shareTextNode);
-    const rects = Array.from(range.getClientRects());
-    range.detach();
-    return rects.some((rect) => rect.width > 1 && rect.height > 1);
+    return false;
   }
   /*
-   * 將匯出按鈕的 compact 狀態同步到分享按鈕文字顯示狀態。
+   * 依 page header 實際寬度與 expanded 版面碰撞結果決定 compact 狀態。
+   *
+   * 門檻只負責保留窄視窗的純圖示體驗；達到門檻後仍會做實際 overflow
+   * 與左右區塊碰撞檢查，不會只依賴固定 viewport breakpoint。
    */
-  function syncExportButtonsWithShareButton(headerActions, rawButton, handoffButton) {
+  function shouldUseCompactHeaderLayout(headerActions) {
+    const parts = getHeaderLayoutParts(headerActions);
+    if (!parts) {
+      return true;
+    }
+    const currentCompact = headerActions.getAttribute('data-cgpt-header-compact') !== 'false';
+    const expandThreshold = currentCompact
+      ? HEADER_EXPANDED_MIN_WIDTH + HEADER_LAYOUT_HYSTERESIS
+      : HEADER_EXPANDED_MIN_WIDTH;
+    const headerRect = parts.pageHeader.getBoundingClientRect();
+    if (headerRect.width < expandThreshold) {
+      return true;
+    }
+    /*
+     * 使用離屏 clone 測量 expanded 狀態，避免在原始 Header 上暫時切換尺寸，
+     * 進而觸發 ResizeObserver 反覆 compact / expanded 的回授迴圈。
+     */
+    const headerClone = parts.pageHeader.cloneNode(true);
+    headerClone.setAttribute('aria-hidden', 'true');
+    headerClone.setAttribute('inert', '');
+    headerClone.style.setProperty('position', 'fixed', 'important');
+    headerClone.style.setProperty('left', '-100000px', 'important');
+    headerClone.style.setProperty('top', '0', 'important');
+    headerClone.style.setProperty('width', `${headerRect.width}px`, 'important');
+    headerClone.style.setProperty('height', `${Math.max(headerRect.height, 1)}px`, 'important');
+    headerClone.style.setProperty('visibility', 'hidden', 'important');
+    headerClone.style.setProperty('pointer-events', 'none', 'important');
+    headerClone.style.setProperty('contain', 'layout paint', 'important');
+    const cloneHeaderActions = headerClone.querySelector(HEADER_ACTIONS_SELECTOR);
+    if (!cloneHeaderActions) {
+      return true;
+    }
+    cloneHeaderActions.setAttribute('data-cgpt-header-compact', 'false');
+    for (const cloneExportButton of cloneHeaderActions.querySelectorAll('[data-cgpt-export-button="true"]')) {
+      cloneExportButton.setAttribute('data-cgpt-export-compact', 'false');
+    }
+    document.body.append(headerClone);
+    try {
+      const cloneParts = getHeaderLayoutParts(cloneHeaderActions);
+      if (!cloneParts) {
+        return true;
+      }
+      return isExpandedHeaderLayoutConflicting(cloneParts, cloneHeaderActions);
+    } finally {
+      headerClone.remove();
+    }
+  }
+  /*
+   * 排程分享 fallback reconciliation 與三顆按鈕的共用版面狀態同步。
+   */
+  function syncHeaderActionLayout(headerActions, rawButton, handoffButton) {
     if (!headerActions || !rawButton || !handoffButton) {
       return;
     }
-    if (exportButtonShareMirrorTimer !== null) {
-      cancelAnimationFrame(exportButtonShareMirrorTimer);
+    if (headerActionLayoutTimer !== null) {
+      cancelAnimationFrame(headerActionLayoutTimer);
     }
-    exportButtonShareMirrorTimer = requestAnimationFrame(() => {
-      exportButtonShareMirrorTimer = null;
-      const shareTextVisible = isShareButtonTextVisible(headerActions);
-      setExportButtonsCompact(rawButton, handoffButton, !shareTextVisible);
+    headerActionLayoutTimer = requestAnimationFrame(() => {
+      headerActionLayoutTimer = null;
+      if (!headerActions.isConnected || !rawButton.isConnected || !handoffButton.isConnected) {
+        return;
+      }
+      reconcileShareButtonLabel(headerActions);
+      const isCompact = shouldUseCompactHeaderLayout(headerActions);
+      setHeaderActionsCompact(headerActions, rawButton, handoffButton, isCompact);
     });
   }
   /*
-   * 停止同步分享按鈕文字狀態，並清除 observer、listener 與 pending frame。
+   * 停止 Header action 同步，清除 observer、listener、pending frame 與 fallback。
    */
-  function stopObservingExportButtonsShareState() {
-    if (exportButtonShareMirrorTimer !== null) {
-      cancelAnimationFrame(exportButtonShareMirrorTimer);
-      exportButtonShareMirrorTimer = null;
+  function stopObservingHeaderActionLayout() {
+    if (headerActionLayoutTimer !== null) {
+      cancelAnimationFrame(headerActionLayoutTimer);
+      headerActionLayoutTimer = null;
     }
-    if (exportButtonShareMirrorObserver) {
-      exportButtonShareMirrorObserver.disconnect();
-      exportButtonShareMirrorObserver = null;
+    if (headerActionLayoutObserver) {
+      headerActionLayoutObserver.disconnect();
+      headerActionLayoutObserver = null;
     }
-    if (exportButtonShareMirrorResizeHandler) {
-      window.removeEventListener('resize', exportButtonShareMirrorResizeHandler);
-      exportButtonShareMirrorResizeHandler = null;
+    if (headerActionLayoutResizeObserver) {
+      headerActionLayoutResizeObserver.disconnect();
+      headerActionLayoutResizeObserver = null;
     }
+    if (headerActionLayoutResizeHandler) {
+      window.removeEventListener('resize', headerActionLayoutResizeHandler);
+      headerActionLayoutResizeHandler = null;
+    }
+    observedHeaderActionLayoutTargets = null;
+    cleanupHeaderActionLayoutDom();
   }
   /*
-   * 開始觀察 header action 狀態，使匯出按鈕 compact 狀態能跟著分享按鈕同步。
+   * 開始觀察 Header action DOM 與寬度。
+   *
+   * 若 insertButtonsOnce() 的低頻補救再次命中同一組節點，直接沿用既有
+   * observer；DOM 與尺寸變化會由 MutationObserver / ResizeObserver 觸發同步，
+   * 避免每秒重建 observer 或重做離屏寬度測量。
    */
-  function observeExportButtonsShareState(headerActions, rawButton, handoffButton) {
+  function observeHeaderActionLayout(headerActions, rawButton, handoffButton) {
     if (!headerActions || !rawButton || !handoffButton) {
       return;
     }
-    stopObservingExportButtonsShareState();
-    exportButtonShareMirrorObserver = new MutationObserver(() => {
-      syncExportButtonsWithShareButton(headerActions, rawButton, handoffButton);
+    if (
+      observedHeaderActionLayoutTargets &&
+      observedHeaderActionLayoutTargets.headerActions === headerActions &&
+      observedHeaderActionLayoutTargets.rawButton === rawButton &&
+      observedHeaderActionLayoutTargets.handoffButton === handoffButton
+    ) {
+      return;
+    }
+    stopObservingHeaderActionLayout();
+    observedHeaderActionLayoutTargets = {
+      headerActions,
+      rawButton,
+      handoffButton
+    };
+    const parts = getHeaderLayoutParts(headerActions);
+    const mutationRoot = parts?.pageHeader || headerActions;
+    headerActionLayoutObserver = new MutationObserver(() => {
+      syncHeaderActionLayout(headerActions, rawButton, handoffButton);
     });
-    exportButtonShareMirrorObserver.observe(headerActions, {
+    headerActionLayoutObserver.observe(mutationRoot, {
       attributes: true,
       childList: true,
       subtree: true,
@@ -2958,17 +3233,36 @@
         'style',
         'hidden',
         'aria-hidden',
+        'aria-label',
         'data-state',
         'data-fixed-header'
       ]
     });
-    exportButtonShareMirrorResizeHandler = () => {
-      syncExportButtonsWithShareButton(headerActions, rawButton, handoffButton);
+    if (typeof ResizeObserver === 'function') {
+      headerActionLayoutResizeObserver = new ResizeObserver(() => {
+        syncHeaderActionLayout(headerActions, rawButton, handoffButton);
+      });
+      const resizeTargets = new Set([
+        parts?.pageHeader,
+        parts?.leftRegion,
+        parts?.rightRegion,
+        parts?.rightActionsContainer,
+        parts?.rightActions,
+        headerActions
+      ]);
+      for (const target of resizeTargets) {
+        if (target) {
+          headerActionLayoutResizeObserver.observe(target);
+        }
+      }
+    }
+    headerActionLayoutResizeHandler = () => {
+      syncHeaderActionLayout(headerActions, rawButton, handoffButton);
     };
-    window.addEventListener('resize', exportButtonShareMirrorResizeHandler, {
+    window.addEventListener('resize', headerActionLayoutResizeHandler, {
       passive: true
     });
-    syncExportButtonsWithShareButton(headerActions, rawButton, handoffButton);
+    syncHeaderActionLayout(headerActions, rawButton, handoffButton);
   }
   /*
    * 將兩個按鈕插入 ChatGPT 對話頁 header。
@@ -3005,7 +3299,7 @@
     });
     placeExportButtons(headerActions, rawButton, handoffButton);
     updateButtonState();
-    observeExportButtonsShareState(headerActions, rawButton, handoffButton);
+    observeHeaderActionLayout(headerActions, rawButton, handoffButton);
   }
   /*
    * 節流插入按鈕。
