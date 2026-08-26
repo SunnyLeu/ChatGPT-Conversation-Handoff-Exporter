@@ -1,7 +1,6 @@
 # ChatGPT Conversation Handoff Exporter
 
 Tampermonkey userscript，用來在 ChatGPT 網頁版對話頁匯出目前對話的原始 JSON，或直接產出精簡交接用 handoff JSON。
-
 這個工具的目標是取代手動從 DevTools 複製長 JSON response 的流程，讓使用者可以在目前正在看的單一對話中，透過頁面右上角按鈕匯出資料。
 
 ## 功能特色
@@ -11,6 +10,9 @@ Tampermonkey userscript，用來在 ChatGPT 網頁版對話頁匯出目前對話
   - **下載交接 JSON**
 - 支援一般對話網址與 GPT / project 內的對話網址。
 - 點擊按鈕時會即時重新抓取目前對話的最新 raw conversation JSON。
+- 正式匯出 conversation JSON 時會驗證 response 完整性，不直接把頁面被動觀察到的 response 視為可信原始資料。
+- conversation 與 textdocs 預設使用 XMLHttpRequest 取得；主要通道無法直接驗證時，才使用 `window.fetch` 作第二通道交叉確認，降低頁面腳本、userscript 或瀏覽器擴充功能改寫 Fetch response 導致匯出缺漏的風險。
+- 會利用瀏覽器 Resource Timing 與實際 response bytes 進行完整性檢查；若無法確認 conversation 完整性，會停止 raw / handoff 匯出，避免靜默產生缺漏檔案。
 - 原始 JSON 會以 4 空白縮排輸出，方便閱讀與保存。
 - 若對話包含畫布 / textdocs，下載原始 JSON 時會一併下載 textdocs 原始 JSON。
 - 交接 JSON 會保留目前主分支上的可見 `user` / `assistant` 訊息。
@@ -31,9 +33,9 @@ Tampermonkey userscript，用來在 ChatGPT 網頁版對話頁匯出目前對話
 1. 安裝 Tampermonkey。
 2. 開啟以下 Raw URL：
 
-```text
-https://raw.githubusercontent.com/SunnyLeu/ChatGPT-Conversation-Handoff-Exporter/main/chatgpt-conversation-handoff-exporter.user.js
-```
+   ```text
+   https://raw.githubusercontent.com/SunnyLeu/ChatGPT-Conversation-Handoff-Exporter/main/chatgpt-conversation-handoff-exporter.user.js
+   ```
 
 3. Tampermonkey 會開啟 userscript 安裝頁面。
 4. 按下安裝。
@@ -53,7 +55,6 @@ https://raw.githubusercontent.com/SunnyLeu/ChatGPT-Conversation-Handoff-Exporter
 ## 自動更新
 
 若透過 Raw URL 安裝，Tampermonkey 可依照腳本中的 `@updateURL` / `@downloadURL` 檢查遠端版本。
-
 腳本目前使用的更新來源為：
 
 ```text
@@ -114,14 +115,30 @@ Tampermonkey 會依照其自身設定定期檢查更新；也可以在 Tampermon
 
 ### 對話資料
 
-工具會優先使用 ChatGPT 頁面自己發出的 backend API 請求資訊，重新抓取目前對話的最新 raw JSON。
+工具會被動觀察 ChatGPT 頁面自己發出的 backend API 請求，取得目前對話重新抓取資料所需的 request context。
+被動觀察到的 conversation response 只作為輔助資料，不會直接視為正式匯出的可信 raw JSON。
+使用者按下匯出按鈕後，工具會：
 
+1. 重新抓取目前 conversation JSON。
+2. 優先使用 XMLHttpRequest 作為正式取得通道。
+3. 比較 JavaScript 實際取得的 UTF-8 response bytes 與瀏覽器 Resource Timing 的 `decodedBodySize`。
+4. 若主要通道無法直接驗證，才使用第二取得通道交叉確認。
+5. 只有完整性可以確認的 conversation snapshot 才會進入 raw JSON 或 handoff JSON。
+
+若 response 大小、conversation revision 或 `mapping` 結構出現無法安全判定的差異，工具會中止本次 raw / handoff 匯出，而不是下載可能不完整的 JSON。
 若目前尚未捕捉到可重用請求資訊，工具會提示使用者等待對話載入完成、重新整理頁面，或重新進入該對話後再試。
 
 ### textdocs / 畫布資料
 
-textdocs 是附加資料，不應阻斷主要對話匯出。
+textdocs 也會使用與 conversation 類似的 response 完整性檢查：
 
+- 預設先使用 XMLHttpRequest 取得。
+- 若主要通道無法直接確認完整性，才使用 `window.fetch` 作第二通道比較。
+- 會比較 JavaScript 實際取得的 response bytes 與瀏覽器 Resource Timing。
+- 若兩個通道都缺少足夠的網路層證據，只有在正規化後的 textdocs 內容完全一致時才接受。
+- 不會單純因為某一份 textdocs 數量較多，就猜測它比較完整。
+
+textdocs 是附加資料，不應阻斷主要對話匯出。
 以下情況會以空陣列 `[]` 處理 textdocs，並繼續完成主要匯出：
 
 - textdocs endpoint 無法取得。
@@ -129,6 +146,8 @@ textdocs 是附加資料，不應阻斷主要對話匯出。
 - endpoint 回傳空內容。
 - endpoint 回傳非 JSON。
 - endpoint 回傳格式與預期不同。
+- textdocs response 無法通過完整性驗證。
+- 兩個取得通道的 textdocs 內容不同，且沒有足夠證據判定哪一份可信。
 - 單一 textdoc 項目格式不完整或不支援。
 
 ### 錯誤提示
@@ -140,11 +159,12 @@ textdocs 是附加資料，不應阻斷主要對話匯出。
 - `408` / `425` / `429`：可能需要稍候片刻再試。
 - `5xx`：可能是 ChatGPT 後端暫時異常，可稍後再試。
 - 非 JSON 或非完整 conversation JSON：可重新整理頁面，等待對話載入完成後再試。
+- conversation response 完整性無法確認：可能有頁面腳本、userscript 或瀏覽器擴充功能修改 API response，也可能是在驗證期間對話剛好更新。工具會停止 raw / handoff 匯出，避免輸出可能缺漏的資料。
+- textdocs response 完整性無法確認：會略過 textdocs，並繼續主要 conversation 匯出。
 
 ## 交接 JSON 格式
 
 交接 JSON 是從 ChatGPT 原始 conversation JSON 與 textdocs JSON 轉換而來的精簡格式，目標是讓新的 ChatGPT 對話能快速理解前一段對話的實際進度、訊息脈絡與畫布內容。
-
 完整結構大致如下：
 
 ```json
@@ -286,9 +306,7 @@ textdocs 是附加資料，不應阻斷主要對話匯出。
 ## 訊息順序與主分支
 
 ChatGPT 原始 conversation JSON 的 `mapping` 是樹狀結構，不是單純的訊息陣列。
-
 本工具會從 `current_node` 沿著 `parent` 一路回推，取得目前 UI 實際採用的主分支，再依順序輸出到 `messages`。
-
 這代表：
 
 - 若使用者編輯過訊息，通常會輸出目前主分支上的版本。
@@ -326,24 +344,27 @@ ChatGPT 原始 conversation JSON 的 `mapping` 是樹狀結構，不是單純的
 ## 隱私與安全
 
 本腳本設計為手動匯出目前正在看的單一對話。
-
 它不會：
 
 - 上傳資料到第三方伺服器
 - 批次匯出所有對話
 - 背景定時抓取對話或畫布內容
 - 將 token、cookie 或 session 寫死在程式碼
+- 主動讀取 `document.cookie`
 - 將 raw JSON 或敏感 headers 印到 Console
 - 將 raw JSON 寫入 localStorage、IndexedDB 或 cookie
 
+request context 只暫存在目前頁面的記憶體中；重新抓取同源 backend JSON 時，cookie / session 由瀏覽器透過既有登入狀態自行處理，不會手動保存或寫入 cookie header。
+完整性檢查的 Console 摘要只包含必要的非內容資訊，例如 conversation ID、取得通道、response bytes、network bytes、`mapping` 節點數或 textdoc 數量；不會輸出 raw JSON、textdoc 內容、完整 headers、token 或 cookie。
 textdocs 內容只會在使用者按下 **下載原始 JSON** 或 **下載交接 JSON** 時抓取。
 
 ## 限制
 
 - 本腳本依賴 ChatGPT 網頁版目前的 DOM 與內部請求格式。
+- conversation / textdocs 完整性驗證會使用瀏覽器 Resource Timing；若瀏覽器無法提供足夠資訊，工具會改用第二取得通道交叉確認，仍無法確認時會採保守處理。
 - 若 ChatGPT 前端或內部 endpoint 改版，腳本可能需要更新。
 - 本腳本不是 OpenAI 官方 API，也不是官方匯出功能。
-- 本工具主要面向可安裝 Tampermonkey / userscript 的桌面瀏覽器環境。
+- 本工具主要面向可安裝 Tampermonkey / userscript 的桌面 Chromium 瀏覽器環境。
 
 ## License
 
