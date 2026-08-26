@@ -2,7 +2,7 @@
 // @name         ChatGPT 對話 JSON 與交接檔匯出工具
 // @name:en      ChatGPT Conversation Handoff Exporter
 // @namespace    https://github.com/SunnyLeu/ChatGPT-Conversation-Handoff-Exporter
-// @version      1.1.17
+// @version      1.1.18
 // @description  在 ChatGPT 對話頁新增按鈕，可下載目前對話的格式化原始 JSON，或直接產出精簡交接用 handoff JSON。
 // @description:en Export the current ChatGPT conversation as formatted raw JSON or compact handoff JSON.
 // @author       SunnyLeu
@@ -60,7 +60,7 @@
    *   - 多次包裝 window.fetch
    *   - 重複的 timer / listener
    */
-  const INSTALL_FLAG = '__chatgptConversationHandoffExporterInstalled_v1117';
+  const INSTALL_FLAG = '__chatgptConversationHandoffExporterInstalled_v1118';
   /*
    * 匯出按鈕事件綁定標記。
    *
@@ -68,7 +68,7 @@
    * click listener 是否屬於目前腳本，必要時重建按鈕以避免殘留
    * listener 或 conversation 狀態。
    */
-  const EXPORT_BUTTON_LISTENER_VERSION = '1.1.17';
+  const EXPORT_BUTTON_LISTENER_VERSION = '1.1.18';
   /*
    * 兩個按鈕的 DOM id。
    *
@@ -96,7 +96,7 @@
   const HEADER_EXPANDED_MIN_WIDTH = 960;
   const HEADER_LAYOUT_HYSTERESIS = 32;
   /*
-   * conversation response 完整性驗證用容差。
+   * backend JSON response 完整性驗證用容差。
    *
    * PerformanceResourceTiming.decodedBodySize 是瀏覽器網路層解碼後的 body bytes；
    * TextEncoder 則計算 JavaScript 實際拿到的 JSON UTF-8 bytes。
@@ -1261,7 +1261,7 @@
   /*
    * 計算字串以 UTF-8 編碼後的實際 bytes。
    *
-   * raw JSON 完整性判定只記錄長度，不輸出內容。
+   * JSON 完整性判定只記錄長度，不輸出內容。
    */
   function getUtf8ByteLength(value) {
     return new TextEncoder().encode(String(value || '')).byteLength;
@@ -1346,8 +1346,8 @@
         }
         const entry = candidates.length > 0
           ? candidates.reduce((latest, current) => {
-            return !latest || current.startTime > latest.startTime ? current : latest;
-          }, null)
+              return !latest || current.startTime > latest.startTime ? current : latest;
+            }, null)
           : null;
         const rawByteLength = getUtf8ByteLength(rawText);
         const decodedBodySize = entry && Number.isFinite(entry.decodedBodySize)
@@ -1934,72 +1934,349 @@
       .filter(Boolean);
   }
   /*
-   * textdocs 取得或解析失敗時的共同退路。
+   * textdocs 取得、解析或完整性驗證失敗時的共同退路。
    *
-   * textdocs 是附加資料；失敗時改用空陣列，避免阻斷主要對話匯出。
+   * textdocs 是附加資料；失敗時改用空陣列，避免阻斷主要 conversation 匯出。
    */
   function warnAndReturnEmptyTextdocs(message, data = null) {
     logWarn(message, data);
-    return '[]';
+    return [];
   }
   /*
-   * 即時抓取目前對話的 textdocs JSON。
+   * textdocs 正式重抓通道 A：XMLHttpRequest。
    *
-   * textdocs 是附加資料，不應阻斷主要對話匯出。
-   * 因此 204、205、404、空回應、非 JSON 或解析失敗都會轉成空陣列。
+   * 和 conversation 一樣，預設先使用不經 window.fetch 的 XHR，
+   * 再用 Resource Timing 比對 JavaScript body bytes 與瀏覽器網路層 decodedBodySize。
    */
-  async function refetchTextdocsRaw(conversationId) {
-    const replayRequest = getReplayRequestForTextdocs(conversationId);
-    if (!replayRequest) {
-      return warnAndReturnEmptyTextdocs(
-        '目前無法取得此對話的 textdocs 請求資訊，改以空 textdocs 繼續。',
-        { conversationId }
-      );
-    }
+  async function requestTextdocsViaXhr(replayRequest) {
+    return new Promise((resolve, reject) => {
+      let xhr;
+      let probe = null;
+      try {
+        xhr = new XMLHttpRequest();
+        xhr.open('GET', replayRequest.url, true);
+        xhr.withCredentials = true;
+        const xhrHeaders = new Headers(replayRequest.headers);
+        xhrHeaders.set('cache-control', 'no-cache');
+        applyReplayHeadersToXhr(xhr, xhrHeaders);
+        probe = createResourceTimingProbe(replayRequest.url, 'xmlhttprequest');
+      } catch (error) {
+        probe?.cancel();
+        reject(error);
+        return;
+      }
+      try {
+        xhr.addEventListener('load', async () => {
+          try {
+            const rawText = typeof xhr.responseText === 'string' ? xhr.responseText : '';
+            const timing = await probe.finish(rawText);
+            resolve({
+              transport: 'xhr',
+              status: xhr.status,
+              statusText: xhr.statusText || '',
+              contentType: xhr.getResponseHeader('content-type') || '',
+              rawText,
+              timing
+            });
+          } catch (error) {
+            reject(error);
+          }
+        }, { once: true });
+        xhr.addEventListener('error', () => {
+          probe?.cancel();
+          reject(new Error('XHR 重新抓取 textdocs JSON 時發生網路錯誤。'));
+        }, { once: true });
+        xhr.addEventListener('abort', () => {
+          probe?.cancel();
+          reject(new Error('XHR 重新抓取 textdocs JSON 已被中止。'));
+        }, { once: true });
+        xhr.send();
+      } catch (error) {
+        probe?.cancel();
+        reject(error);
+      }
+    });
+  }
+  /*
+   * textdocs 正式重抓通道 B：目前頁面的 window.fetch。
+   *
+   * 只有 XHR 無法由 Resource Timing 直接驗證、或 XHR 取得失敗時才啟用。
+   * 這條通道只作第二個比較訊號，不會因為 JSON 可解析就直接視為可信來源。
+   */
+  async function requestTextdocsViaFetch(replayRequest) {
+    const probe = createResourceTimingProbe(replayRequest.url, 'fetch');
     let response;
+    let rawText;
     try {
-      response = await fetch(replayRequest.url, {
+      response = await window.fetch(replayRequest.url, {
         method: 'GET',
         credentials: 'include',
         cache: 'no-store',
         headers: new Headers(replayRequest.headers)
       });
+      rawText = await response.text();
     } catch (error) {
-      return warnAndReturnEmptyTextdocs('即時重新抓取 textdocs 失敗，改以空 textdocs 繼續。', {
-        conversationId,
-        message: toErrorMessage(error)
-      });
+      probe.cancel();
+      throw error;
     }
-    if (response.status === 204 || response.status === 205 || response.status === 404) {
-      return '[]';
+    const timing = await probe.finish(rawText);
+    return {
+      transport: 'fetch',
+      status: response.status,
+      statusText: response.statusText || '',
+      contentType: response.headers.get('content-type') || '',
+      rawText,
+      timing
+    };
+  }
+  /*
+   * 建立 textdocs 的非敏感完整性摘要。
+   *
+   * 只記錄 response bytes 與正規化後的 textdoc 數量，不輸出內容、comment、
+   * request headers、token、cookie 或 raw JSON。
+   */
+  function analyzeTextdocsIntegrity(textdocs, rawText) {
+    return {
+      rawByteLength: getUtf8ByteLength(rawText),
+      textdocCount: Array.isArray(textdocs) ? textdocs.length : 0
+    };
+  }
+  /*
+   * 將 transport response 解析成可比較的 textdocs candidate。
+   *
+   * 204 / 205 / 404 與空 2xx body 沿用既有容錯語意，視為「目前沒有 textdocs」。
+   */
+  function validateTextdocsTransportResult(result) {
+    if (!result || !Number.isFinite(result.status)) {
+      throw new Error('重新抓取 textdocs JSON 失敗：無法取得有效 HTTP 狀態。');
     }
-    if (!response.ok) {
-      return warnAndReturnEmptyTextdocs('textdocs endpoint 回應非成功狀態，改以空 textdocs 繼續。', {
-        conversationId,
-        status: response.status,
-        statusText: response.statusText || ''
-      });
+    const status = result.status;
+    const rawText = String(result.rawText || '');
+    if (status === 204 || status === 205 || status === 404) {
+      const textdocs = [];
+      return {
+        ...result,
+        textdocs,
+        integrity: analyzeTextdocsIntegrity(textdocs, rawText)
+      };
     }
-    const rawText = await response.text();
+    if (status < 200 || status >= 300) {
+      throw new Error(
+        `重新抓取 textdocs JSON 失敗：HTTP ${status || '未知'} ${result.statusText || ''}`
+      );
+    }
     if (!rawText.trim()) {
-      return '[]';
+      const textdocs = [];
+      return {
+        ...result,
+        textdocs,
+        integrity: analyzeTextdocsIntegrity(textdocs, rawText)
+      };
     }
-    const contentType = response.headers.get('content-type') || '';
-    if (!contentType.includes('application/json')) {
-      return warnAndReturnEmptyTextdocs('textdocs endpoint 回應不是 JSON，改以空 textdocs 繼續。', {
-        conversationId,
-        contentType: contentType || '未知'
-      });
+    if (!String(result.contentType || '').includes('application/json')) {
+      throw new Error(
+        '重新抓取 textdocs JSON 失敗：回應不是 JSON。' +
+        ` Content-Type: ${result.contentType || '未知'}`
+      );
     }
+    const textdocs = parseAndValidateTextdocsRaw(rawText);
+    return {
+      ...result,
+      textdocs,
+      integrity: analyzeTextdocsIntegrity(textdocs, rawText)
+    };
+  }
+  async function tryTextdocsTransport(transportName, replayRequest) {
     try {
-      parseAndValidateTextdocsRaw(rawText);
+      const rawResult = transportName === 'xhr'
+        ? await requestTextdocsViaXhr(replayRequest)
+        : await requestTextdocsViaFetch(replayRequest);
+      return {
+        candidate: validateTextdocsTransportResult(rawResult),
+        error: null
+      };
     } catch (error) {
-      return warnAndReturnEmptyTextdocs('textdocs JSON 格式無法使用，改以空 textdocs 繼續。', {
-        conversationId,
-        message: toErrorMessage(error)
-      });
+      return {
+        candidate: null,
+        error
+      };
     }
-    return rawText;
+  }
+  /*
+   * 比較兩個 textdocs candidate 的正規化內容是否完全一致。
+   *
+   * 只有雙通道 fallback 被啟動時才進行一次序列化比較；平常 XHR timing match
+   * 的 fast path 不會額外轉換大型 textdocs。
+   */
+  function areTextdocsCandidatesEquivalent(candidateA, candidateB) {
+    if (!candidateA || !candidateB) {
+      return false;
+    }
+    if (candidateA.integrity.textdocCount !== candidateB.integrity.textdocCount) {
+      return false;
+    }
+    return JSON.stringify(candidateA.textdocs) === JSON.stringify(candidateB.textdocs);
+  }
+  /*
+   * 使用另一個 request 的 network decodedBodySize 交叉驗證 textdocs candidate。
+   */
+  function isTextdocsCandidateSupportedByOtherTiming(candidate, timingSourceCandidate) {
+    if (!candidate || !timingSourceCandidate) {
+      return false;
+    }
+    const decodedBodySize = timingSourceCandidate.timing?.decodedBodySize || 0;
+    return isBodyByteLengthConsistent(candidate.integrity.rawByteLength, decodedBodySize);
+  }
+  function formatTextdocsIntegritySummary(candidate) {
+    if (!candidate) {
+      return '無有效 response';
+    }
+    const timing = candidate.timing || {};
+    return [
+      `${candidate.transport.toUpperCase()} response=${candidate.integrity.rawByteLength} bytes`,
+      `network=${timing.decodedBodySize > 0 ? `${timing.decodedBodySize} bytes` : '無法取得'}`,
+      `timing=${timing.status || 'unavailable'}`,
+      `textdocs=${candidate.integrity.textdocCount}`
+    ].join('，');
+  }
+  function buildTextdocsIntegrityFailureMessage(xhrAttempt, fetchAttempt, reason) {
+    const lines = [
+      '無法確認 textdocs JSON 的完整性。',
+      '',
+      reason,
+      ''
+    ];
+    if (xhrAttempt?.candidate) {
+      lines.push(formatTextdocsIntegritySummary(xhrAttempt.candidate));
+    } else if (xhrAttempt?.error) {
+      lines.push(`XHR：${toErrorMessage(xhrAttempt.error)}`);
+    }
+    if (fetchAttempt?.candidate) {
+      lines.push(formatTextdocsIntegritySummary(fetchAttempt.candidate));
+    } else if (fetchAttempt?.error) {
+      lines.push(`Fetch：${toErrorMessage(fetchAttempt.error)}`);
+    }
+    lines.push(
+      '',
+      '這可能表示頁面腳本、userscript 或瀏覽器擴充功能修改了 textdocs API 回應，',
+      '也可能是 textdocs 剛好在兩次請求之間更新。',
+      '',
+      'textdocs 屬於附加資料；為避免把不完整 Canvas / textdoc 內容寫入匯出檔，',
+      '本次會略過 textdocs，但不阻斷主要 conversation raw JSON。'
+    );
+    return lines.join('\n');
+  }
+  /*
+   * 從 XHR / fetch 候選中選出可信 textdocs response。
+   *
+   * 原則與 conversation 保持一致，但不對 textdocs 做「較大即較完整」的猜測：
+   *   1. 任一通道自身 Resource Timing 明確 match → 直接可信。
+   *   2. 某通道 body bytes 能吻合另一 request 的 network size → 採該通道。
+   *   3. 兩邊都沒有 timing 證據時，只接受正規化 textdocs 完全一致。
+   *   4. 已知 mismatch 或兩通道內容不同 → 不猜測哪份較完整，改為略過 textdocs。
+   */
+  function selectTrustedTextdocsCandidate(xhrAttempt, fetchAttempt) {
+    const xhrCandidate = xhrAttempt?.candidate || null;
+    const fetchCandidate = fetchAttempt?.candidate || null;
+    if (xhrCandidate?.timing?.status === 'match') {
+      return xhrCandidate;
+    }
+    if (fetchCandidate?.timing?.status === 'match') {
+      return fetchCandidate;
+    }
+    if (!xhrCandidate && !fetchCandidate) {
+      throw new Error(
+        buildTextdocsIntegrityFailureMessage(
+          xhrAttempt,
+          fetchAttempt,
+          '兩個 textdocs 取得通道都失敗。'
+        )
+      );
+    }
+    if (xhrCandidate && fetchCandidate) {
+      const xhrSupportedByFetchTiming = isTextdocsCandidateSupportedByOtherTiming(xhrCandidate, fetchCandidate);
+      const fetchSupportedByXhrTiming = isTextdocsCandidateSupportedByOtherTiming(fetchCandidate, xhrCandidate);
+      if (xhrSupportedByFetchTiming && !fetchSupportedByXhrTiming) {
+        return xhrCandidate;
+      }
+      if (fetchSupportedByXhrTiming && !xhrSupportedByFetchTiming) {
+        return fetchCandidate;
+      }
+      if (
+        xhrCandidate.timing?.status === 'mismatch' ||
+        fetchCandidate.timing?.status === 'mismatch'
+      ) {
+        throw new Error(
+          buildTextdocsIntegrityFailureMessage(
+            xhrAttempt,
+            fetchAttempt,
+            '至少一個 JavaScript response body 與瀏覽器實際網路 response 大小明顯不一致。'
+          )
+        );
+      }
+      if (areTextdocsCandidatesEquivalent(xhrCandidate, fetchCandidate)) {
+        return xhrCandidate;
+      }
+      throw new Error(
+        buildTextdocsIntegrityFailureMessage(
+          xhrAttempt,
+          fetchAttempt,
+          '兩個取得通道的 textdocs 內容不同，且沒有足夠的網路層證據判定哪一份可信。'
+        )
+      );
+    }
+    const onlyCandidate = xhrCandidate || fetchCandidate;
+    const onlyAttemptName = xhrCandidate ? 'XHR' : 'Fetch';
+    if (onlyCandidate.timing?.status === 'mismatch') {
+      throw new Error(
+        buildTextdocsIntegrityFailureMessage(
+          xhrAttempt,
+          fetchAttempt,
+          `${onlyAttemptName} response 與瀏覽器實際網路 response 大小不一致，另一通道又無法提供有效驗證。`
+        )
+      );
+    }
+    throw new Error(
+      buildTextdocsIntegrityFailureMessage(
+        xhrAttempt,
+        fetchAttempt,
+        `${onlyAttemptName} 雖取得可解析的 textdocs，但缺少可獨立驗證的 Resource Timing，另一通道也無法確認。`
+      )
+    );
+  }
+  /*
+   * 使用先前被動捕捉的 request context，即時重新抓取目前 textdocs。
+   *
+   * textdocs 現在與 conversation 使用相同的 transport / Resource Timing 原則：
+   * 預設 XHR，必要時追加 window.fetch 作第二通道；只有通過完整性判定的
+   * candidate 才會進入 .textdocs.json 或 handoff。
+   */
+  async function refetchLatestTextdocsSnapshot(conversationId) {
+    const replayRequest = getReplayRequestForTextdocs(conversationId);
+    if (!replayRequest) {
+      throw new Error(buildMissingRequestContextMessage('textdocs JSON'));
+    }
+    const xhrAttempt = await tryTextdocsTransport('xhr', replayRequest);
+    let fetchAttempt = null;
+    if (!xhrAttempt.candidate || xhrAttempt.candidate.timing?.status !== 'match') {
+      fetchAttempt = await tryTextdocsTransport('fetch', replayRequest);
+    }
+    const trustedCandidate = selectTrustedTextdocsCandidate(xhrAttempt, fetchAttempt);
+    logInfo('textdocs JSON 完整性驗證通過。', {
+      conversationId,
+      transport: trustedCandidate.transport,
+      responseBytes: trustedCandidate.integrity.rawByteLength,
+      networkBytes: trustedCandidate.timing?.decodedBodySize || null,
+      timingStatus: trustedCandidate.timing?.status || 'unavailable',
+      textdocCount: trustedCandidate.integrity.textdocCount
+    });
+    return {
+      rawText: trustedCandidate.rawText,
+      textdocs: trustedCandidate.textdocs,
+      integrity: trustedCandidate.integrity,
+      transport: trustedCandidate.transport,
+      timing: trustedCandidate.timing
+    };
   }
   /*
    * 確認匯出流程仍停留在觸發匯出時的 conversation。
@@ -2087,14 +2364,16 @@
    */
   async function getLatestTextdocs(conversationId) {
     try {
-      const textdocsRawText = await refetchTextdocsRaw(conversationId);
-      return parseAndValidateTextdocsRaw(textdocsRawText);
+      const snapshot = await refetchLatestTextdocsSnapshot(conversationId);
+      return snapshot.textdocs;
     } catch (error) {
-      logWarn('textdocs 解析失敗，改以空 textdocs 繼續。', {
-        conversationId,
-        message: toErrorMessage(error)
-      });
-      return [];
+      return warnAndReturnEmptyTextdocs(
+        'textdocs 無法通過取得或完整性驗證，改以空 textdocs 繼續。',
+        {
+          conversationId,
+          message: toErrorMessage(error)
+        }
+      );
     }
   }
   /*
