@@ -2,7 +2,7 @@
 // @name         ChatGPT 對話 JSON 與交接檔匯出工具
 // @name:en      ChatGPT Conversation Handoff Exporter
 // @namespace    https://github.com/SunnyLeu/ChatGPT-Conversation-Handoff-Exporter
-// @version      1.1.16.3
+// @version      1.1.17
 // @description  在 ChatGPT 對話頁新增按鈕，可下載目前對話的格式化原始 JSON，或直接產出精簡交接用 handoff JSON。
 // @description:en Export the current ChatGPT conversation as formatted raw JSON or compact handoff JSON.
 // @author       SunnyLeu
@@ -60,7 +60,7 @@
    *   - 多次包裝 window.fetch
    *   - 重複的 timer / listener
    */
-  const INSTALL_FLAG = '__chatgptConversationHandoffExporterInstalled_v11163';
+  const INSTALL_FLAG = '__chatgptConversationHandoffExporterInstalled_v1117';
   /*
    * 匯出按鈕事件綁定標記。
    *
@@ -68,7 +68,7 @@
    * click listener 是否屬於目前腳本，必要時重建按鈕以避免殘留
    * listener 或 conversation 狀態。
    */
-  const EXPORT_BUTTON_LISTENER_VERSION = '1.1.16.3';
+  const EXPORT_BUTTON_LISTENER_VERSION = '1.1.17';
   /*
    * 兩個按鈕的 DOM id。
    *
@@ -96,6 +96,18 @@
   const HEADER_EXPANDED_MIN_WIDTH = 960;
   const HEADER_LAYOUT_HYSTERESIS = 32;
   /*
+   * conversation response 完整性驗證用容差。
+   *
+   * PerformanceResourceTiming.decodedBodySize 是瀏覽器網路層解碼後的 body bytes；
+   * TextEncoder 則計算 JavaScript 實際拿到的 JSON UTF-8 bytes。
+   *
+   * 正常同源 JSON 兩者應非常接近。保留少量比例與固定 bytes 容差，
+   * 避免 BOM、瀏覽器實作細節或極小 response 的微小差異被誤判。
+   */
+  const RESOURCE_TIMING_BYTE_TOLERANCE_RATIO = 0.01;
+  const RESOURCE_TIMING_BYTE_TOLERANCE_MIN = 64;
+  const RESOURCE_TIMING_START_SLOP_MS = 5;
+  /*
    * 若目前頁面已經安裝過本腳本，就直接結束。
    */
   if (window[INSTALL_FLAG]) {
@@ -104,7 +116,7 @@
   window[INSTALL_FLAG] = true;
   /*
    * capturedRawByConversationId：
-   *   暫存已捕捉到的 raw conversation JSON。
+   *   暫存被動觀察到或已驗證通過的 conversation JSON。
    *
    *   key：conversation_id
    *   value：
@@ -959,17 +971,24 @@
    *
    * title 會一併快取，避免 tooltip 更新時重複解析大型 raw JSON。
    */
-  function rememberRawConversation(conversationId, rawText, conversation = null) {
+  function rememberRawConversation(conversationId, rawText, conversation = null, source = 'observed') {
     const title = conversation ? getConversationTitle(conversation, '') : '';
     capturedRawByConversationId.set(conversationId, {
       rawText,
       capturedAt: Date.now(),
-      title
+      title,
+      source
     });
-    logInfo('已捕捉 conversation JSON。', {
-      conversationId,
-      length: rawText.length
-    });
+    logInfo(
+      source.startsWith('authoritative')
+        ? '已更新可信 conversation JSON。'
+        : '已捕捉 conversation JSON。',
+      {
+        conversationId,
+        length: rawText.length,
+        source
+      }
+    );
     ensureButtonsSoon();
   }
   /*
@@ -1023,6 +1042,9 @@
     if (typeof conversation.current_node !== 'string' || !conversation.current_node) {
       throw new Error('raw JSON 不包含有效的 current_node。');
     }
+    if (!Object.prototype.hasOwnProperty.call(conversation.mapping, conversation.current_node)) {
+      throw new Error('raw JSON 的 current_node 不存在於 mapping 中。');
+    }
     if (typeof conversation.conversation_id !== 'string' || !conversation.conversation_id) {
       throw new Error('raw JSON 不包含有效的 conversation_id。');
     }
@@ -1066,7 +1088,7 @@
           } catch {
             return;
           }
-          rememberRawConversation(conversationId, rawText, conversation);
+          rememberRawConversation(conversationId, rawText, conversation, 'observed-fetch');
         })
         .catch((error) => {
           logWarn('捕捉 conversation JSON 失敗。', {
@@ -1081,7 +1103,10 @@
    * 用途：
    *   - 觀察 ChatGPT 頁面自己發出的 conversation JSON 請求。
    *   - 記住可重抓的請求資訊。
-   *   - 捕捉成功回應的 raw JSON。
+   *   - 捕捉成功回應作為 observed JSON，供標題 / 狀態與輔助比較使用。
+   *
+   * 注意：被動 response 可能已被其他 page script / userscript / extension 改寫，
+   * 因此正式 raw / handoff 匯出不會直接把這份 capture 視為 authoritative JSON。
    *
    * 這裡不會：
    *   - 修改 ChatGPT 的請求內容。
@@ -1234,47 +1259,594 @@
     };
   }
   /*
-   * 使用先前捕捉的 request context 即時重新抓最新 raw JSON。
+   * 計算字串以 UTF-8 編碼後的實際 bytes。
    *
-   * 這可避免使用者新增 / 編輯訊息後必須手動重新整理頁面。
+   * raw JSON 完整性判定只記錄長度，不輸出內容。
    */
-  async function refetchLatestConversationRaw(conversationId) {
+  function getUtf8ByteLength(value) {
+    return new TextEncoder().encode(String(value || '')).byteLength;
+  }
+  /*
+   * 判斷 JavaScript 收到的 body bytes 是否與瀏覽器網路層 decodedBodySize 一致。
+   */
+  function isBodyByteLengthConsistent(rawByteLength, decodedBodySize) {
+    if (!Number.isFinite(rawByteLength) || !Number.isFinite(decodedBodySize) || decodedBodySize <= 0) {
+      return false;
+    }
+    const tolerance = Math.max(
+      RESOURCE_TIMING_BYTE_TOLERANCE_MIN,
+      Math.ceil(decodedBodySize * RESOURCE_TIMING_BYTE_TOLERANCE_RATIO)
+    );
+    return Math.abs(rawByteLength - decodedBodySize) <= tolerance;
+  }
+  /*
+   * 建立單次 Resource Timing 探針。
+   *
+   * 優先使用 PerformanceObserver 只觀察「探針建立後」的新 resource entry，
+   * 避免同一 URL 先前已有大量歷史 entry 時配錯 request。
+   * 若 observer 不可用，再退回 performance.getEntriesByName()。
+   *
+   * 這裡不 clear 全域 Resource Timing buffer，也不修改 ChatGPT 自己的 performance 狀態。
+   */
+  function createResourceTimingProbe(url, initiatorType) {
+    const normalizedUrl = new URL(url, location.origin).href;
+    const startedAt = performance.now();
+    const observedEntries = [];
+    let observer = null;
+    if (typeof PerformanceObserver === 'function') {
+      try {
+        observer = new PerformanceObserver((list) => {
+          for (const entry of list.getEntries()) {
+            if (
+              entry &&
+              entry.entryType === 'resource' &&
+              entry.name === normalizedUrl &&
+              entry.initiatorType === initiatorType &&
+              entry.startTime >= startedAt - RESOURCE_TIMING_START_SLOP_MS
+            ) {
+              observedEntries.push(entry);
+            }
+          }
+        });
+        observer.observe({ type: 'resource', buffered: false });
+      } catch {
+        observer = null;
+      }
+    }
+    return {
+      startedAt,
+      cancel() {
+        if (observer) {
+          observer.disconnect();
+          observer = null;
+        }
+      },
+      async finish(rawText) {
+        /* 讓 PerformanceObserver 有一個 task 的時間送出最後一批 entry。 */
+        await new Promise((resolve) => window.setTimeout(resolve, 0));
+        if (observer) {
+          observer.disconnect();
+          observer = null;
+        }
+        let candidates = observedEntries;
+        if (candidates.length === 0) {
+          try {
+            candidates = performance
+              .getEntriesByName(normalizedUrl, 'resource')
+              .filter((entry) => {
+                return (
+                  entry &&
+                  entry.initiatorType === initiatorType &&
+                  entry.startTime >= startedAt - RESOURCE_TIMING_START_SLOP_MS
+                );
+              });
+          } catch {
+            candidates = [];
+          }
+        }
+        const entry = candidates.length > 0
+          ? candidates.reduce((latest, current) => {
+            return !latest || current.startTime > latest.startTime ? current : latest;
+          }, null)
+          : null;
+        const rawByteLength = getUtf8ByteLength(rawText);
+        const decodedBodySize = entry && Number.isFinite(entry.decodedBodySize)
+          ? entry.decodedBodySize
+          : 0;
+        const encodedBodySize = entry && Number.isFinite(entry.encodedBodySize)
+          ? entry.encodedBodySize
+          : 0;
+        const transferSize = entry && Number.isFinite(entry.transferSize)
+          ? entry.transferSize
+          : 0;
+        if (!entry || decodedBodySize <= 0) {
+          return {
+            status: 'unavailable',
+            rawByteLength,
+            decodedBodySize,
+            encodedBodySize,
+            transferSize
+          };
+        }
+        return {
+          status: isBodyByteLengthConsistent(rawByteLength, decodedBodySize)
+            ? 'match'
+            : 'mismatch',
+          rawByteLength,
+          decodedBodySize,
+          encodedBodySize,
+          transferSize
+        };
+      }
+    };
+  }
+  /*
+   * 從 current_node 沿 parent 鏈回溯，建立 conversation 主路徑摘要。
+   *
+   * 只回傳 node ID 與結構狀態，不讀取或輸出訊息內容。
+   */
+  function analyzeConversationMainPath(conversation) {
+    const mapping = conversation && conversation.mapping && typeof conversation.mapping === 'object'
+      ? conversation.mapping
+      : {};
+    const pathNodeIds = [];
+    const seen = new Set();
+    let currentId = conversation ? conversation.current_node : null;
+    let hasCycle = false;
+    let missingNodeId = null;
+    while (typeof currentId === 'string' && currentId) {
+      if (seen.has(currentId)) {
+        hasCycle = true;
+        break;
+      }
+      seen.add(currentId);
+      const node = mapping[currentId];
+      if (!node || typeof node !== 'object') {
+        missingNodeId = currentId;
+        break;
+      }
+      pathNodeIds.push(currentId);
+      currentId = typeof node.parent === 'string' && node.parent ? node.parent : null;
+    }
+    return {
+      pathNodeIds,
+      hasCycle,
+      missingNodeId
+    };
+  }
+  /*
+   * 建立 conversation 的非敏感完整性摘要。
+   *
+   * 這些數值只用來比較不同取得通道，不會把 message content、headers、
+   * token、cookie 或 raw JSON 寫入 log / 檔案。
+   */
+  function analyzeConversationIntegrity(conversation, rawText) {
+    const mapping = conversation.mapping;
+    const mappingNodeIds = Object.keys(mapping);
+    const mainPath = analyzeConversationMainPath(conversation);
+    let branchCount = 0;
+    for (const nodeId of mappingNodeIds) {
+      const node = mapping[nodeId];
+      if (node && Array.isArray(node.children) && node.children.length > 1) {
+        branchCount += 1;
+      }
+    }
+    let visibleRoleTransitionCount = 0;
+    let previousVisibleRole = null;
+    const chronologicalPath = [...mainPath.pathNodeIds].reverse();
+    for (const nodeId of chronologicalPath) {
+      const role = mapping[nodeId]?.message?.author?.role;
+      if (role !== 'user' && role !== 'assistant') {
+        continue;
+      }
+      if (role !== previousVisibleRole) {
+        visibleRoleTransitionCount += 1;
+        previousVisibleRole = role;
+      }
+    }
+    return {
+      rawByteLength: getUtf8ByteLength(rawText),
+      mappingNodeCount: mappingNodeIds.length,
+      mainPathNodeCount: mainPath.pathNodeIds.length,
+      offMainPathNodeCount: Math.max(0, mappingNodeIds.length - mainPath.pathNodeIds.length),
+      branchCount,
+      visibleRoleTransitionCount,
+      hasMainPathCycle: mainPath.hasCycle,
+      missingMainPathNode: mainPath.missingNodeId,
+      isLinearMapping:
+        !mainPath.hasCycle &&
+        !mainPath.missingNodeId &&
+        mappingNodeIds.length === mainPath.pathNodeIds.length &&
+        branchCount === 0
+    };
+  }
+  /*
+   * 判斷兩份 conversation 是否可視為同一個 revision。
+   *
+   * current_node 必須一致；若兩邊都有 update_time，也必須一致。
+   * 這可避免使用者剛好在雙通道驗證期間新增訊息時，把不同 revision 誤判成裁切。
+   */
+  function isSameConversationRevision(candidateA, candidateB) {
+    if (!candidateA || !candidateB) {
+      return false;
+    }
+    const a = candidateA.conversation;
+    const b = candidateB.conversation;
+    if (
+      a.conversation_id !== b.conversation_id ||
+      a.current_node !== b.current_node
+    ) {
+      return false;
+    }
+    const aUpdateTime = a.update_time ?? null;
+    const bUpdateTime = b.update_time ?? null;
+    if (aUpdateTime !== null && bUpdateTime !== null && String(aUpdateTime) !== String(bUpdateTime)) {
+      return false;
+    }
+    return true;
+  }
+  /*
+   * 比較 mapping key 集合。
+   */
+  function isMappingKeySubset(smallerCandidate, largerCandidate) {
+    const smallerKeys = Object.keys(smallerCandidate.conversation.mapping);
+    const largerMapping = largerCandidate.conversation.mapping;
+    return smallerKeys.every((nodeId) => Object.prototype.hasOwnProperty.call(largerMapping, nodeId));
+  }
+  function compareConversationCandidates(candidateA, candidateB) {
+    if (!isSameConversationRevision(candidateA, candidateB)) {
+      return 'different-revision';
+    }
+    const aCount = candidateA.integrity.mappingNodeCount;
+    const bCount = candidateB.integrity.mappingNodeCount;
+    if (aCount === bCount) {
+      return isMappingKeySubset(candidateA, candidateB) && isMappingKeySubset(candidateB, candidateA)
+        ? 'equivalent'
+        : 'diverged';
+    }
+    if (aCount > bCount && isMappingKeySubset(candidateB, candidateA)) {
+      return 'a-superset';
+    }
+    if (bCount > aCount && isMappingKeySubset(candidateA, candidateB)) {
+      return 'b-superset';
+    }
+    return 'diverged';
+  }
+  /*
+   * 將安全可重用 headers 套用到 XMLHttpRequest。
+   *
+   * 若瀏覽器拒絕某個 header，錯誤只顯示 header 名稱，不輸出值。
+   */
+  function applyReplayHeadersToXhr(xhr, headers) {
+    headers.forEach((value, key) => {
+      try {
+        xhr.setRequestHeader(key, value);
+      } catch (error) {
+        throw new Error(
+          `XHR 無法套用必要 request header「${key}」：${toErrorMessage(error)}`
+        );
+      }
+    });
+  }
+  /*
+   * conversation 正式重抓通道 A：XMLHttpRequest。
+   *
+   * 這條通道不使用 window.fetch，可避開只攔截 fetch 的第三方修改器。
+   * 但 XHR 本身仍可能被其他頁面程式包裝，因此結果仍必須通過 Resource Timing 驗證。
+   */
+  async function requestConversationViaXhr(replayRequest) {
+    return new Promise((resolve, reject) => {
+      let xhr;
+      let probe = null;
+      try {
+        xhr = new XMLHttpRequest();
+        xhr.open('GET', replayRequest.url, true);
+        xhr.withCredentials = true;
+        const xhrHeaders = new Headers(replayRequest.headers);
+        xhrHeaders.set('cache-control', 'no-cache');
+        applyReplayHeadersToXhr(xhr, xhrHeaders);
+        probe = createResourceTimingProbe(replayRequest.url, 'xmlhttprequest');
+      } catch (error) {
+        probe?.cancel();
+        reject(error);
+        return;
+      }
+      try {
+        xhr.addEventListener('load', async () => {
+          try {
+            const rawText = typeof xhr.responseText === 'string' ? xhr.responseText : '';
+            const timing = await probe.finish(rawText);
+            resolve({
+              transport: 'xhr',
+              status: xhr.status,
+              statusText: xhr.statusText || '',
+              contentType: xhr.getResponseHeader('content-type') || '',
+              rawText,
+              timing
+            });
+          } catch (error) {
+            reject(error);
+          }
+        }, { once: true });
+        xhr.addEventListener('error', () => {
+          probe?.cancel();
+          reject(new Error('XHR 重新抓取 conversation JSON 時發生網路錯誤。'));
+        }, { once: true });
+        xhr.addEventListener('abort', () => {
+          probe?.cancel();
+          reject(new Error('XHR 重新抓取 conversation JSON 已被中止。'));
+        }, { once: true });
+        xhr.send();
+      } catch (error) {
+        probe?.cancel();
+        reject(error);
+      }
+    });
+  }
+  /*
+   * conversation 正式重抓通道 B：目前頁面的 window.fetch。
+   *
+   * 這條通道只在 XHR 無法被 Resource Timing 直接驗證，或偵測到大小不一致時啟用。
+   * 它不是預設可信來源，而是第二個獨立比較訊號。
+   */
+  async function requestConversationViaFetch(replayRequest) {
+    const probe = createResourceTimingProbe(replayRequest.url, 'fetch');
+    let response;
+    let rawText;
+    try {
+      response = await window.fetch(replayRequest.url, {
+        method: 'GET',
+        credentials: 'include',
+        cache: 'no-store',
+        headers: new Headers(replayRequest.headers)
+      });
+      rawText = await response.text();
+    } catch (error) {
+      probe.cancel();
+      throw error;
+    }
+    const timing = await probe.finish(rawText);
+    return {
+      transport: 'fetch',
+      status: response.status,
+      statusText: response.statusText || '',
+      contentType: response.headers.get('content-type') || '',
+      rawText,
+      timing
+    };
+  }
+  /*
+   * 將 transport response 解析成可比較的 conversation candidate。
+   */
+  function validateConversationTransportResult(result, conversationId) {
+    if (!result || !Number.isFinite(result.status) || result.status < 200 || result.status >= 300) {
+      const status = result && Number.isFinite(result.status) ? result.status : 0;
+      const statusText = result?.statusText || '';
+      throw new Error(
+        `重新抓取 conversation JSON 失敗：HTTP ${status || '未知'} ${statusText}\n\n` +
+        getHttpStatusSuggestion(status)
+      );
+    }
+    if (!String(result.contentType || '').includes('application/json')) {
+      throw new Error(
+        '重新抓取 conversation JSON 失敗：回應不是 JSON。\n\n' +
+        `Content-Type: ${result.contentType || '未知'}\n\n` +
+        '建議：重新整理頁面並確認對話已正常載入。若仍持續發生，可能是 ChatGPT 前端或內部 endpoint 格式已變更。'
+      );
+    }
+    if (!String(result.rawText || '').trim()) {
+      throw new Error('重新抓取 conversation JSON 失敗：response body 為空。');
+    }
+    const conversation = parseAndValidateRawConversation(result.rawText, conversationId);
+    return {
+      ...result,
+      conversation,
+      integrity: analyzeConversationIntegrity(conversation, result.rawText)
+    };
+  }
+  async function tryConversationTransport(transportName, replayRequest, conversationId) {
+    try {
+      const rawResult = transportName === 'xhr'
+        ? await requestConversationViaXhr(replayRequest)
+        : await requestConversationViaFetch(replayRequest);
+      return {
+        candidate: validateConversationTransportResult(rawResult, conversationId),
+        error: null
+      };
+    } catch (error) {
+      return {
+        candidate: null,
+        error
+      };
+    }
+  }
+  /*
+   * 使用另一個 request 的 network decodedBodySize 驗證 candidate。
+   *
+   * 只有兩份 response 屬於同一個 conversation revision 時才允許交叉驗證，
+   * 避免對話剛好更新時拿舊的 network size 套到新 revision。
+   */
+  function isCandidateSupportedByOtherTiming(candidate, timingSourceCandidate) {
+    if (
+      !candidate ||
+      !timingSourceCandidate ||
+      !isSameConversationRevision(candidate, timingSourceCandidate)
+    ) {
+      return false;
+    }
+    const decodedBodySize = timingSourceCandidate.timing?.decodedBodySize || 0;
+    return isBodyByteLengthConsistent(candidate.integrity.rawByteLength, decodedBodySize);
+  }
+  function formatCandidateIntegritySummary(candidate) {
+    if (!candidate) {
+      return '無有效 response';
+    }
+    const timing = candidate.timing || {};
+    return [
+      `${candidate.transport.toUpperCase()} response=${candidate.integrity.rawByteLength} bytes`,
+      `network=${timing.decodedBodySize > 0 ? `${timing.decodedBodySize} bytes` : '無法取得'}`,
+      `timing=${timing.status || 'unavailable'}`,
+      `mapping=${candidate.integrity.mappingNodeCount}`,
+      `mainPath=${candidate.integrity.mainPathNodeCount}`,
+      `branches=${candidate.integrity.branchCount}`
+    ].join('，');
+  }
+  function buildConversationIntegrityFailureMessage(xhrAttempt, fetchAttempt, reason) {
+    const lines = [
+      '下載中止：無法確認 conversation JSON 的完整性。',
+      '',
+      reason,
+      ''
+    ];
+    if (xhrAttempt?.candidate) {
+      lines.push(formatCandidateIntegritySummary(xhrAttempt.candidate));
+    } else if (xhrAttempt?.error) {
+      lines.push(`XHR：${toErrorMessage(xhrAttempt.error)}`);
+    }
+    if (fetchAttempt?.candidate) {
+      lines.push(formatCandidateIntegritySummary(fetchAttempt.candidate));
+    } else if (fetchAttempt?.error) {
+      lines.push(`Fetch：${toErrorMessage(fetchAttempt.error)}`);
+    }
+    lines.push(
+      '',
+      '這可能表示頁面腳本、userscript 或瀏覽器擴充功能修改了 conversation API 回應，',
+      '也可能是對話剛好仍在更新，導致兩次請求取得不同 revision。',
+      '',
+      '為避免產生不完整的 raw / handoff JSON，本次未下載檔案。',
+      '建議：等待對話停止更新後再試；若持續發生，請重新整理頁面後重新匯出。'
+    );
+    return lines.join('\n');
+  }
+  /*
+   * 從 XHR / fetch 候選中選出可被網路大小或雙通道結構支持的可信 response。
+   *
+   * 原則：
+   *   1. 任一通道自身 Resource Timing 明確 match → 直接可信。
+   *   2. 某通道 timing mismatch，但另一份同 revision body bytes 能吻合該 network size → 採另一份。
+   *   3. 兩邊都沒有 timing 證據時，只接受同 revision 且 mapping 完全一致或一方為嚴格 superset。
+   *   4. 已知 mismatch、不同 revision 或無法判斷 → fail closed。
+   */
+  function selectTrustedConversationCandidate(xhrAttempt, fetchAttempt) {
+    const xhrCandidate = xhrAttempt?.candidate || null;
+    const fetchCandidate = fetchAttempt?.candidate || null;
+    if (xhrCandidate?.timing?.status === 'match') {
+      return xhrCandidate;
+    }
+    if (fetchCandidate?.timing?.status === 'match') {
+      return fetchCandidate;
+    }
+    if (!xhrCandidate && !fetchCandidate) {
+      throw new Error(
+        buildConversationIntegrityFailureMessage(
+          xhrAttempt,
+          fetchAttempt,
+          '兩個 conversation 取得通道都失敗。'
+        )
+      );
+    }
+    if (xhrCandidate && fetchCandidate) {
+      const xhrSupportedByFetchTiming = isCandidateSupportedByOtherTiming(xhrCandidate, fetchCandidate);
+      const fetchSupportedByXhrTiming = isCandidateSupportedByOtherTiming(fetchCandidate, xhrCandidate);
+      if (xhrSupportedByFetchTiming && !fetchSupportedByXhrTiming) {
+        return xhrCandidate;
+      }
+      if (fetchSupportedByXhrTiming && !xhrSupportedByFetchTiming) {
+        return fetchCandidate;
+      }
+      if (
+        xhrCandidate.timing?.status === 'mismatch' ||
+        fetchCandidate.timing?.status === 'mismatch'
+      ) {
+        throw new Error(
+          buildConversationIntegrityFailureMessage(
+            xhrAttempt,
+            fetchAttempt,
+            '至少一個 JavaScript response body 與瀏覽器實際網路 response 大小明顯不一致。'
+          )
+        );
+      }
+      const comparison = compareConversationCandidates(xhrCandidate, fetchCandidate);
+      if (comparison === 'equivalent') {
+        return xhrCandidate;
+      }
+      if (comparison === 'a-superset') {
+        return xhrCandidate;
+      }
+      if (comparison === 'b-superset') {
+        return fetchCandidate;
+      }
+      throw new Error(
+        buildConversationIntegrityFailureMessage(
+          xhrAttempt,
+          fetchAttempt,
+          comparison === 'different-revision'
+            ? '兩個取得通道拿到不同 conversation revision，無法安全判定哪一份是目前完整資料。'
+            : '兩個取得通道的 mapping 結構不一致，且不存在可確認的完整 superset。'
+        )
+      );
+    }
+    const onlyCandidate = xhrCandidate || fetchCandidate;
+    const onlyAttemptName = xhrCandidate ? 'XHR' : 'Fetch';
+    if (onlyCandidate.timing?.status === 'mismatch') {
+      throw new Error(
+        buildConversationIntegrityFailureMessage(
+          xhrAttempt,
+          fetchAttempt,
+          `${onlyAttemptName} response 與瀏覽器實際網路 response 大小不一致，另一通道又無法提供有效驗證。`
+        )
+      );
+    }
+    throw new Error(
+      buildConversationIntegrityFailureMessage(
+        xhrAttempt,
+        fetchAttempt,
+        `${onlyAttemptName} 雖取得合法 JSON，但缺少可獨立驗證的 Resource Timing，另一通道也無法確認，因此不將它視為原始 authoritative JSON。`
+      )
+    );
+  }
+  /*
+   * 使用先前被動捕捉的 request context，即時重新抓取目前 conversation。
+   *
+   * 正式匯出不再直接信任被動 capture，也不再把 window.fetch 的單一路徑
+   * 當成 authoritative source。預設先走 XHR；只有無法直接驗證或發現異常時，
+   * 才追加 fetch 第二通道，最後由完整性判定挑選可信 snapshot。
+   */
+  async function refetchLatestConversationSnapshot(conversationId) {
     const replayRequest = getReplayRequestForConversation(conversationId);
     if (!replayRequest) {
       throw new Error(buildMissingRequestContextMessage('conversation JSON'));
     }
     replayRequestByConversationId.set(conversationId, replayRequest);
-    const response = await fetch(replayRequest.url, {
-      method: 'GET',
-      credentials: 'include',
-      cache: 'no-store',
-      headers: new Headers(replayRequest.headers)
+    const xhrAttempt = await tryConversationTransport('xhr', replayRequest, conversationId);
+    let fetchAttempt = null;
+    if (!xhrAttempt.candidate || xhrAttempt.candidate.timing?.status !== 'match') {
+      fetchAttempt = await tryConversationTransport('fetch', replayRequest, conversationId);
+    }
+    const trustedCandidate = selectTrustedConversationCandidate(xhrAttempt, fetchAttempt);
+    rememberRawConversation(
+      conversationId,
+      trustedCandidate.rawText,
+      trustedCandidate.conversation,
+      `authoritative-${trustedCandidate.transport}`
+    );
+    logInfo('conversation JSON 完整性驗證通過。', {
+      conversationId,
+      transport: trustedCandidate.transport,
+      responseBytes: trustedCandidate.integrity.rawByteLength,
+      networkBytes: trustedCandidate.timing?.decodedBodySize || null,
+      timingStatus: trustedCandidate.timing?.status || 'unavailable',
+      mappingNodeCount: trustedCandidate.integrity.mappingNodeCount,
+      mainPathNodeCount: trustedCandidate.integrity.mainPathNodeCount,
+      branchCount: trustedCandidate.integrity.branchCount
     });
-    if (!response.ok) {
-      throw new Error(
-        `即時重新抓取 conversation JSON 失敗：HTTP ${response.status} ${response.statusText || ''}\n\n` +
-        getHttpStatusSuggestion(response.status)
-      );
-    }
-    const contentType = response.headers.get('content-type') || '';
-    if (!contentType.includes('application/json')) {
-      throw new Error(
-        '即時重新抓取 conversation JSON 失敗：回應不是 JSON。\n\n' +
-        `Content-Type: ${contentType || '未知'}\n\n` +
-        '建議：重新整理頁面並確認對話已正常載入。若仍持續發生，可能是 ChatGPT 前端或內部 endpoint 格式已變更。'
-      );
-    }
-    const rawText = await response.text();
-    if (!looksLikeConversationObject(rawText)) {
-      throw new Error(
-        '即時重新抓取 conversation JSON 失敗：回應不是完整 conversation JSON 物件。\n\n' +
-        `內容長度：${rawText ? rawText.length : 0}\n\n` +
-        '建議：確認目前頁面是完整對話頁，等待載入完成後再試；若仍失敗，請重新整理或稍後再試。'
-      );
-    }
-    const conversation = parseAndValidateRawConversation(rawText, conversationId);
-    rememberRawConversation(conversationId, rawText, conversation);
-    return rawText;
+    return {
+      rawText: trustedCandidate.rawText,
+      conversation: trustedCandidate.conversation,
+      integrity: trustedCandidate.integrity,
+      transport: trustedCandidate.transport,
+      timing: trustedCandidate.timing
+    };
   }
   /*
    * 判斷值是否為一般物件。
@@ -1495,55 +2067,16 @@
     }
   }
   /*
-   * 取得最新 raw JSON。
+   * 取得目前對話的 authoritative conversation snapshot。
    *
-   * 優先順序：
-   *   1. 若有目前對話可用的 request context 或 backend API 樣板，
-   *      直接重新抓取最新資料。
-   *   2. 只有在已捕捉 raw JSON 的 conversation_id 與目前 URL 完全一致時，
-   *      才允許使用記憶體中的 capture。
-   *
-   * 此流程避免在 SPA 切換期間使用其他對話的 capture。
-   */
-  async function getLatestRawText(conversationId) {
-    assertConversationStillCurrent(conversationId, '取得 raw JSON 前');
-    if (getReplayRequestForConversation(conversationId)) {
-      const rawText = await refetchLatestConversationRaw(conversationId);
-      assertConversationStillCurrent(conversationId, '重新抓取 raw JSON 後');
-      return rawText;
-    }
-    const capture = capturedRawByConversationId.get(conversationId);
-    if (capture) {
-      const capturedConversation = parseAndValidateRawConversation(capture.rawText, conversationId);
-      assertConversationStillCurrent(conversationId, '使用已捕捉 raw JSON 前');
-      if (capturedConversation.conversation_id !== getConversationIdFromUrl()) {
-        throw new Error(
-          '匯出中止：已捕捉的 JSON 與目前對話不一致。\n\n' +
-          `已捕捉 JSON ID：${capturedConversation.conversation_id}\n` +
-          `目前網址 ID：${getConversationIdFromUrl() || '未知'}\n\n` +
-          '為避免匯出舊資料，請等待目前對話載入完成後再試。'
-        );
-      }
-      return capture.rawText;
-    }
-    throw new Error(
-      '目前無法取得此對話的 JSON 請求資訊。\n\n' +
-      '請確認對話內容已載入完成，或重新進入此對話頁後再試一次。'
-    );
-  }
-  /*
-   * 取得目前對話的 raw JSON 與已驗證 conversation 物件。
-   *
-   * 匯出流程會先通過這個 helper，避免 raw JSON 取得、解析與 ID 驗證邏輯
-   * 分散在不同 click handler 中。
+   * 被動 capture 只保留給 tooltip / 標題與 request context 輔助用途；
+   * 正式 raw / handoff 匯出必須重新抓取並通過 transport + Resource Timing 完整性驗證。
    */
   async function getLatestConversationSnapshot(conversationId) {
-    const rawText = await getLatestRawText(conversationId);
-    const conversation = parseAndValidateRawConversation(rawText, conversationId);
-    return {
-      rawText,
-      conversation
-    };
+    assertConversationStillCurrent(conversationId, '取得 raw JSON 前');
+    const snapshot = await refetchLatestConversationSnapshot(conversationId);
+    assertConversationStillCurrent(conversationId, '重新抓取 raw JSON 後');
+    return snapshot;
   }
   /*
    * 取得目前對話的 textdocs 陣列。
@@ -2947,22 +3480,46 @@
     return usableCandidates.length === 1 ? usableCandidates[0] : null;
   }
   /*
-   * 極少數 DOM 可能把原生分享文字直接放在 button 的文字節點中。
-   * 這時只包住既有文字節點，不複製內容，讓 CSS 仍能安全切換 compact。
+   * 尋找分享按鈕 subtree 中的原生可見文字節點，並只包住文字本身。
+   *
+   * ChatGPT 目前可能把 SVG 與「分享」裸文字放在同一個內層 div；
+   * 若直接標記整個 div，compact CSS 會連 SVG 一起隱藏。因此這裡使用
+   * TreeWalker 找實際 Text node，不依賴固定 DOM 深度，也不複製文字內容。
    */
-  function wrapDirectNativeShareTextNode(shareButton) {
-    const directTextNode = Array.from(shareButton.childNodes).find((node) => {
-      return node.nodeType === Node.TEXT_NODE && normalizeUiText(node.nodeValue) !== '';
-    });
-    if (!directTextNode) {
-      return null;
+  function wrapNativeShareTextNode(shareButton, expectedText) {
+    const walker = document.createTreeWalker(shareButton, NodeFilter.SHOW_TEXT);
+    let textNode = walker.nextNode();
+    while (textNode) {
+      const candidateText = normalizeUiText(textNode.nodeValue);
+      const parentElement = textNode.parentElement;
+      const matchesExpectedText = Boolean(
+        candidateText &&
+        (
+          candidateText === expectedText ||
+          expectedText.includes(candidateText) ||
+          candidateText.includes(expectedText)
+        )
+      );
+      const excluded = !parentElement || Boolean(
+        parentElement.closest(
+          '[data-cgpt-share-label="fallback"], svg, [aria-hidden="true"], .sr-only, [hidden]'
+        )
+      );
+      if (matchesExpectedText && !excluded) {
+        const existingNative = parentElement.closest('[data-cgpt-share-label="native"]');
+        if (existingNative && shareButton.contains(existingNative)) {
+          return existingNative;
+        }
+        const wrapper = document.createElement('span');
+        wrapper.setAttribute('data-cgpt-share-label', 'native');
+        wrapper.setAttribute('data-cgpt-share-label-wrapper', 'true');
+        textNode.replaceWith(wrapper);
+        wrapper.append(textNode);
+        return wrapper;
+      }
+      textNode = walker.nextNode();
     }
-    const wrapper = document.createElement('span');
-    wrapper.setAttribute('data-cgpt-share-label', 'native');
-    wrapper.setAttribute('data-cgpt-share-label-wrapper', 'true');
-    directTextNode.replaceWith(wrapper);
-    wrapper.append(directTextNode);
-    return wrapper;
+    return null;
   }
   /*
    * 讓分享按鈕永遠只有一個可控制的文字標籤。
@@ -2988,7 +3545,7 @@
     }
     const nativeLabel =
       findNativeShareLabelElement(shareButton, expectedText) ||
-      wrapDirectNativeShareTextNode(shareButton);
+      wrapNativeShareTextNode(shareButton, expectedText);
     for (const markedNative of shareButton.querySelectorAll('[data-cgpt-share-label="native"]')) {
       if (markedNative !== nativeLabel) {
         markedNative.removeAttribute('data-cgpt-share-label');
@@ -3408,7 +3965,8 @@
   // 七、啟動腳本
   // ============================================================
   /*
-   * 越早包裝 fetch，越有機會捕捉到 ChatGPT 載入對話時的原始 JSON。
+   * 越早包裝 fetch，越有機會被動取得 ChatGPT request context 與 observed response。
+   * 正式匯出仍會使用獨立重抓與完整性驗證，不把被動 capture 視為 authoritative raw。
    *
    * UI 插入則等 DOM 可用後再開始。
    */
