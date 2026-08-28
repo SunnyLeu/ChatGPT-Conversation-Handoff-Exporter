@@ -2,7 +2,7 @@
 // @name         ChatGPT 對話 JSON 與交接檔匯出工具
 // @name:en      ChatGPT Conversation Handoff Exporter
 // @namespace    https://github.com/SunnyLeu/ChatGPT-Conversation-Handoff-Exporter
-// @version      1.1.18
+// @version      1.1.20
 // @description  在 ChatGPT 對話頁新增按鈕，可下載目前對話的格式化原始 JSON，或直接產出精簡交接用 handoff JSON。
 // @description:en Export the current ChatGPT conversation as formatted raw JSON or compact handoff JSON.
 // @author       SunnyLeu
@@ -60,7 +60,7 @@
    *   - 多次包裝 window.fetch
    *   - 重複的 timer / listener
    */
-  const INSTALL_FLAG = '__chatgptConversationHandoffExporterInstalled_v1118';
+  const INSTALL_FLAG = '__chatgptConversationHandoffExporterInstalled_v1120';
   /*
    * 匯出按鈕事件綁定標記。
    *
@@ -68,7 +68,7 @@
    * click listener 是否屬於目前腳本，必要時重建按鈕以避免殘留
    * listener 或 conversation 狀態。
    */
-  const EXPORT_BUTTON_LISTENER_VERSION = '1.1.18';
+  const EXPORT_BUTTON_LISTENER_VERSION = '1.1.20';
   /*
    * 兩個按鈕的 DOM id。
    *
@@ -81,20 +81,20 @@
   const RAW_BUTTON_ID = 'cgpt-export-raw-json-button';
   const HANDOFF_BUTTON_ID = 'cgpt-export-handoff-json-button';
   /*
-   * Header action 共用 selector 與寬度門檻。
+   * Header action 共用 selector 與幾何量測容差。
    *
-   * HEADER_EXPANDED_MIN_WIDTH：
-   *   只有 page header 的實際可用寬度達到這個門檻，才嘗試顯示
-   *   「分享／下載原始 JSON／下載交接 JSON」三個文字標籤。
+   * HEADER_LAYOUT_TOLERANCE：
+   *   只用來吸收 getBoundingClientRect()、clientWidth / scrollWidth 的
+   *   次像素與整數取整差異，不作為 viewport / Header 固定寬度門檻。
    *
-   * HEADER_LAYOUT_HYSTERESIS：
-   *   compact 狀態需要多出少量寬度才會切回 expanded，避免瀏覽器縮放、
-   *   字型載入或捲軸變化讓按鈕在臨界值附近反覆跳動。
+   * compact / expanded 的決策改由實際版面壓力驅動：
+   *   - 右側 action 發生 overflow 或越界。
+   *   - 左右 Header 區塊實際重疊。
+   *   - expanded 相較 compact 新增左側文字裁切 / 截斷。
    */
   const SHARE_BUTTON_SELECTOR = '[data-testid="share-chat-button"]';
   const HEADER_ACTIONS_SELECTOR = '#conversation-header-actions';
-  const HEADER_EXPANDED_MIN_WIDTH = 960;
-  const HEADER_LAYOUT_HYSTERESIS = 32;
+  const HEADER_LAYOUT_TOLERANCE = 1;
   /*
    * backend JSON response 完整性驗證用容差。
    *
@@ -1346,8 +1346,8 @@
         }
         const entry = candidates.length > 0
           ? candidates.reduce((latest, current) => {
-              return !latest || current.startTime > latest.startTime ? current : latest;
-            }, null)
+            return !latest || current.startTime > latest.startTime ? current : latest;
+          }, null)
           : null;
         const rawByteLength = getUtf8ByteLength(rawText);
         const decodedBodySize = entry && Number.isFinite(entry.decodedBodySize)
@@ -3899,62 +3899,152 @@
     };
   }
   /*
-   * 判斷離屏 expanded clone 是否造成實際裁切或左右區塊重疊。
+   * 量測 Header 左側文字在目前 clone 狀態下的裁切壓力。
    *
-   * 實際 Header 不會在測量過程中切換尺寸，避免畫面閃動與 ResizeObserver
-   * 回授迴圈。
+   * 不依賴專案名稱文案或特定 class；只掃描左側 region 中實際含文字的
+   * DOM 節點，記錄 scrollWidth / clientWidth 與 scrollHeight / clientHeight。
+   * compact 與 expanded 使用同一份 clone DOM，因此可用節點順序穩定比對。
    */
-  function isExpandedHeaderLayoutConflicting(parts, headerActions) {
-    const measurableContainers = [
-      headerActions,
-      parts.rightActions,
-      parts.rightActionsContainer
-    ].filter(Boolean);
-    if (measurableContainers.some((element) => element.clientWidth > 0 && element.scrollWidth > element.clientWidth + 1)) {
-      return true;
+  function measureLeftHeaderTextPressure(leftRegion) {
+    if (!leftRegion) {
+      return [];
     }
-    const headerRect = parts.pageHeader.getBoundingClientRect();
-    const rightRect = (parts.rightRegion || headerActions).getBoundingClientRect();
-    const headerStyle = getComputedStyle(parts.pageHeader);
-    const paddingStart = Number.parseFloat(headerStyle.paddingInlineStart) || 0;
-    const paddingEnd = Number.parseFloat(headerStyle.paddingInlineEnd) || 0;
-    if (
-      rightRect.left < headerRect.left + paddingStart - 1 ||
-      rightRect.right > headerRect.right - paddingEnd + 1
-    ) {
-      return true;
+    const elements = [leftRegion, ...leftRegion.querySelectorAll('*')];
+    const samples = [];
+    for (let index = 0; index < elements.length; index += 1) {
+      const element = elements[index];
+      if (!normalizeUiText(element.textContent)) {
+        continue;
+      }
+      const style = getComputedStyle(element);
+      if (style.display === 'none') {
+        continue;
+      }
+      const clientWidth = element.clientWidth;
+      const clientHeight = element.clientHeight;
+      const scrollWidth = element.scrollWidth;
+      const scrollHeight = element.scrollHeight;
+      samples.push({
+        index,
+        horizontalOverflow: Math.max(0, scrollWidth - clientWidth),
+        verticalOverflow: Math.max(0, scrollHeight - clientHeight)
+      });
     }
-    if (parts.leftRegion && parts.rightRegion) {
-      const leftRect = parts.leftRegion.getBoundingClientRect();
-      const directRightRect = parts.rightRegion.getBoundingClientRect();
-      if (leftRect.right > directRightRect.left + 1) {
+    return samples;
+  }
+  /*
+   * 判斷 expanded 是否比 compact 額外擠壓左側 Header 文字。
+   *
+   * 左側內容若在 compact 本來就因自身 max-width 或視窗極窄而截斷，
+   * 不會單憑「已截斷」就永遠維持 compact；只有 expanded 讓裁切量進一步
+   * 增加超過量測容差時，才視為右側文字造成的版面壓力。
+   */
+  function hasExpandedLeftHeaderPressure(compactPressure, expandedPressure) {
+    if (!compactPressure?.length || !expandedPressure?.length) {
+      return false;
+    }
+    const compactByIndex = new Map(
+      compactPressure.map((sample) => [sample.index, sample])
+    );
+    for (const expandedSample of expandedPressure) {
+      const compactSample = compactByIndex.get(expandedSample.index);
+      if (!compactSample) {
+        continue;
+      }
+      if (
+        expandedSample.horizontalOverflow > compactSample.horizontalOverflow + HEADER_LAYOUT_TOLERANCE ||
+        expandedSample.verticalOverflow > compactSample.verticalOverflow + HEADER_LAYOUT_TOLERANCE
+      ) {
         return true;
       }
     }
     return false;
   }
   /*
-   * 依 page header 實際寬度與 expanded 版面碰撞結果決定 compact 狀態。
+   * 將離屏 clone 的三顆主要 Header action 切成指定版面狀態。
    *
-   * 門檻只負責保留窄視窗的純圖示體驗；達到門檻後仍會做實際 overflow
-   * 與左右區塊碰撞檢查，不會只依賴固定 viewport breakpoint。
+   * 只修改 clone 上既有的 data attribute；正式頁面的 DOM 不會在量測過程
+   * 中切換，因此不會造成可見閃動或 ResizeObserver 回授迴圈。
+   */
+  function setClonedHeaderActionsCompact(headerActions, isCompact) {
+    const value = isCompact ? 'true' : 'false';
+    headerActions.setAttribute('data-cgpt-header-compact', value);
+    for (const cloneExportButton of headerActions.querySelectorAll('[data-cgpt-export-button="true"]')) {
+      cloneExportButton.setAttribute('data-cgpt-export-compact', value);
+    }
+  }
+  /*
+   * 判斷離屏 expanded clone 是否造成實際版面壓力。
+   *
+   * 判定來源：
+   *   1. 右側 action 容器實際 overflow。
+   *   2. 右側 region 超出 Header 合法邊界（含原生負 margin 補償）。
+   *   3. 左右 Header region 實際重疊。
+   *   4. expanded 相較 compact 新增左側文字裁切 / 截斷。
+   */
+  function isExpandedHeaderLayoutConflicting(parts, headerActions, compactLeftPressure) {
+    const measurableContainers = [
+      headerActions,
+      parts.rightActions,
+      parts.rightActionsContainer
+    ].filter(Boolean);
+    if (
+      measurableContainers.some(
+        (element) =>
+          element.clientWidth > 0 &&
+          element.scrollWidth > element.clientWidth + HEADER_LAYOUT_TOLERANCE
+      )
+    ) {
+      return true;
+    }
+    const headerRect = parts.pageHeader.getBoundingClientRect();
+    const rightTarget = parts.rightRegion || headerActions;
+    const rightRect = rightTarget.getBoundingClientRect();
+    const headerStyle = getComputedStyle(parts.pageHeader);
+    const rightStyle = getComputedStyle(rightTarget);
+    const paddingStart = Number.parseFloat(headerStyle.paddingInlineStart) || 0;
+    const paddingEnd = Number.parseFloat(headerStyle.paddingInlineEnd) || 0;
+    const negativeMarginLeft = Math.min(0, Number.parseFloat(rightStyle.marginLeft) || 0);
+    const negativeMarginRight = Math.min(0, Number.parseFloat(rightStyle.marginRight) || 0);
+    /*
+     * ChatGPT 原生 Header action wrapper 可能用負 margin 抵銷自身 padding。
+     * 這類合法外延不應被視為 expanded 版面越界；邊界只額外放寬實際的負 margin。
+     */
+    const allowedLeft =
+      headerRect.left + paddingStart + negativeMarginLeft - HEADER_LAYOUT_TOLERANCE;
+    const allowedRight =
+      headerRect.right - paddingEnd - negativeMarginRight + HEADER_LAYOUT_TOLERANCE;
+    if (rightRect.left < allowedLeft || rightRect.right > allowedRight) {
+      return true;
+    }
+    if (parts.leftRegion && parts.rightRegion) {
+      const leftRect = parts.leftRegion.getBoundingClientRect();
+      const directRightRect = parts.rightRegion.getBoundingClientRect();
+      if (leftRect.right > directRightRect.left + HEADER_LAYOUT_TOLERANCE) {
+        return true;
+      }
+    }
+    const expandedLeftPressure = measureLeftHeaderTextPressure(parts.leftRegion);
+    return hasExpandedLeftHeaderPressure(compactLeftPressure, expandedLeftPressure);
+  }
+  /*
+   * 依 Header 實際版面壓力決定 compact 狀態，不使用固定 viewport / Header 寬度門檻。
+   *
+   * 先在同一份離屏 clone 量測 compact 基準，再切成 expanded 量測候選狀態。
+   * 只要 expanded 沒有造成 overflow、越界、左右重疊或新增左側文字裁切，
+   * 就維持文字顯示；即使視窗較窄也不會因固定 breakpoint 強制 compact。
    */
   function shouldUseCompactHeaderLayout(headerActions) {
     const parts = getHeaderLayoutParts(headerActions);
     if (!parts) {
       return true;
     }
-    const currentCompact = headerActions.getAttribute('data-cgpt-header-compact') !== 'false';
-    const expandThreshold = currentCompact
-      ? HEADER_EXPANDED_MIN_WIDTH + HEADER_LAYOUT_HYSTERESIS
-      : HEADER_EXPANDED_MIN_WIDTH;
     const headerRect = parts.pageHeader.getBoundingClientRect();
-    if (headerRect.width < expandThreshold) {
+    if (headerRect.width <= 0 || headerRect.height <= 0) {
       return true;
     }
     /*
-     * 使用離屏 clone 測量 expanded 狀態，避免在原始 Header 上暫時切換尺寸，
-     * 進而觸發 ResizeObserver 反覆 compact / expanded 的回授迴圈。
+     * 使用離屏 clone 量測 compact / expanded，避免在原始 Header 上暫時切換尺寸。
      */
     const headerClone = parts.pageHeader.cloneNode(true);
     headerClone.setAttribute('aria-hidden', 'true');
@@ -3971,17 +4061,20 @@
     if (!cloneHeaderActions) {
       return true;
     }
-    cloneHeaderActions.setAttribute('data-cgpt-header-compact', 'false');
-    for (const cloneExportButton of cloneHeaderActions.querySelectorAll('[data-cgpt-export-button="true"]')) {
-      cloneExportButton.setAttribute('data-cgpt-export-compact', 'false');
-    }
     document.body.append(headerClone);
     try {
       const cloneParts = getHeaderLayoutParts(cloneHeaderActions);
       if (!cloneParts) {
         return true;
       }
-      return isExpandedHeaderLayoutConflicting(cloneParts, cloneHeaderActions);
+      setClonedHeaderActionsCompact(cloneHeaderActions, true);
+      const compactLeftPressure = measureLeftHeaderTextPressure(cloneParts.leftRegion);
+      setClonedHeaderActionsCompact(cloneHeaderActions, false);
+      return isExpandedHeaderLayoutConflicting(
+        cloneParts,
+        cloneHeaderActions,
+        compactLeftPressure
+      );
     } finally {
       headerClone.remove();
     }
