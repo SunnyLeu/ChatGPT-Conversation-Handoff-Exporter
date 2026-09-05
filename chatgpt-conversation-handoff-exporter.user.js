@@ -2,9 +2,9 @@
 // @name         ChatGPT 對話 JSON 與交接檔匯出工具
 // @name:en      ChatGPT Conversation Handoff Exporter
 // @namespace    https://github.com/SunnyLeu/ChatGPT-Conversation-Handoff-Exporter
-// @version      1.1.20
-// @description  在 ChatGPT 對話頁新增按鈕，可下載目前對話的格式化原始 JSON，或直接產出精簡交接用 handoff JSON。
-// @description:en Export the current ChatGPT conversation as formatted raw JSON or compact handoff JSON.
+// @version      1.2.0
+// @description  在 ChatGPT 對話頁匯出目前對話的 raw / handoff JSON，並支援雙區域獨立 session、可追加佇列、移除項目與延後打包。
+// @description:en Export the current ChatGPT conversation as raw or handoff JSON, with independent batch sessions, appendable queues, item removal and deferred ZIP packaging.
 // @author       SunnyLeu
 // @license      MIT
 // @homepageURL  https://github.com/SunnyLeu/ChatGPT-Conversation-Handoff-Exporter
@@ -31,9 +31,26 @@
  *   3.「下載交接 JSON」會把 raw conversation JSON 轉成較精簡、
  *      適合上傳到新 ChatGPT 對話接續前情的 handoff JSON。
  *
+ *   4. 一般聊天側邊欄與專案聊天列表提供受控批次 raw / handoff 功能：
+ *      使用者可在同一個批次 session 中多次選取並追加 conversation 到佇列；
+ *      資料取得完成後仍保留在目前頁面記憶體，只有使用者按下「打包」時，
+ *      才以 ZIP STORE（不壓縮）封裝並下載。
+ *
  * 設計原則：
- *   - 只處理目前使用者正在看的單一對話。
- *   - 不批次掃描所有對話。
+ *   - 單一匯出只處理目前使用者正在看的對話。
+ *   - 批次選取只處理使用者在 ChatGPT UI 中直接點選的一般對話，
+ *     或單一專案內直接點選的專案對話；不列舉或掃描帳號其他對話。
+ *   - 批次模式只處理使用者直接選取並確認加入目前 session 的 conversation ID；
+ *     不列舉帳號其他對話，也不在背景定時主動抓取 conversation / textdocs。
+ *   - 一般聊天與專案聊天各自維持獨立 batch session；兩者可同時存在、各自追加與打包。
+ *   - 底層主動資料 request 共用全域 round-robin scheduler，任何時間最多只處理一筆。
+ *   - 同一個批次 session 鎖定 raw 或 handoff 類型，可在既有 queue 執行期間繼續追加。
+ *   - 批次資料只暫存在目前頁面記憶體；按下「打包」後才建立 ZIP STORE
+ *     （compression method 0），不壓縮、不載入第三方 ZIP library。
+ *   - 從出現第一個批次選取起，到所有相關 session 打包完成前，使用 beforeunload 防止誤關閉／重新整理。
+ *   - 「取消批次下載作業」需再次確認；確認後以一次性 bypass 直接重新整理頁面，以清除整個 session。
+ *   - raw 批次沿用單一 raw 匯出語意：封裝 conversation JSON，若有 textdocs 則一併封裝
+ *     正規化 `.textdocs.json`；handoff 批次每筆輸出既有 schema 的 `.handoff.json`。
  *   - 不上傳任何資料到第三方伺服器。
  *   - 不把 token、cookie、header、raw JSON 印到 Console。
  *   - 不把驗證資訊寫死在程式碼。
@@ -60,7 +77,7 @@
    *   - 多次包裝 window.fetch
    *   - 重複的 timer / listener
    */
-  const INSTALL_FLAG = '__chatgptConversationHandoffExporterInstalled_v1120';
+  const INSTALL_FLAG = '__chatgptConversationHandoffExporterInstalled_v120';
   /*
    * 匯出按鈕事件綁定標記。
    *
@@ -68,7 +85,7 @@
    * click listener 是否屬於目前腳本，必要時重建按鈕以避免殘留
    * listener 或 conversation 狀態。
    */
-  const EXPORT_BUTTON_LISTENER_VERSION = '1.1.20';
+  const EXPORT_BUTTON_LISTENER_VERSION = '1.2.0';
   /*
    * 兩個按鈕的 DOM id。
    *
@@ -1534,7 +1551,7 @@
    * 這條通道不使用 window.fetch，可避開只攔截 fetch 的第三方修改器。
    * 但 XHR 本身仍可能被其他頁面程式包裝，因此結果仍必須通過 Resource Timing 驗證。
    */
-  async function requestConversationViaXhr(replayRequest) {
+  async function requestConversationViaXhr(replayRequest, onProgress = null) {
     return new Promise((resolve, reject) => {
       let xhr;
       let probe = null;
@@ -1552,6 +1569,20 @@
         return;
       }
       try {
+        xhr.addEventListener('progress', (event) => {
+          if (typeof onProgress !== 'function') {
+            return;
+          }
+          try {
+            onProgress({
+              loaded: Number.isFinite(event.loaded) ? event.loaded : 0,
+              total: Number.isFinite(event.total) ? event.total : 0,
+              lengthComputable: Boolean(event.lengthComputable)
+            });
+          } catch {
+            // UI 進度 callback 不得影響 authoritative transport。
+          }
+        });
         xhr.addEventListener('load', async () => {
           try {
             const rawText = typeof xhr.responseText === 'string' ? xhr.responseText : '';
@@ -1644,10 +1675,10 @@
       integrity: analyzeConversationIntegrity(conversation, result.rawText)
     };
   }
-  async function tryConversationTransport(transportName, replayRequest, conversationId) {
+  async function tryConversationTransport(transportName, replayRequest, conversationId, onProgress = null) {
     try {
       const rawResult = transportName === 'xhr'
-        ? await requestConversationViaXhr(replayRequest)
+        ? await requestConversationViaXhr(replayRequest, onProgress)
         : await requestConversationViaFetch(replayRequest);
       return {
         candidate: validateConversationTransportResult(rawResult, conversationId),
@@ -1812,13 +1843,13 @@
    * 當成 authoritative source。預設先走 XHR；只有無法直接驗證或發現異常時，
    * 才追加 fetch 第二通道，最後由完整性判定挑選可信 snapshot。
    */
-  async function refetchLatestConversationSnapshot(conversationId) {
+  async function refetchLatestConversationSnapshot(conversationId, { onProgress = null } = {}) {
     const replayRequest = getReplayRequestForConversation(conversationId);
     if (!replayRequest) {
       throw new Error(buildMissingRequestContextMessage('conversation JSON'));
     }
     replayRequestByConversationId.set(conversationId, replayRequest);
-    const xhrAttempt = await tryConversationTransport('xhr', replayRequest, conversationId);
+    const xhrAttempt = await tryConversationTransport('xhr', replayRequest, conversationId, onProgress);
     let fetchAttempt = null;
     if (!xhrAttempt.candidate || xhrAttempt.candidate.timing?.status !== 'match') {
       fetchAttempt = await tryConversationTransport('fetch', replayRequest, conversationId);
@@ -1948,7 +1979,7 @@
    * 和 conversation 一樣，預設先使用不經 window.fetch 的 XHR，
    * 再用 Resource Timing 比對 JavaScript body bytes 與瀏覽器網路層 decodedBodySize。
    */
-  async function requestTextdocsViaXhr(replayRequest) {
+  async function requestTextdocsViaXhr(replayRequest, onProgress = null) {
     return new Promise((resolve, reject) => {
       let xhr;
       let probe = null;
@@ -1966,6 +1997,20 @@
         return;
       }
       try {
+        xhr.addEventListener('progress', (event) => {
+          if (typeof onProgress !== 'function') {
+            return;
+          }
+          try {
+            onProgress({
+              loaded: Number.isFinite(event.loaded) ? event.loaded : 0,
+              total: Number.isFinite(event.total) ? event.total : 0,
+              lengthComputable: Boolean(event.lengthComputable)
+            });
+          } catch {
+            // UI 進度 callback 不得影響 textdocs transport。
+          }
+        });
         xhr.addEventListener('load', async () => {
           try {
             const rawText = typeof xhr.responseText === 'string' ? xhr.responseText : '';
@@ -2086,10 +2131,10 @@
       integrity: analyzeTextdocsIntegrity(textdocs, rawText)
     };
   }
-  async function tryTextdocsTransport(transportName, replayRequest) {
+  async function tryTextdocsTransport(transportName, replayRequest, onProgress = null) {
     try {
       const rawResult = transportName === 'xhr'
-        ? await requestTextdocsViaXhr(replayRequest)
+        ? await requestTextdocsViaXhr(replayRequest, onProgress)
         : await requestTextdocsViaFetch(replayRequest);
       return {
         candidate: validateTextdocsTransportResult(rawResult),
@@ -2251,12 +2296,12 @@
    * 預設 XHR，必要時追加 window.fetch 作第二通道；只有通過完整性判定的
    * candidate 才會進入 .textdocs.json 或 handoff。
    */
-  async function refetchLatestTextdocsSnapshot(conversationId) {
+  async function refetchLatestTextdocsSnapshot(conversationId, { onProgress = null } = {}) {
     const replayRequest = getReplayRequestForTextdocs(conversationId);
     if (!replayRequest) {
       throw new Error(buildMissingRequestContextMessage('textdocs JSON'));
     }
-    const xhrAttempt = await tryTextdocsTransport('xhr', replayRequest);
+    const xhrAttempt = await tryTextdocsTransport('xhr', replayRequest, onProgress);
     let fetchAttempt = null;
     if (!xhrAttempt.candidate || xhrAttempt.candidate.timing?.status !== 'match') {
       fetchAttempt = await tryTextdocsTransport('fetch', replayRequest);
@@ -2362,9 +2407,9 @@
    * 若 endpoint 無法取得、回應格式異常或解析失敗，會回傳空陣列，
    * 讓 raw JSON 與 handoff 主體仍可完成匯出。
    */
-  async function getLatestTextdocs(conversationId) {
+  async function getLatestTextdocs(conversationId, { onProgress = null } = {}) {
     try {
-      const snapshot = await refetchLatestTextdocsSnapshot(conversationId);
+      const snapshot = await refetchLatestTextdocsSnapshot(conversationId, { onProgress });
       return snapshot.textdocs;
     } catch (error) {
       return warnAndReturnEmptyTextdocs(
@@ -2411,6 +2456,406 @@
     return {
       text: JSON.stringify(handoff, null, 4),
       filename: buildHandoffFilename(rawText, conversationId, exportTimestamp)
+    };
+  }
+  /*
+   * 以指定 conversation ID 建立一份已驗證 handoff payload。
+   *
+   * enforceCurrentPage=true 供既有單一對話匯出使用，保留 URL / conversation 安全斷言。
+   * enforceCurrentPage=false 供使用者確認後的受控批次流程使用；批次目標由 immutable snapshot 決定。
+   * 這個 helper 只建立 payload，不下載檔案。
+   */
+  async function createHandoffPayloadForConversationId(
+    conversationId,
+    {
+      enforceCurrentPage = false,
+      onStage = null,
+      onConversationProgress = null,
+      onTextdocsProgress = null
+    } = {}
+  ) {
+    const reportStage = (stage) => {
+      if (typeof onStage !== 'function') {
+        return;
+      }
+      try {
+        onStage(stage);
+      } catch {
+        // UI callback 不得影響 handoff 建置。
+      }
+    };
+    const exportTimestamp = getTimestampString();
+    reportStage('conversation-start');
+    const snapshot = enforceCurrentPage
+      ? await getLatestConversationSnapshot(conversationId)
+      : await refetchLatestConversationSnapshot(conversationId, {
+        onProgress: onConversationProgress
+      });
+    assertSnapshotConversationMatches(snapshot, conversationId, '產出交接 JSON 前');
+    reportStage('conversation-ready');
+    if (enforceCurrentPage) {
+      assertConversationStillCurrent(conversationId, '擷取 textdocs 前');
+    }
+    reportStage('textdocs-start');
+    const textdocs = await getLatestTextdocs(conversationId, {
+      onProgress: onTextdocsProgress
+    });
+    if (enforceCurrentPage) {
+      assertConversationStillCurrent(conversationId, '擷取 textdocs 後');
+    }
+    reportStage('textdocs-ready');
+    reportStage('handoff-build');
+    const handoffPayload = buildHandoffDownloadPayload(
+      snapshot,
+      textdocs,
+      conversationId,
+      exportTimestamp
+    );
+    reportStage('handoff-ready');
+    if (enforceCurrentPage) {
+      assertConversationStillCurrent(conversationId, '下載交接 JSON 前');
+    }
+    return {
+      handoffPayload,
+      textdocCount: Array.isArray(textdocs) ? textdocs.length : 0,
+      conversationIntegrity: snapshot.integrity || null,
+      transport: snapshot.transport || null
+    };
+  }
+
+  /*
+   * 建立已驗證 raw conversation 的文字 payload。
+   *
+   * 與既有單一 raw 下載相同，輸出 4 空白縮排的 conversation JSON。
+   */
+  function buildRawDownloadPayload({ rawText, conversation }, conversationId, exportTimestamp) {
+    return {
+      text: JSON.stringify(conversation, null, 4),
+      filename: buildRawFilename(rawText, conversationId, exportTimestamp)
+    };
+  }
+  /*
+   * 建立正規化 textdocs 的文字 payload。
+   *
+   * 沒有 textdocs 時回傳 null；raw 批次會因此只封裝 conversation JSON。
+   */
+  function buildTextdocsDownloadPayload(textdocs, rawText, conversationId, exportTimestamp) {
+    if (!Array.isArray(textdocs) || textdocs.length === 0) {
+      return null;
+    }
+    return {
+      text: JSON.stringify(textdocs, null, 4),
+      filename: buildTextdocsFilename(rawText, conversationId, exportTimestamp)
+    };
+  }
+  /*
+   * 以指定 conversation ID 建立 raw 批次需要的 payload。
+   *
+   * conversation 仍必須通過 authoritative transport / Resource Timing；
+   * textdocs 採既有容錯，無法取得時以空陣列繼續。
+   */
+  async function createRawPayloadForConversationId(
+    conversationId,
+    {
+      onStage = null,
+      onConversationProgress = null,
+      onTextdocsProgress = null
+    } = {}
+  ) {
+    const reportStage = (stage) => {
+      if (typeof onStage !== 'function') {
+        return;
+      }
+      try {
+        onStage(stage);
+      } catch {
+        // UI callback 不得影響正式資料取得。
+      }
+    };
+    const exportTimestamp = getTimestampString();
+    reportStage('conversation-start');
+    const snapshot = await refetchLatestConversationSnapshot(conversationId, {
+      onProgress: onConversationProgress
+    });
+    assertSnapshotConversationMatches(snapshot, conversationId, '產出批次原始 JSON 前');
+    reportStage('conversation-ready');
+    reportStage('textdocs-start');
+    const textdocs = await getLatestTextdocs(conversationId, {
+      onProgress: onTextdocsProgress
+    });
+    reportStage('textdocs-ready');
+    reportStage('raw-build');
+    const rawPayload = buildRawDownloadPayload(snapshot, conversationId, exportTimestamp);
+    const textdocsPayload = buildTextdocsDownloadPayload(
+      textdocs,
+      snapshot.rawText,
+      conversationId,
+      exportTimestamp
+    );
+    reportStage('raw-ready');
+    return {
+      rawPayload,
+      textdocsPayload,
+      textdocCount: Array.isArray(textdocs) ? textdocs.length : 0,
+      conversationIntegrity: snapshot.integrity || null,
+      transport: snapshot.transport || null
+    };
+  }
+  /*
+   * 下載 Blob 檔案。
+   */
+  function downloadBlobFile(blob, filename) {
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    window.setTimeout(() => {
+      URL.revokeObjectURL(url);
+    }, 1000);
+  }
+  /*
+   * ZIP32 / STORE 純封裝 writer。
+   *
+   * - compression method 固定為 0（STORE），不壓縮。
+   * - UTF-8 filename flag 固定開啟。
+   * - 不載入 CDN / 第三方套件，也不上傳資料。
+   * - 以 Blob parts 累積 local file records，避免建立一個同等大小的連續 ArrayBuffer。
+   * - 使用標準 ZIP32；單檔、offset、central directory 或整體結構超過 4 GiB 時停止，
+   *   不偷偷改用未實作的 ZIP64。
+   */
+  let storedZipCrc32Table = null;
+  function getStoredZipCrc32Table() {
+    if (storedZipCrc32Table) {
+      return storedZipCrc32Table;
+    }
+    const table = new Uint32Array(256);
+    for (let index = 0; index < 256; index += 1) {
+      let value = index;
+      for (let bit = 0; bit < 8; bit += 1) {
+        value = (value & 1)
+          ? (0xedb88320 ^ (value >>> 1))
+          : (value >>> 1);
+      }
+      table[index] = value >>> 0;
+    }
+    storedZipCrc32Table = table;
+    return table;
+  }
+  function calculateStoredZipCrc32(bytes) {
+    const table = getStoredZipCrc32Table();
+    let crc = 0xffffffff;
+    for (let index = 0; index < bytes.length; index += 1) {
+      crc = table[(crc ^ bytes[index]) & 0xff] ^ (crc >>> 8);
+    }
+    return (crc ^ 0xffffffff) >>> 0;
+  }
+  function writeZipUint16(view, offset, value) {
+    view.setUint16(offset, value & 0xffff, true);
+  }
+  function writeZipUint32(view, offset, value) {
+    view.setUint32(offset, value >>> 0, true);
+  }
+  function getStoredZipDosDateTime(date = new Date()) {
+    const year = Math.min(2107, Math.max(1980, date.getFullYear()));
+    const dosTime =
+      ((date.getHours() & 0x1f) << 11) |
+      ((date.getMinutes() & 0x3f) << 5) |
+      ((Math.floor(date.getSeconds() / 2)) & 0x1f);
+    const dosDate =
+      (((year - 1980) & 0x7f) << 9) |
+      (((date.getMonth() + 1) & 0x0f) << 5) |
+      (date.getDate() & 0x1f);
+    return {
+      time: dosTime,
+      date: dosDate
+    };
+  }
+  function splitZipFilenameForSuffix(filename) {
+    for (const suffix of ['.handoff.json', '.textdocs.json', '.json']) {
+      if (filename.toLowerCase().endsWith(suffix)) {
+        return {
+          base: filename.slice(0, -suffix.length),
+          extension: filename.slice(-suffix.length)
+        };
+      }
+    }
+    const dotIndex = filename.lastIndexOf('.');
+    if (dotIndex > 0) {
+      return {
+        base: filename.slice(0, dotIndex),
+        extension: filename.slice(dotIndex)
+      };
+    }
+    return {
+      base: filename,
+      extension: ''
+    };
+  }
+  function createUniqueStoredZipFilename(filename, usedNames) {
+    let candidate = String(filename || 'file');
+    if (!usedNames.has(candidate)) {
+      usedNames.add(candidate);
+      return candidate;
+    }
+    const { base, extension } = splitZipFilenameForSuffix(candidate);
+    let suffixIndex = 2;
+    while (usedNames.has(`${base} (${suffixIndex})${extension}`)) {
+      suffixIndex += 1;
+    }
+    candidate = `${base} (${suffixIndex})${extension}`;
+    usedNames.add(candidate);
+    return candidate;
+  }
+  function createStoredZipBuilder() {
+    const encoder = new TextEncoder();
+    const parts = [];
+    const centralEntries = [];
+    const usedNames = new Set();
+    let offset = 0;
+    let fileCount = 0;
+    const ZIP32_MAX = 0xffffffff;
+    const ZIP32_MAX_FILES = 0xffff;
+    const ensureZip32 = (value, label) => {
+      if (!Number.isSafeInteger(value) || value < 0 || value > ZIP32_MAX) {
+        throw new Error(`ZIP32 限制：${label} 超過 4 GiB 可表示範圍。`);
+      }
+    };
+    const addTextFile = (requestedFilename, text, date = new Date()) => {
+      if (fileCount >= ZIP32_MAX_FILES) {
+        throw new Error('ZIP32 限制：檔案數量超過 65535。');
+      }
+      const safeRequestedFilename = String(requestedFilename || 'file')
+        .replace(/[\u0000-\u001f\u007f]/g, '')
+        .replace(/[\\/]/g, '_')
+        .replace(/[. ]+$/g, '')
+        .trim()
+        .slice(0, 240) || 'file';
+      const filename = createUniqueStoredZipFilename(
+        safeRequestedFilename,
+        usedNames
+      );
+      const filenameBytes = encoder.encode(filename);
+      if (filenameBytes.length > 0xffff) {
+        throw new Error('ZIP32 限制：ZIP 內檔名過長。');
+      }
+      const dataBytes = encoder.encode(String(text));
+      const dataSize = dataBytes.byteLength;
+      ensureZip32(dataSize, `檔案 ${filename}`);
+      const crc32 = calculateStoredZipCrc32(dataBytes);
+      const { time, date: dosDate } = getStoredZipDosDateTime(date);
+      const flags = 0x0800; // UTF-8 filenames
+      const method = 0; // STORE
+      const localHeader = new ArrayBuffer(30 + filenameBytes.length);
+      const localView = new DataView(localHeader);
+      writeZipUint32(localView, 0, 0x04034b50);
+      writeZipUint16(localView, 4, 20);
+      writeZipUint16(localView, 6, flags);
+      writeZipUint16(localView, 8, method);
+      writeZipUint16(localView, 10, time);
+      writeZipUint16(localView, 12, dosDate);
+      writeZipUint32(localView, 14, crc32);
+      writeZipUint32(localView, 18, dataSize);
+      writeZipUint32(localView, 22, dataSize);
+      writeZipUint16(localView, 26, filenameBytes.length);
+      writeZipUint16(localView, 28, 0);
+      new Uint8Array(localHeader, 30).set(filenameBytes);
+      const localRecordSize = localHeader.byteLength + dataSize;
+      ensureZip32(offset, 'local header offset');
+      ensureZip32(offset + localRecordSize, 'archive data');
+      parts.push(localHeader, dataBytes);
+      centralEntries.push({
+        filenameBytes,
+        crc32,
+        dataSize,
+        time,
+        dosDate,
+        flags,
+        method,
+        localHeaderOffset: offset
+      });
+      offset += localRecordSize;
+      fileCount += 1;
+      return {
+        filename,
+        bytes: dataSize,
+        crc32
+      };
+    };
+    const finalize = () => {
+      const centralOffset = offset;
+      const centralParts = [];
+      let centralSize = 0;
+      for (const entry of centralEntries) {
+        const header = new ArrayBuffer(46 + entry.filenameBytes.length);
+        const view = new DataView(header);
+        writeZipUint32(view, 0, 0x02014b50);
+        writeZipUint16(view, 4, 20);
+        writeZipUint16(view, 6, 20);
+        writeZipUint16(view, 8, entry.flags);
+        writeZipUint16(view, 10, entry.method);
+        writeZipUint16(view, 12, entry.time);
+        writeZipUint16(view, 14, entry.dosDate);
+        writeZipUint32(view, 16, entry.crc32);
+        writeZipUint32(view, 20, entry.dataSize);
+        writeZipUint32(view, 24, entry.dataSize);
+        writeZipUint16(view, 28, entry.filenameBytes.length);
+        writeZipUint16(view, 30, 0);
+        writeZipUint16(view, 32, 0);
+        writeZipUint16(view, 34, 0);
+        writeZipUint16(view, 36, 0);
+        writeZipUint32(view, 38, 0);
+        writeZipUint32(view, 42, entry.localHeaderOffset);
+        new Uint8Array(header, 46).set(entry.filenameBytes);
+        centralParts.push(header);
+        centralSize += header.byteLength;
+      }
+      ensureZip32(centralOffset, 'central directory offset');
+      ensureZip32(centralSize, 'central directory size');
+      ensureZip32(centralOffset + centralSize + 22, 'archive size');
+      const endRecord = new ArrayBuffer(22);
+      const endView = new DataView(endRecord);
+      writeZipUint32(endView, 0, 0x06054b50);
+      writeZipUint16(endView, 4, 0);
+      writeZipUint16(endView, 6, 0);
+      writeZipUint16(endView, 8, fileCount);
+      writeZipUint16(endView, 10, fileCount);
+      writeZipUint32(endView, 12, centralSize);
+      writeZipUint32(endView, 16, centralOffset);
+      writeZipUint16(endView, 20, 0);
+      return new Blob(
+        [...parts, ...centralParts, endRecord],
+        { type: 'application/zip' }
+      );
+    };
+    const createCheckpoint = () => ({
+      partsLength: parts.length,
+      centralEntriesLength: centralEntries.length,
+      offset,
+      fileCount,
+      usedNames: new Set(usedNames)
+    });
+    const rollback = (checkpoint) => {
+      if (!checkpoint) {
+        return;
+      }
+      parts.length = checkpoint.partsLength;
+      centralEntries.length = checkpoint.centralEntriesLength;
+      offset = checkpoint.offset;
+      fileCount = checkpoint.fileCount;
+      usedNames.clear();
+      for (const name of checkpoint.usedNames) {
+        usedNames.add(name);
+      }
+    };
+    return {
+      addTextFile,
+      createCheckpoint,
+      rollback,
+      finalize,
+      getFileCount: () => fileCount
     };
   }
   /*
@@ -3502,19 +3947,21 @@
    * textdocs 若不可取得會被視為空陣列，讓主要對話脈絡仍可交接。
    */
   async function exportHandoffFile(conversationId, updateProgress) {
-    const exportTimestamp = getTimestampString();
-    updateProgress('正在擷取原始 JSON…');
-    const snapshot = await getLatestConversationSnapshot(conversationId);
-    assertSnapshotConversationMatches(snapshot, conversationId, '產出交接 JSON 前');
-    assertConversationStillCurrent(conversationId, '擷取 textdocs 前');
-    updateProgress('正在擷取 textdocs…');
-    const textdocs = await getLatestTextdocs(conversationId);
-    assertConversationStillCurrent(conversationId, '擷取 textdocs 後');
-    updateProgress('正在產出交接 JSON…');
-    const handoffPayload = buildHandoffDownloadPayload(snapshot, textdocs, conversationId, exportTimestamp);
-    assertConversationStillCurrent(conversationId, '下載交接 JSON 前');
-    updateProgress('正在下載交接 JSON…');
-    downloadHandoffPayload(handoffPayload);
+    const result = await createHandoffPayloadForConversationId(conversationId, {
+      enforceCurrentPage: true,
+      onStage(stage) {
+        if (stage === 'conversation-start') {
+          updateProgress('正在擷取原始 JSON…');
+        } else if (stage === 'textdocs-start') {
+          updateProgress('正在擷取 textdocs…');
+        } else if (stage === 'handoff-build') {
+          updateProgress('正在產出交接 JSON…');
+        } else if (stage === 'handoff-ready') {
+          updateProgress('正在下載交接 JSON…');
+        }
+      }
+    });
+    downloadHandoffPayload(result.handoffPayload);
   }
   /*
    * 點擊「下載原始 JSON」。
@@ -4244,6 +4691,3767 @@
       insertButtonsOnce();
     }, 300);
   }
+
+  // ============================================================
+  // 六-A、批次匯出 UI、可追加佇列與延後打包
+  // ============================================================
+  /*
+   * selectedConversations 是尚未加入 session 的 draft selection。
+   * sessionTargets / pendingQueue / completedPayloads 則是已由使用者明確確認加入的項目。
+   * 同一個 session 鎖定 raw 或 handoff，concurrency 固定為 1。
+   * 已完成 payload 只暫存在目前頁面記憶體；使用者按「打包」才建立 STORE ZIP。
+   */
+  const BATCH_SCOPE_GENERAL = 'general';
+  const BATCH_SCOPE_PROJECT = 'project';
+  const BATCH_EXPORT_RAW = 'raw';
+  const BATCH_EXPORT_HANDOFF = 'handoff';
+
+  const BATCH_PHASE_IDLE = 'idle';
+  const BATCH_PHASE_SELECTING = 'selecting';
+  const BATCH_PHASE_CONFIRMING = 'confirming';
+  const BATCH_PHASE_SESSION = 'session';
+  const BATCH_PHASE_PACKAGING = 'packaging';
+
+  const BATCH_ITEM_PENDING = 'pending';
+  const BATCH_ITEM_EXPORTING = 'exporting';
+  const BATCH_ITEM_SUCCESS = 'success';
+  const BATCH_ITEM_FAILED = 'failed';
+  const BATCH_ITEM_SKIPPED = 'skipped';
+
+  const BATCH_STYLE_ID = 'cgpt-batch-export-selection-style';
+  const BATCH_GENERAL_CONTROLS_ID = 'cgpt-batch-export-general-controls';
+  const BATCH_PROJECT_CONTROLS_ID = 'cgpt-batch-export-project-controls';
+  const BATCH_DIALOG_ID = 'cgpt-batch-export-confirmation-dialog';
+  const BATCH_CANCEL_JOB_DIALOG_ID = 'cgpt-batch-cancel-job-confirmation-dialog';
+
+  const BATCH_SELECTED_COLOR = 'rgba(96, 165, 250, 0.24)';
+  const BATCH_SELECTED_HOVER_COLOR = 'rgba(96, 165, 250, 0.32)';
+  const BATCH_PROGRESS_FILL_COLOR = 'rgba(59, 130, 246, 0.42)';
+  const BATCH_SUCCESS_COLOR = 'rgba(34, 197, 94, 0.28)';
+  const BATCH_FAILED_COLOR = 'rgba(127, 29, 29, 0.76)';
+  const BATCH_SKIPPED_COLOR = 'rgba(107, 114, 128, 0.28)';
+
+  const BATCH_ROW_COLOR_TRANSITION_MS = 180;
+  const BATCH_MOTION_TRANSITION_MS = 160;
+  const BATCH_PROGRESS_CONVERSATION_START = 0.03;
+  const BATCH_PROGRESS_CONVERSATION_END = 0.76;
+  const BATCH_PROGRESS_TEXTDOCS_START = 0.82;
+  const BATCH_PROGRESS_TEXTDOCS_END = 0.93;
+  const BATCH_PROGRESS_HANDOFF_BUILD = 0.96;
+  const BATCH_PROGRESS_HANDOFF_READY = 0.99;
+
+  function createBatchSelectionState(scope) {
+    return {
+      scope,
+      phase: BATCH_PHASE_IDLE,
+
+      selectedConversations: new Map(),
+      manuallyExcludedIds: new Set(),
+      selectAllMode: false,
+      rangeAnchorConversationId: null,
+      selectionOrder: 0,
+      routePathname: null,
+
+      exportKind: null,
+      sessionStartedAt: null,
+      sessionUpdatedAt: null,
+      sessionBlockedReason: '',
+      sessionTargets: [],
+      sessionConversationIds: new Set(),
+      pendingQueue: [],
+      workerRunning: false,
+      currentConversationId: null,
+      removedWhileProcessingIds: new Set(),
+      itemRuntime: new Map(),
+      completedPayloads: new Map(),
+      sessionResults: new Map(),
+      zipFilename: null,
+      lastBatchResults: null,
+
+      listRoot: null,
+      listObserver: null,
+      listClickHandler: null,
+      listDblclickHandler: null,
+      listKeydownHandler: null,
+      listDragstartHandler: null,
+      originalDraggableByLink: new Map(),
+      closingMode: false
+    };
+  }
+
+  const batchSelectionStates = new Map([
+    [BATCH_SCOPE_GENERAL, createBatchSelectionState(BATCH_SCOPE_GENERAL)],
+    [BATCH_SCOPE_PROJECT, createBatchSelectionState(BATCH_SCOPE_PROJECT)]
+  ]);
+
+  function getBatchSelectionState(scope) {
+    return batchSelectionStates.get(scope) || null;
+  }
+
+  const batchRowDecorationCleanupTimers = new Map();
+  let batchRequestSchedulerRunning = false;
+  let batchRequestSchedulerLastScope = null;
+  const batchMotionLifecycles = new WeakMap();
+  let batchBeforeUnloadGuardAttached = false;
+  let allowBatchUnloadOnce = false;
+  let batchProjectTabObserver = null;
+  let batchProjectObservedTablist = null;
+
+  const BATCH_ENTRY_ICON_SVG = `
+        <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 20 20" data-icon-shape="non-circular" focusable="false" aria-hidden="true" class="icon-sm" fill="none">
+          <rect x="3.25" y="3.25" width="13.5" height="13.5" rx="2.25" stroke="currentColor" stroke-width="1.5"/>
+          <path d="M6.5 7.25h4.25M6.5 10h7M6.5 12.75h5.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+          <path d="M13.5 6.25l1 1 1.75-2" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+  `;
+  const BATCH_CANCEL_ICON_SVG = `
+        <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 20 20" data-icon-shape="non-circular" focusable="false" aria-hidden="true" class="icon-sm" fill="none">
+          <path d="M5.25 5.25l9.5 9.5M14.75 5.25l-9.5 9.5" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/>
+        </svg>
+  `;
+  const BATCH_EXPORT_ICON_SVG = `
+        <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 20 20" data-icon-shape="non-circular" focusable="false" aria-hidden="true" class="icon-sm" fill="none">
+          <path d="M10 3.25v8.5M6.75 8.75L10 12l3.25-3.25" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+          <path d="M4 13.25v1.5A1.25 1.25 0 0 0 5.25 16h9.5A1.25 1.25 0 0 0 16 14.75v-1.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
+        </svg>
+  `;
+  const BATCH_SELECT_ALL_ICON_SVG = `
+        <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 20 20" data-icon-shape="non-circular" focusable="false" aria-hidden="true" class="icon-sm" fill="none">
+          <rect x="5.25" y="5.25" width="10.5" height="10.5" rx="2" stroke="currentColor" stroke-width="1.5"/>
+          <path d="M7.75 10.25l1.6 1.6 3.15-3.35" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+          <path d="M3.25 12V5A1.75 1.75 0 0 1 5 3.25h7" stroke="currentColor" stroke-width="1.35" stroke-linecap="round"/>
+        </svg>
+  `;
+  const BATCH_PACKAGE_ICON_SVG = `
+        <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 20 20" data-icon-shape="non-circular" focusable="false" aria-hidden="true" class="icon-sm" fill="none">
+          <path d="M4 6.25 10 3l6 3.25v7.5L10 17l-6-3.25z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/>
+          <path d="m4.35 6.45 5.65 3.1 5.65-3.1M10 9.55V17" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/>
+        </svg>
+  `;
+  const BATCH_STOP_ICON_SVG = `
+        <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 20 20" data-icon-shape="non-circular" focusable="false" aria-hidden="true" class="icon-sm" fill="none">
+          <circle cx="10" cy="10" r="7" stroke="currentColor" stroke-width="1.5"/>
+          <path d="M7.4 7.4l5.2 5.2M12.6 7.4l-5.2 5.2" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
+        </svg>
+  `;
+
+  function hasActiveBatchSession(state) {
+    return Boolean(state && state.exportKind && state.sessionStartedAt);
+  }
+
+  /*
+   * 只要一般聊天或專案聊天任一 scope 還有尚未安全結束的批次狀態，
+   * 就視為離頁可能造成資料遺失：
+   *   - 尚未加入 queue 的目前選取；
+   *   - 已建立且尚未打包完成的 batch session；
+   *   - 正在 packaging 的 session。
+   *
+   * 單純開啟批次面板但尚未選任何 conversation，不需要攔截離頁。
+   */
+  function hasUnsafeBatchUnloadState() {
+    return [
+      BATCH_SCOPE_GENERAL,
+      BATCH_SCOPE_PROJECT
+    ].some((scope) => {
+      const state = getBatchSelectionState(scope);
+      if (!state) {
+        return false;
+      }
+      return (
+        state.selectedConversations.size > 0 ||
+        hasActiveBatchSession(state) ||
+        state.phase === BATCH_PHASE_PACKAGING
+      );
+    });
+  }
+
+  function handleBatchBeforeUnload(event) {
+    if (
+      allowBatchUnloadOnce ||
+      !hasUnsafeBatchUnloadState()
+    ) {
+      return;
+    }
+
+    /*
+     * Chromium 目前只允許顯示瀏覽器提供的通用離頁警告文案；
+     * event.returnValue 的具體文字不會呈現在 UI 中。
+     */
+    event.preventDefault();
+    event.returnValue = '';
+    return '';
+  }
+
+  function syncBatchBeforeUnloadGuard() {
+    const shouldAttach = hasUnsafeBatchUnloadState();
+
+    if (shouldAttach && !batchBeforeUnloadGuardAttached) {
+      window.addEventListener(
+        'beforeunload',
+        handleBatchBeforeUnload
+      );
+      batchBeforeUnloadGuardAttached = true;
+      return;
+    }
+
+    if (!shouldAttach && batchBeforeUnloadGuardAttached) {
+      window.removeEventListener(
+        'beforeunload',
+        handleBatchBeforeUnload
+      );
+      batchBeforeUnloadGuardAttached = false;
+      allowBatchUnloadOnce = false;
+    }
+  }
+
+  function isBatchListLockedPhase(phase) {
+    return [
+      BATCH_PHASE_SELECTING,
+      BATCH_PHASE_CONFIRMING,
+      BATCH_PHASE_SESSION,
+      BATCH_PHASE_PACKAGING
+    ].includes(phase);
+  }
+
+  function isBatchSelectionEditableState(state) {
+    if (
+      !state ||
+      state.closingMode ||
+      state.phase === BATCH_PHASE_CONFIRMING ||
+      state.phase === BATCH_PHASE_PACKAGING
+    ) {
+      return false;
+    }
+    if (state.phase === BATCH_PHASE_SELECTING) {
+      return true;
+    }
+    return state.phase === BATCH_PHASE_SESSION && !state.sessionBlockedReason;
+  }
+
+  function getBatchExportKindLabel(exportKind) {
+    return exportKind === BATCH_EXPORT_RAW ? '原始 JSON' : '交接 JSON';
+  }
+
+  function countBatchStatus(state, status) {
+    let count = 0;
+    for (const runtime of state?.itemRuntime.values() || []) {
+      if (runtime.status === status) {
+        count += 1;
+      }
+    }
+    return count;
+  }
+
+  function getBatchSessionResultArray(state) {
+    return state.sessionTargets
+      .map((target) => state.sessionResults.get(target.conversationId))
+      .filter(Boolean);
+  }
+
+  function canPackageBatchSession(state) {
+    return Boolean(
+      hasActiveBatchSession(state) &&
+      state.phase === BATCH_PHASE_SESSION &&
+      !state.workerRunning &&
+      state.pendingQueue.length === 0 &&
+      state.selectedConversations.size === 0 &&
+      state.sessionTargets.length > 0
+    );
+  }
+
+  function ensureBatchSelectionStyles() {
+    if (document.getElementById(BATCH_STYLE_ID)) {
+      return;
+    }
+    const style = document.createElement('style');
+    style.id = BATCH_STYLE_ID;
+    style.textContent = `
+      @property --cgpt-batch-progress {
+        syntax: '<percentage>';
+        inherits: false;
+        initial-value: 0%;
+      }
+      [data-cgpt-batch-selection-row="true"][data-cgpt-batch-row-state="selected"] {
+        background-color: ${BATCH_SELECTED_COLOR} !important;
+      }
+      [data-cgpt-batch-selection-row="true"][data-cgpt-batch-row-state="selected"]:hover {
+        background-color: ${BATCH_SELECTED_HOVER_COLOR} !important;
+      }
+      [data-cgpt-batch-selection-row="true"][data-cgpt-batch-row-state="queued"] {
+        position: relative !important;
+        background-color: ${BATCH_SELECTED_COLOR} !important;
+        background-image:
+          repeating-linear-gradient(
+            135deg,
+            rgba(255,255,255,0.14) 0 8px,
+            rgba(255,255,255,0.035) 8px 16px
+          ),
+          linear-gradient(
+            to right,
+            transparent 0 100%
+          ) !important;
+        background-size: 28px 28px, 100% 100% !important;
+        background-repeat: repeat, no-repeat !important;
+      }
+      [data-cgpt-batch-selection-row="true"][data-cgpt-batch-row-state="exporting"] {
+        position: relative !important;
+        --cgpt-batch-progress: 0%;
+        background-color: ${BATCH_SELECTED_COLOR} !important;
+        background-image:
+          repeating-linear-gradient(135deg, rgba(255,255,255,0.14) 0 8px, rgba(255,255,255,0.035) 8px 16px),
+          linear-gradient(to right, ${BATCH_PROGRESS_FILL_COLOR} 0 var(--cgpt-batch-progress), transparent var(--cgpt-batch-progress) 100%) !important;
+        background-size: 28px 28px, 100% 100% !important;
+        background-repeat: repeat, no-repeat !important;
+      }
+      [data-cgpt-batch-selection-row="true"][data-cgpt-batch-row-state="success"] {
+        background-color: ${BATCH_SUCCESS_COLOR} !important;
+        background-image: none !important;
+      }
+      [data-cgpt-batch-selection-row="true"][data-cgpt-batch-row-state="failed"] {
+        background-color: ${BATCH_FAILED_COLOR} !important;
+        background-image: none !important;
+      }
+      [data-cgpt-batch-selection-row="true"][data-cgpt-batch-row-state="skipped"] {
+        background-color: ${BATCH_SKIPPED_COLOR} !important;
+        background-image: none !important;
+      }
+      [data-cgpt-batch-row-spinner] {
+        position: absolute;
+        inset-inline-end: 0.65rem;
+        top: 50%;
+        z-index: 3;
+        width: 0.9rem;
+        height: 0.9rem;
+        margin-top: -0.45rem;
+        border: 2px solid rgba(255,255,255,0.34);
+        border-top-color: currentColor;
+        border-radius: 9999px;
+        pointer-events: none;
+      }
+      [data-cgpt-batch-selection-header="true"] [data-trailing-button] {
+        opacity: 1 !important;
+      }
+      [data-cgpt-batch-selection-header="true"] [data-trailing-button]:not([data-cgpt-batch-action]) {
+        transition-property: none !important;
+        transition-duration: 0ms !important;
+      }
+      [data-cgpt-batch-selection-list="true"][data-cgpt-batch-selection-scope="general"]
+        a[data-sidebar-item="true"][href^="/c/"] > .trailing {
+        display: none !important;
+      }
+      [data-cgpt-batch-selection-list="true"][data-cgpt-batch-selection-scope="project"]
+        [data-testid="project-conversation-overflow-menu"] {
+        display: none !important;
+      }
+      [data-cgpt-batch-selection-list="true"][data-cgpt-batch-selection-scope="project"]
+        [data-testid="project-conversation-overflow-date"] {
+        opacity: 1 !important;
+      }
+
+      [data-cgpt-batch-controls="general"][data-cgpt-batch-general-mode="panel"] {
+        max-height: 24rem;
+        margin: 0.35rem 0.5rem 0.55rem;
+        padding: 0.4rem;
+        border: 1px solid color-mix(in srgb, currentColor 20%, transparent);
+        border-radius: var(--custom-large-radius, 12px);
+        background: color-mix(in srgb, currentColor 4%, transparent);
+        opacity: 1;
+        transform: translateY(0);
+        overflow: hidden;
+        transition:
+          max-height ${BATCH_MOTION_TRANSITION_MS}ms cubic-bezier(0.2,0,0,1),
+          margin-block ${BATCH_MOTION_TRANSITION_MS}ms cubic-bezier(0.2,0,0,1),
+          padding-block ${BATCH_MOTION_TRANSITION_MS}ms cubic-bezier(0.2,0,0,1),
+          opacity ${BATCH_MOTION_TRANSITION_MS}ms ease,
+          transform ${BATCH_MOTION_TRANSITION_MS}ms cubic-bezier(0.2,0,0,1),
+          border-color ${BATCH_MOTION_TRANSITION_MS}ms ease,
+          background-color ${BATCH_MOTION_TRANSITION_MS}ms ease;
+      }
+      [data-cgpt-batch-controls="general"][data-cgpt-batch-general-mode="panel"][data-cgpt-motion-state="open"] {
+        animation:
+          cgpt-batch-general-panel-enter
+          ${BATCH_MOTION_TRANSITION_MS}ms
+          cubic-bezier(0.2,0,0,1);
+      }
+      [data-cgpt-batch-controls="general"][data-cgpt-batch-general-mode="panel"][data-cgpt-motion-state="closed"] {
+        max-height: 0;
+        margin-block: 0;
+        padding-block: 0;
+        border-color: transparent;
+        background-color: transparent;
+        opacity: 0;
+        transform: translateY(-4px);
+        pointer-events: none;
+      }
+      [data-cgpt-batch-general-panel-header] {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 0.5rem;
+        min-width: 0;
+        padding: 0.35rem 0.45rem 0.45rem 0.6rem;
+      }
+      [data-cgpt-batch-general-panel-title] {
+        min-width: 0;
+        font-size: 1rem;
+        line-height: 1.35;
+        font-weight: 600;
+        color: var(--text-primary);
+      }
+      [data-cgpt-batch-general-panel-status-list] {
+        margin-top: 0.28rem;
+        padding-inline-start: 1.1rem;
+        list-style: disc;
+        font-size: 0.75rem;
+        line-height: 1.45;
+        font-weight: 400;
+        color: var(--text-tertiary);
+      }
+      [data-cgpt-batch-general-panel-status-list] > li {
+        padding-block: 0.03rem;
+      }
+      [data-cgpt-batch-general-panel-actions] {
+        display: flex;
+        flex-direction: column;
+        gap: 0;
+      }
+      [data-cgpt-batch-action-slot] {
+        min-width: 0;
+      }
+      [data-cgpt-batch-action-slot][data-cgpt-batch-action-placement="general-panel"] {
+        overflow: hidden;
+        max-height: 3rem;
+        margin-top: 0.15rem;
+        opacity: 1;
+        transform: translateY(0);
+        transition:
+          max-height ${BATCH_MOTION_TRANSITION_MS}ms cubic-bezier(0.2,0,0,1),
+          margin-top ${BATCH_MOTION_TRANSITION_MS}ms cubic-bezier(0.2,0,0,1),
+          opacity ${BATCH_MOTION_TRANSITION_MS}ms ease,
+          transform ${BATCH_MOTION_TRANSITION_MS}ms cubic-bezier(0.2,0,0,1);
+      }
+      [data-cgpt-batch-action-slot][data-cgpt-batch-action-placement="general-panel"][data-cgpt-motion-state="closed"] {
+        max-height: 0;
+        margin-top: 0;
+        opacity: 0;
+        transform: translateY(-3px);
+        pointer-events: none;
+      }
+      [data-cgpt-batch-general-action] {
+        display: flex;
+        width: 100%;
+        min-height: 2.3rem;
+        align-items: center;
+        gap: 0.7rem;
+        padding: 0.42rem 0.65rem;
+        border-radius: var(--custom-large-radius, 12px);
+        color: var(--text-primary);
+        font-size: 0.8125rem;
+        line-height: 1.3;
+        text-align: start;
+        transition: background-color 120ms ease, opacity 120ms ease;
+      }
+      [data-cgpt-batch-general-action]:not(:disabled):hover {
+        background: color-mix(in srgb, currentColor 9%, transparent);
+      }
+      [data-cgpt-batch-general-action] svg {
+        flex: 0 0 auto;
+      }
+      [data-cgpt-batch-general-action-label] {
+        min-width: 0;
+        flex: 1 1 auto;
+      }
+      [data-cgpt-batch-action="cancel-job"]:not(:disabled) {
+        color: rgb(239 68 68);
+      }
+      [data-cgpt-batch-general-panel-close] {
+        display: inline-flex;
+        width: 2rem;
+        height: 2rem;
+        align-items: center;
+        justify-content: center;
+        border-radius: 0.5rem;
+        color: var(--text-secondary);
+        opacity: 1;
+        scale: 1;
+        transition:
+          opacity ${BATCH_MOTION_TRANSITION_MS}ms ease,
+          scale ${BATCH_MOTION_TRANSITION_MS}ms cubic-bezier(0.2,0,0,1);
+      }
+      [data-cgpt-batch-general-panel-close][data-cgpt-motion-state="closed"] {
+        opacity: 0;
+        scale: 0.92;
+        pointer-events: none;
+      }
+      [data-cgpt-batch-general-panel-close]:hover {
+        background: color-mix(in srgb, currentColor 9%, transparent);
+        color: var(--text-primary);
+      }
+
+      [data-cgpt-batch-controls="project"] {
+        display: flex;
+        flex: 0 1 auto;
+        min-width: 0;
+        max-width: 52rem;
+        align-items: center;
+        gap: 0;
+        margin-inline: 0.125rem;
+        overflow: hidden;
+        opacity: 1;
+        transform: translateX(0);
+        white-space: nowrap;
+        transition:
+          max-width ${BATCH_MOTION_TRANSITION_MS}ms cubic-bezier(0.2,0,0,1),
+          margin-inline ${BATCH_MOTION_TRANSITION_MS}ms cubic-bezier(0.2,0,0,1),
+          opacity ${BATCH_MOTION_TRANSITION_MS}ms ease,
+          transform ${BATCH_MOTION_TRANSITION_MS}ms cubic-bezier(0.2,0,0,1);
+      }
+      [data-cgpt-batch-controls="project"][data-cgpt-motion-state="closed"] {
+        max-width: 0;
+        margin-inline: 0;
+        opacity: 0;
+        transform: translateX(-4px);
+        pointer-events: none;
+      }
+      [data-cgpt-batch-controls="project"] [data-cgpt-batch-action] > div {
+        gap: 0.4rem;
+      }
+      [data-cgpt-batch-action-slot][data-cgpt-batch-action-placement="project"] {
+        display: inline-flex;
+        flex: 0 0 auto;
+        overflow: hidden;
+        max-width: 18rem;
+        margin-inline-end: 0.35rem;
+        opacity: 1;
+        transform: translateX(0);
+        transition:
+          max-width ${BATCH_MOTION_TRANSITION_MS}ms cubic-bezier(0.2,0,0,1),
+          margin-inline-end ${BATCH_MOTION_TRANSITION_MS}ms cubic-bezier(0.2,0,0,1),
+          opacity ${BATCH_MOTION_TRANSITION_MS}ms ease,
+          transform ${BATCH_MOTION_TRANSITION_MS}ms cubic-bezier(0.2,0,0,1);
+      }
+      [data-cgpt-batch-action-slot][data-cgpt-batch-action-placement="project"][data-cgpt-motion-state="closed"] {
+        max-width: 0;
+        margin-inline-end: 0;
+        opacity: 0;
+        transform: translateX(-4px);
+        pointer-events: none;
+      }
+
+      [data-cgpt-batch-dialog-download="true"] {
+        background-color: #ffffff !important;
+        color: #000000 !important;
+        border-color: rgba(0,0,0,0.14) !important;
+      }
+      [data-cgpt-batch-dialog-download="true"]:is(:hover,:focus-visible) {
+        background-color: #f2f2f2 !important;
+        color: #000000 !important;
+      }
+      [data-cgpt-batch-dialog-download="true"]:active {
+        background-color: #e8e8e8 !important;
+        color: #000000 !important;
+      }
+      [data-cgpt-batch-dialog-download="true"] :is(svg,path,span,div) {
+        color: inherit !important;
+      }
+      [data-cgpt-batch-dialog-danger="true"] {
+        background-color: rgb(220 38 38) !important;
+        color: #fff !important;
+        border-color: rgb(220 38 38) !important;
+      }
+      [data-cgpt-batch-dialog-danger="true"]:hover {
+        background-color: rgb(185 28 28) !important;
+      }
+      [data-cgpt-batch-dialog-list] {
+        max-height: min(50vh,420px);
+        overflow-y: auto;
+        scrollbar-width: thin;
+      }
+      [data-cgpt-batch-dialog-shell] [data-cgpt-batch-dialog-backdrop]::before {
+        opacity: 1;
+        transition: opacity ${BATCH_MOTION_TRANSITION_MS}ms ease;
+      }
+      [data-cgpt-batch-dialog-shell] [data-cgpt-batch-dialog-surface] {
+        opacity: 1;
+        scale: 1;
+        transition:
+          opacity ${BATCH_MOTION_TRANSITION_MS}ms ease,
+          scale ${BATCH_MOTION_TRANSITION_MS}ms cubic-bezier(0.2,0,0,1);
+      }
+      [data-cgpt-batch-dialog-shell][data-cgpt-motion-state="closed"] {
+        pointer-events: none;
+      }
+      [data-cgpt-batch-dialog-shell][data-cgpt-motion-state="closed"] [data-cgpt-batch-dialog-backdrop]::before {
+        opacity: 0;
+      }
+      [data-cgpt-batch-dialog-shell][data-cgpt-motion-state="closed"] [data-cgpt-batch-dialog-surface] {
+        opacity: 0;
+        scale: 0.985;
+      }
+
+      /*
+       * 新建立 finite-motion UI 的 entry 起始值。
+       * 由 Chromium @starting-style 建立 before-change style，
+       * 避免 JS 在 click handler 中同步讀取 layout。
+       */
+      @starting-style {
+        [data-cgpt-batch-action-slot][data-cgpt-batch-action-placement="general-panel"][data-cgpt-motion-state="open"] {
+          max-height: 0;
+          margin-top: 0;
+          opacity: 0;
+          transform: translateY(-3px);
+        }
+        [data-cgpt-batch-general-panel-close][data-cgpt-motion-state="open"] {
+          opacity: 0;
+          scale: 0.92;
+        }
+        [data-cgpt-batch-controls="project"][data-cgpt-motion-state="open"] {
+          max-width: 0;
+          margin-inline: 0;
+          opacity: 0;
+          transform: translateX(-4px);
+        }
+        [data-cgpt-batch-action-slot][data-cgpt-batch-action-placement="project"][data-cgpt-motion-state="open"] {
+          max-width: 0;
+          margin-inline-end: 0;
+          opacity: 0;
+          transform: translateX(-4px);
+        }
+        [data-cgpt-batch-dialog-shell][data-cgpt-motion-state="open"] [data-cgpt-batch-dialog-backdrop]::before {
+          opacity: 0;
+        }
+        [data-cgpt-batch-dialog-shell][data-cgpt-motion-state="open"] [data-cgpt-batch-dialog-surface] {
+          opacity: 0;
+          scale: 0.985;
+        }
+      }
+
+      @keyframes cgpt-batch-general-panel-enter {
+        from {
+          max-height: 0;
+          margin-block: 0;
+          padding-block: 0;
+          border-color: transparent;
+          background-color: transparent;
+          opacity: 0;
+          transform: translateY(-4px);
+        }
+        to {
+          max-height: 24rem;
+          margin-block: 0.35rem 0.55rem;
+          padding-block: 0.4rem;
+          border-color: color-mix(in srgb, currentColor 20%, transparent);
+          background-color: color-mix(in srgb, currentColor 4%, transparent);
+          opacity: 1;
+          transform: translateY(0);
+        }
+      }
+
+      @keyframes cgpt-batch-progress-stripes {
+        from { background-position: 0 0, 0 0; }
+        to { background-position: 28px 0, 0 0; }
+      }
+      @keyframes cgpt-batch-row-spinner {
+        to { transform: rotate(360deg); }
+      }
+      @media (prefers-reduced-motion: no-preference) {
+        [data-cgpt-batch-selection-row="true"] {
+          transition:
+            --cgpt-batch-progress 120ms linear,
+            background-color ${BATCH_ROW_COLOR_TRANSITION_MS}ms ease;
+        }
+        [data-cgpt-batch-selection-row="true"]:is(
+          [data-cgpt-batch-row-state="queued"],
+          [data-cgpt-batch-row-state="exporting"]
+        ) {
+          animation: cgpt-batch-progress-stripes 620ms linear infinite;
+        }
+        [data-cgpt-batch-row-spinner] {
+          animation: cgpt-batch-row-spinner 720ms linear infinite;
+        }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        [data-cgpt-batch-controls="general"][data-cgpt-batch-general-mode="panel"],
+        [data-cgpt-batch-general-panel-close],
+        [data-cgpt-batch-action-slot],
+        [data-cgpt-batch-controls="project"],
+        [data-cgpt-batch-dialog-backdrop]::before,
+        [data-cgpt-batch-dialog-surface] {
+          transition: none !important;
+        }
+        [data-cgpt-batch-controls="general"][data-cgpt-batch-general-mode="panel"] {
+          animation: none !important;
+        }
+      }
+    `;
+    document.head.append(style);
+  }
+
+  function getConversationIdFromHref(href) {
+    try {
+      const parsedUrl = new URL(href, location.origin);
+      if (parsedUrl.origin !== location.origin) {
+        return null;
+      }
+      const match = parsedUrl.pathname.match(/\/c\/([^/?#]+)\/?$/);
+      if (!match) {
+        return null;
+      }
+      const conversationId = decodeURIComponent(match[1]);
+      return isExportableConversationId(conversationId) ? conversationId : null;
+    } catch {
+      return null;
+    }
+  }
+
+  function findGeneralBatchUiContext() {
+    const history = document.getElementById('history');
+    if (!history || !history.parentElement) {
+      return null;
+    }
+    let header = history.previousElementSibling;
+    if (header?.id === BATCH_GENERAL_CONTROLS_ID) {
+      header = header.previousElementSibling;
+    }
+    if (!header || !header.parentElement) {
+      return null;
+    }
+    const actionHost = header.lastElementChild;
+    if (!actionHost || actionHost === header.firstElementChild) {
+      return null;
+    }
+    return {
+      scope: BATCH_SCOPE_GENERAL,
+      active: true,
+      controlsHost: actionHost,
+      panelHost: history.parentElement,
+      header,
+      listRoot: history
+    };
+  }
+
+  function findProjectBatchUiContext() {
+    const tablist = document.querySelector('[role="tablist"][id^="project-home-tabs-"]');
+    if (!tablist) {
+      return null;
+    }
+    const chatTab = tablist.querySelector('[role="tab"][id$="-chats"]');
+    const sourcesTab = tablist.querySelector('[role="tab"][id$="-sources"]');
+    if (!chatTab || !sourcesTab) {
+      return null;
+    }
+    const panelId = chatTab.getAttribute('aria-controls');
+    const panel = panelId ? document.getElementById(panelId) : null;
+    const listRoot = panel ? panel.querySelector('section > ol') : null;
+    return {
+      scope: BATCH_SCOPE_PROJECT,
+      active: chatTab.getAttribute('data-state') === 'active' && Boolean(listRoot),
+      controlsHost: tablist,
+      tablist,
+      chatTab,
+      sourcesTab,
+      listRoot
+    };
+  }
+
+  function getBatchUiContext(scope) {
+    return scope === BATCH_SCOPE_GENERAL
+      ? findGeneralBatchUiContext()
+      : scope === BATCH_SCOPE_PROJECT
+        ? findProjectBatchUiContext()
+        : null;
+  }
+
+  function getBatchConversationRows(context) {
+    if (!context?.listRoot) {
+      return [];
+    }
+    if (context.scope === BATCH_SCOPE_GENERAL) {
+      return Array.from(
+        context.listRoot.querySelectorAll('a[data-sidebar-item="true"][href^="/c/"]')
+      );
+    }
+    return Array.from(context.listRoot.querySelectorAll('li')).filter((row) => {
+      return Boolean(row.querySelector('a[href*="/c/"]'));
+    });
+  }
+
+  function getBatchConversationInfo(row, scope) {
+    if (!row) {
+      return null;
+    }
+    const link = scope === BATCH_SCOPE_GENERAL
+      ? row
+      : row.querySelector('a[href*="/c/"]');
+    if (!link) {
+      return null;
+    }
+    const conversationId = getConversationIdFromHref(
+      link.getAttribute('href') || link.href || ''
+    );
+    if (!conversationId) {
+      return null;
+    }
+    let title = '';
+    if (scope === BATCH_SCOPE_GENERAL) {
+      title = String(link.getAttribute('aria-label') || '').trim();
+    } else {
+      title = String(
+        link.querySelector('.text-sm.font-medium')?.textContent || ''
+      ).replace(/\s+/g, ' ').trim();
+    }
+    if (!title) {
+      title = getKnownConversationTitle(conversationId) || conversationId;
+    }
+    return {
+      conversationId,
+      title,
+      hrefPath: new URL(
+        link.getAttribute('href') || link.href || '',
+        location.origin
+      ).pathname
+    };
+  }
+
+  function rememberBatchConversation(state, info) {
+    if (
+      !state ||
+      !info ||
+      state.sessionConversationIds.has(info.conversationId) ||
+      state.removedWhileProcessingIds.has(info.conversationId) ||
+      state.selectedConversations.has(info.conversationId)
+    ) {
+      return;
+    }
+    state.selectionOrder += 1;
+    state.selectedConversations.set(info.conversationId, {
+      ...info,
+      selectionOrder: state.selectionOrder
+    });
+  }
+
+  function forgetBatchConversation(state, conversationId) {
+    state?.selectedConversations.delete(conversationId);
+  }
+
+  function clearPendingBatchRowDecorationCleanup(scope) {
+    const timer = batchRowDecorationCleanupTimers.get(scope);
+    if (timer !== undefined) {
+      window.clearTimeout(timer);
+      batchRowDecorationCleanupTimers.delete(scope);
+    }
+  }
+
+  function removeBatchRowSpinner(row) {
+    row?.querySelector(':scope > [data-cgpt-batch-row-spinner]')?.remove();
+  }
+
+  function ensureBatchRowSpinner(row) {
+    if (!row || row.querySelector(':scope > [data-cgpt-batch-row-spinner]')) {
+      return;
+    }
+    const spinner = document.createElement('span');
+    spinner.setAttribute('data-cgpt-batch-row-spinner', 'true');
+    spinner.setAttribute('aria-hidden', 'true');
+    row.append(spinner);
+  }
+
+  function clearBatchRowVisualAttributes(row) {
+    if (!row) {
+      return;
+    }
+    row.removeAttribute('data-cgpt-batch-row-state');
+    row.removeAttribute('data-cgpt-batch-progress-mode');
+    row.removeAttribute('data-cgpt-batch-progress-stage');
+    row.style.removeProperty('--cgpt-batch-progress');
+    removeBatchRowSpinner(row);
+  }
+
+  function finalizeBatchConversationRowDecorations(scope) {
+    clearPendingBatchRowDecorationCleanup(scope);
+    const selector =
+      `[data-cgpt-batch-selection-row="true"][data-cgpt-batch-selection-scope="${scope}"]`;
+    for (const row of document.querySelectorAll(selector)) {
+      clearBatchRowVisualAttributes(row);
+      row.removeAttribute('data-cgpt-batch-selection-row');
+      row.removeAttribute('data-cgpt-batch-selection-scope');
+    }
+  }
+
+  function applyBatchSelectionContextMarkers(context) {
+    if (!context?.listRoot) {
+      return;
+    }
+    context.listRoot.setAttribute('data-cgpt-batch-selection-list', 'true');
+    context.listRoot.setAttribute('data-cgpt-batch-selection-scope', context.scope);
+    if (context.scope === BATCH_SCOPE_GENERAL && context.header) {
+      context.header.setAttribute('data-cgpt-batch-selection-header', 'true');
+    }
+  }
+
+  function clearBatchSelectionContextMarkers(scope) {
+    if (scope === BATCH_SCOPE_GENERAL) {
+      for (const header of document.querySelectorAll('[data-cgpt-batch-selection-header="true"]')) {
+        header.removeAttribute('data-cgpt-batch-selection-header');
+      }
+    }
+    const selector =
+      `[data-cgpt-batch-selection-list="true"][data-cgpt-batch-selection-scope="${scope}"]`;
+    for (const list of document.querySelectorAll(selector)) {
+      list.removeAttribute('data-cgpt-batch-selection-list');
+      list.removeAttribute('data-cgpt-batch-selection-scope');
+    }
+  }
+
+  function disableGeneralBatchRowDragging(state, row) {
+    if (!state || state.scope !== BATCH_SCOPE_GENERAL || !row) {
+      return;
+    }
+    if (!state.originalDraggableByLink.has(row)) {
+      state.originalDraggableByLink.set(row, {
+        hadAttribute: row.hasAttribute('draggable'),
+        value: row.getAttribute('draggable')
+      });
+    }
+    row.setAttribute('draggable', 'false');
+    row.setAttribute('data-cgpt-batch-drag-disabled', 'true');
+  }
+
+  function restoreGeneralBatchRowDragging(state) {
+    if (!state) {
+      return;
+    }
+    for (const [link, original] of state.originalDraggableByLink.entries()) {
+      try {
+        if (original.hadAttribute) {
+          link.setAttribute('draggable', original.value ?? '');
+        } else {
+          link.removeAttribute('draggable');
+        }
+        link.removeAttribute('data-cgpt-batch-drag-disabled');
+      } catch { }
+    }
+    state.originalDraggableByLink.clear();
+  }
+
+  function getBatchConversationVisualState(state, conversationId) {
+    const runtime = state?.itemRuntime.get(conversationId);
+    if (runtime) {
+      if (runtime.status === BATCH_ITEM_EXPORTING) return BATCH_ITEM_EXPORTING;
+      if (runtime.status === BATCH_ITEM_SUCCESS) return BATCH_ITEM_SUCCESS;
+      if (runtime.status === BATCH_ITEM_FAILED) return BATCH_ITEM_FAILED;
+      if (runtime.status === BATCH_ITEM_SKIPPED) return BATCH_ITEM_SKIPPED;
+      if (runtime.status === BATCH_ITEM_PENDING) return 'queued';
+    }
+    return state?.selectedConversations.has(conversationId) ? 'selected' : null;
+  }
+
+  function applyBatchConversationRowVisualState(row, info, state) {
+    if (!row || !info || !state) {
+      return;
+    }
+    row.setAttribute('data-cgpt-batch-selection-row', 'true');
+    row.setAttribute('data-cgpt-batch-selection-scope', state.scope);
+
+    if (state.scope === BATCH_SCOPE_GENERAL && isBatchListLockedPhase(state.phase)) {
+      disableGeneralBatchRowDragging(state, row);
+    }
+
+    const visualState = getBatchConversationVisualState(state, info.conversationId);
+    if (!visualState) {
+      clearBatchRowVisualAttributes(row);
+      return;
+    }
+
+    row.setAttribute('data-cgpt-batch-row-state', visualState);
+    const runtime = state.itemRuntime.get(info.conversationId);
+    if (visualState === BATCH_ITEM_EXPORTING && runtime) {
+      const progress = Math.min(1, Math.max(0, Number(runtime.progress) || 0));
+      row.style.setProperty('--cgpt-batch-progress', `${(progress * 100).toFixed(2)}%`);
+      row.setAttribute(
+        'data-cgpt-batch-progress-mode',
+        runtime.progressMode === 'determinate' ? 'determinate' : 'indeterminate'
+      );
+      row.setAttribute('data-cgpt-batch-progress-stage', runtime.stage || 'working');
+      ensureBatchRowSpinner(row);
+    } else if (visualState === 'queued') {
+      row.style.removeProperty('--cgpt-batch-progress');
+      row.setAttribute('data-cgpt-batch-progress-mode', 'indeterminate');
+      row.setAttribute('data-cgpt-batch-progress-stage', 'queued');
+      removeBatchRowSpinner(row);
+    } else {
+      row.style.removeProperty('--cgpt-batch-progress');
+      row.removeAttribute('data-cgpt-batch-progress-mode');
+      row.removeAttribute('data-cgpt-batch-progress-stage');
+      removeBatchRowSpinner(row);
+    }
+  }
+
+  function syncBatchConversationRows(scope, { autoSelectNew = false } = {}) {
+    const state = getBatchSelectionState(scope);
+    if (!state || !isBatchListLockedPhase(state.phase)) {
+      return;
+    }
+    const context = getBatchUiContext(scope);
+    if (!context?.listRoot) {
+      return;
+    }
+    for (const row of getBatchConversationRows(context)) {
+      const info = getBatchConversationInfo(row, context.scope);
+      if (!info) {
+        continue;
+      }
+      if (
+        isBatchSelectionEditableState(state) &&
+        autoSelectNew &&
+        state.selectAllMode &&
+        !state.manuallyExcludedIds.has(info.conversationId) &&
+        !state.sessionConversationIds.has(info.conversationId)
+      ) {
+        rememberBatchConversation(state, info);
+      }
+      applyBatchConversationRowVisualState(row, info, state);
+    }
+    renderBatchControls();
+  }
+
+  function syncSingleBatchConversationRow(scope, conversationId) {
+    const state = getBatchSelectionState(scope);
+    const context = getBatchUiContext(scope);
+    if (!state || !context?.listRoot) {
+      return;
+    }
+    for (const row of getBatchConversationRows(context)) {
+      const info = getBatchConversationInfo(row, context.scope);
+      if (info?.conversationId === conversationId) {
+        applyBatchConversationRowVisualState(row, info, state);
+        return;
+      }
+    }
+  }
+
+  function clearBatchConversationRowDecorations(scope, { animate = true } = {}) {
+    clearPendingBatchRowDecorationCleanup(scope);
+    const selector =
+      `[data-cgpt-batch-selection-row="true"][data-cgpt-batch-selection-scope="${scope}"]`;
+    const rows = Array.from(document.querySelectorAll(selector));
+    for (const row of rows) {
+      clearBatchRowVisualAttributes(row);
+    }
+    const reduced = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
+    if (!animate || reduced || rows.length === 0) {
+      finalizeBatchConversationRowDecorations(scope);
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      batchRowDecorationCleanupTimers.delete(scope);
+      finalizeBatchConversationRowDecorations(scope);
+    }, BATCH_ROW_COLOR_TRANSITION_MS + 30);
+    batchRowDecorationCleanupTimers.set(scope, timer);
+  }
+
+  function getBatchConversationRowFromEventTarget(target, context) {
+    if (!(target instanceof Element) || !context?.listRoot) {
+      return null;
+    }
+    if (context.scope === BATCH_SCOPE_GENERAL) {
+      const row = target.closest('a[data-sidebar-item="true"][href^="/c/"]');
+      return row && context.listRoot.contains(row) ? row : null;
+    }
+    const row = target.closest('li');
+    return row && context.listRoot.contains(row) && row.querySelector('a[href*="/c/"]')
+      ? row
+      : null;
+  }
+
+  function removeConversationFromBatchSession(scope, conversationId) {
+    const state = getBatchSelectionState(scope);
+    if (
+      !state ||
+      !hasActiveBatchSession(state) ||
+      !state.sessionConversationIds.has(conversationId)
+    ) {
+      return false;
+    }
+
+    const isCurrentlyProcessing =
+      state.workerRunning &&
+      state.currentConversationId === conversationId;
+
+    state.sessionConversationIds.delete(conversationId);
+    state.sessionTargets = state.sessionTargets.filter(
+      (target) => target.conversationId !== conversationId
+    );
+    state.pendingQueue = state.pendingQueue.filter(
+      (target) => target.conversationId !== conversationId
+    );
+    state.completedPayloads.delete(conversationId);
+    state.sessionResults.delete(conversationId);
+    state.itemRuntime.delete(conversationId);
+    state.manuallyExcludedIds.add(conversationId);
+
+    if (isCurrentlyProcessing) {
+      state.removedWhileProcessingIds.add(conversationId);
+    }
+    if (state.rangeAnchorConversationId === conversationId) {
+      state.rangeAnchorConversationId = null;
+    }
+
+    state.sessionUpdatedAt = Date.now();
+    syncSingleBatchConversationRow(scope, conversationId);
+    renderBatchControls();
+    return true;
+  }
+
+  function toggleBatchConversationRow(scope, row, context) {
+    const state = getBatchSelectionState(scope);
+    const info = getBatchConversationInfo(row, context.scope);
+    if (!state || !info) {
+      return;
+    }
+
+    if (state.sessionConversationIds.has(info.conversationId)) {
+      removeConversationFromBatchSession(scope, info.conversationId);
+      return;
+    }
+    if (state.removedWhileProcessingIds.has(info.conversationId)) {
+      return;
+    }
+
+    if (state.selectedConversations.has(info.conversationId)) {
+      forgetBatchConversation(state, info.conversationId);
+      if (state.selectAllMode) {
+        state.manuallyExcludedIds.add(info.conversationId);
+      }
+    } else {
+      state.manuallyExcludedIds.delete(info.conversationId);
+      rememberBatchConversation(state, info);
+    }
+    state.rangeAnchorConversationId = info.conversationId;
+    syncBatchConversationRows(scope);
+  }
+
+  function selectBatchConversationRange(scope, row, context) {
+    const state = getBatchSelectionState(scope);
+    const targetInfo = getBatchConversationInfo(row, context.scope);
+    if (
+      !state ||
+      !targetInfo ||
+      state.sessionConversationIds.has(targetInfo.conversationId) ||
+      state.removedWhileProcessingIds.has(targetInfo.conversationId)
+    ) {
+      return;
+    }
+    const anchorId = state.rangeAnchorConversationId;
+    if (!anchorId) {
+      toggleBatchConversationRow(scope, row, context);
+      return;
+    }
+    const items = getBatchConversationRows(context)
+      .map((candidateRow) => ({
+        info: getBatchConversationInfo(candidateRow, context.scope)
+      }))
+      .filter((item) => Boolean(item.info));
+    const anchorIndex = items.findIndex((item) => item.info.conversationId === anchorId);
+    const targetIndex = items.findIndex(
+      (item) => item.info.conversationId === targetInfo.conversationId
+    );
+    if (anchorIndex < 0 || targetIndex < 0) {
+      toggleBatchConversationRow(scope, row, context);
+      return;
+    }
+    const from = Math.min(anchorIndex, targetIndex);
+    const to = Math.max(anchorIndex, targetIndex);
+    for (let index = from; index <= to; index += 1) {
+      const info = items[index].info;
+      if (
+        state.sessionConversationIds.has(info.conversationId) ||
+        state.removedWhileProcessingIds.has(info.conversationId)
+      ) {
+        continue;
+      }
+      state.manuallyExcludedIds.delete(info.conversationId);
+      rememberBatchConversation(state, info);
+    }
+    syncBatchConversationRows(scope);
+  }
+
+  function handleBatchListClick(scope, event) {
+    const state = getBatchSelectionState(scope);
+    if (!state || !isBatchListLockedPhase(state.phase)) {
+      return;
+    }
+    const context = getBatchUiContext(scope);
+    const row = getBatchConversationRowFromEventTarget(event.target, context);
+    if (!row) {
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    event.stopImmediatePropagation();
+
+    const info = getBatchConversationInfo(row, context.scope);
+    if (info && state.sessionConversationIds.has(info.conversationId)) {
+      removeConversationFromBatchSession(scope, info.conversationId);
+      return;
+    }
+
+    if (!isBatchSelectionEditableState(state)) {
+      return;
+    }
+    if (event.shiftKey) {
+      selectBatchConversationRange(scope, row, context);
+    } else {
+      toggleBatchConversationRow(scope, row, context);
+    }
+  }
+
+  function handleBatchListDblClick(scope, event) {
+    if (scope !== BATCH_SCOPE_GENERAL) {
+      return;
+    }
+    const state = getBatchSelectionState(scope);
+    if (!state || !isBatchListLockedPhase(state.phase)) {
+      return;
+    }
+    const context = getBatchUiContext(scope);
+    const row = getBatchConversationRowFromEventTarget(event.target, context);
+    if (!row) {
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    event.stopImmediatePropagation();
+  }
+
+  function handleBatchListKeydown(scope, event) {
+    const state = getBatchSelectionState(scope);
+    if (
+      !state ||
+      !isBatchListLockedPhase(state.phase) ||
+      (event.key !== 'Enter' && event.key !== ' ')
+    ) {
+      return;
+    }
+    const context = getBatchUiContext(scope);
+    const row = getBatchConversationRowFromEventTarget(event.target, context);
+    if (!row) {
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    event.stopImmediatePropagation();
+
+    const info = getBatchConversationInfo(row, context.scope);
+    if (info && state.sessionConversationIds.has(info.conversationId)) {
+      removeConversationFromBatchSession(scope, info.conversationId);
+      return;
+    }
+
+    if (!isBatchSelectionEditableState(state)) {
+      return;
+    }
+    if (event.shiftKey) {
+      selectBatchConversationRange(scope, row, context);
+    } else {
+      toggleBatchConversationRow(scope, row, context);
+    }
+  }
+
+  function handleBatchListDragStart(scope, event) {
+    const state = getBatchSelectionState(scope);
+    if (scope !== BATCH_SCOPE_GENERAL || !state || !isBatchListLockedPhase(state.phase)) {
+      return;
+    }
+    const context = getBatchUiContext(scope);
+    if (!getBatchConversationRowFromEventTarget(event.target, context)) {
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    event.stopImmediatePropagation();
+  }
+
+  function detachBatchSelectionListBinding(scope) {
+    const state = getBatchSelectionState(scope);
+    if (!state) {
+      return;
+    }
+    clearBatchSelectionContextMarkers(scope);
+    if (state.listRoot && state.listClickHandler) {
+      state.listRoot.removeEventListener('click', state.listClickHandler, true);
+    }
+    if (state.listRoot && state.listDblclickHandler) {
+      state.listRoot.removeEventListener('dblclick', state.listDblclickHandler, true);
+    }
+    if (state.listRoot && state.listKeydownHandler) {
+      state.listRoot.removeEventListener('keydown', state.listKeydownHandler, true);
+    }
+    if (state.listRoot && state.listDragstartHandler) {
+      state.listRoot.removeEventListener('dragstart', state.listDragstartHandler, true);
+    }
+    if (state.listObserver) {
+      state.listObserver.disconnect();
+    }
+    restoreGeneralBatchRowDragging(state);
+    state.listRoot = null;
+    state.listObserver = null;
+    state.listClickHandler = null;
+    state.listDblclickHandler = null;
+    state.listKeydownHandler = null;
+    state.listDragstartHandler = null;
+  }
+
+  function bindBatchSelectionList(context) {
+    const state = getBatchSelectionState(context?.scope);
+    if (!context?.listRoot || !state || !isBatchListLockedPhase(state.phase)) {
+      return;
+    }
+    if (state.listRoot === context.listRoot) {
+      applyBatchSelectionContextMarkers(context);
+      syncBatchConversationRows(context.scope, {
+        autoSelectNew: isBatchSelectionEditableState(state) && state.selectAllMode
+      });
+      return;
+    }
+
+    detachBatchSelectionListBinding(context.scope);
+    applyBatchSelectionContextMarkers(context);
+    state.listRoot = context.listRoot;
+    state.listClickHandler = (event) => handleBatchListClick(context.scope, event);
+    state.listDblclickHandler = (event) => handleBatchListDblClick(context.scope, event);
+    state.listKeydownHandler = (event) => handleBatchListKeydown(context.scope, event);
+    state.listDragstartHandler = (event) => handleBatchListDragStart(context.scope, event);
+
+    context.listRoot.addEventListener('click', state.listClickHandler, true);
+    if (context.scope === BATCH_SCOPE_GENERAL) {
+      context.listRoot.addEventListener('dblclick', state.listDblclickHandler, true);
+    }
+    context.listRoot.addEventListener('keydown', state.listKeydownHandler, true);
+    if (context.scope === BATCH_SCOPE_GENERAL) {
+      context.listRoot.addEventListener('dragstart', state.listDragstartHandler, true);
+    }
+
+    state.listObserver = new MutationObserver(() => {
+      syncBatchConversationRows(context.scope, {
+        autoSelectNew: isBatchSelectionEditableState(state) && state.selectAllMode
+      });
+    });
+    state.listObserver.observe(context.listRoot, { childList: true, subtree: true });
+    syncBatchConversationRows(context.scope, {
+      autoSelectNew: isBatchSelectionEditableState(state) && state.selectAllMode
+    });
+  }
+
+  function createBatchActionButton({
+    scope,
+    action,
+    label,
+    iconSvg,
+    disabled = false,
+    placement = 'auto'
+  }) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.setAttribute('data-cgpt-batch-action', action);
+    button.disabled = disabled;
+
+    const actualPlacement = placement === 'auto'
+      ? (scope === BATCH_SCOPE_GENERAL ? 'header' : 'project')
+      : placement;
+
+    if (actualPlacement === 'header') {
+      button.className = [
+        'disabled:text-token-text-tertiary',
+        'pointer-events-auto',
+        'disabled:pointer-events-none',
+        'touch:min-h-10',
+        'keyboard-focused:*:focus-ring',
+        'relative',
+        'isolate',
+        'flex',
+        'min-h-9',
+        'items-center',
+        'self-stretch',
+        'rounded-e-[10px]',
+        'focus:outline-none',
+        '-my-2',
+        '-ms-1',
+        'ps-1',
+        '-me-2.5',
+        'pe-1.5',
+        'text-inherit',
+        'interactive-label-secondary',
+        'data-[state=open]:text-(--interactive-label-hover-secondary)',
+        'transition-opacity',
+        'focus-visible:opacity-100',
+        'can-hover:opacity-0',
+        'can-hover:group-hover/sidebar-expando-section-header:opacity-100',
+        'cant-hover:opacity-100'
+      ].join(' ');
+      button.setAttribute('data-trailing-button', '');
+      button.setAttribute('aria-label', label);
+      button.title = label;
+      button.innerHTML =
+        `<div class="flex items-center justify-center rounded-lg p-1">${iconSvg}</div>`;
+      return button;
+    }
+
+    if (actualPlacement === 'general-panel') {
+      button.className = 'focus:outline-none';
+      button.setAttribute('data-cgpt-batch-general-action', 'true');
+      button.setAttribute('aria-label', label);
+      button.title = label;
+      button.innerHTML =
+        `${iconSvg}<span data-cgpt-batch-general-action-label>${label}</span>`;
+      return button;
+    }
+
+    button.className = [
+      'btn',
+      'relative',
+      'group-focus-within/dialog:focus-visible:[outline-width:1.5px]',
+      'group-focus-within/dialog:focus-visible:[outline-offset:2.5px]',
+      'group-focus-within/dialog:focus-visible:[outline-style:solid]',
+      'group-focus-within/dialog:focus-visible:[outline-color:var(--text-primary)]',
+      'btn-secondary',
+      'touch:h-10',
+      'h-9',
+      'px-3'
+    ].join(' ');
+    button.setAttribute('aria-label', label);
+    button.title = label;
+    button.innerHTML =
+      `<div class="flex items-center justify-center">${iconSvg}<span>${label}</span></div>`;
+    return button;
+  }
+
+  function getOrCreateBatchControls(scope) {
+    const id = scope === BATCH_SCOPE_GENERAL
+      ? BATCH_GENERAL_CONTROLS_ID
+      : BATCH_PROJECT_CONTROLS_ID;
+    let controls = document.getElementById(id);
+    if (!controls) {
+      controls = document.createElement('div');
+      controls.id = id;
+      controls.setAttribute('data-cgpt-batch-controls', scope);
+    }
+    return controls;
+  }
+
+  function placeBatchControls(
+    scope,
+    controls,
+    context,
+    state
+  ) {
+    if (scope === BATCH_SCOPE_GENERAL) {
+      if (state.phase === BATCH_PHASE_IDLE) {
+        clearBatchMotionLifecycle(controls);
+        controls.removeAttribute(
+          'data-cgpt-motion-state'
+        );
+        controls.removeAttribute('inert');
+        controls.removeAttribute('aria-hidden');
+        controls.setAttribute(
+          'data-cgpt-batch-general-mode',
+          'header'
+        );
+        controls.className = 'contents';
+        if (
+          controls.parentElement !==
+          context.controlsHost ||
+          context.controlsHost.firstElementChild !==
+          controls
+        ) {
+          context.controlsHost.insertBefore(
+            controls,
+            context.controlsHost.firstElementChild
+          );
+        }
+      } else {
+        const enteringPanel =
+          controls.getAttribute(
+            'data-cgpt-batch-general-mode'
+          ) !== 'panel';
+
+        controls.setAttribute(
+          'data-cgpt-batch-general-mode',
+          'panel'
+        );
+        controls.className = '';
+
+        if (enteringPanel) {
+          setBatchMotionStateImmediately(
+            controls,
+            false
+          );
+        }
+
+        if (
+          controls.parentElement !==
+          context.panelHost ||
+          controls.nextElementSibling !==
+          context.listRoot
+        ) {
+          context.panelHost.insertBefore(
+            controls,
+            context.listRoot
+          );
+        }
+
+        if (enteringPanel) {
+          transitionBatchMotionState(
+            controls,
+            true
+          );
+        }
+      }
+      return;
+    }
+
+    controls.className = '';
+    controls.setAttribute('role', 'presentation');
+    controls.removeAttribute(
+      'data-cgpt-batch-general-mode'
+    );
+
+    if (
+      !controls.hasAttribute(
+        'data-cgpt-motion-state'
+      )
+    ) {
+      setBatchMotionStateImmediately(
+        controls,
+        false
+      );
+    }
+
+    if (
+      controls.parentElement !== context.tablist ||
+      controls.nextElementSibling !==
+      context.sourcesTab
+    ) {
+      context.tablist.insertBefore(
+        controls,
+        context.sourcesTab
+      );
+    }
+  }
+
+  function removeBatchControlsIfContextMissing(scope) {
+    const state = getBatchSelectionState(scope);
+    if (hasActiveBatchSession(state)) {
+      return;
+    }
+    const id = scope === BATCH_SCOPE_GENERAL
+      ? BATCH_GENERAL_CONTROLS_ID
+      : BATCH_PROJECT_CONTROLS_ID;
+    document.getElementById(id)?.remove();
+  }
+
+  function getBatchPanelStatusItems(state) {
+    const draftCount = state.selectedConversations.size;
+    if (!hasActiveBatchSession(state)) {
+      return [`目前選取：${draftCount}`];
+    }
+
+    const items = [`類型：${getBatchExportKindLabel(state.exportKind)}`];
+    const success = countBatchStatus(state, BATCH_ITEM_SUCCESS);
+    const failed = countBatchStatus(state, BATCH_ITEM_FAILED);
+
+    if (success > 0) items.push(`成功：${success}`);
+    if (failed > 0) items.push(`失敗：${failed}`);
+    if (state.workerRunning) items.push('處理中：1');
+    if (state.pendingQueue.length > 0) items.push(`佇列：${state.pendingQueue.length}`);
+    if (draftCount > 0) items.push(`目前選取：${draftCount}`);
+    if (
+      !state.workerRunning &&
+      state.pendingQueue.length === 0 &&
+      draftCount === 0 &&
+      state.sessionTargets.length > 0
+    ) {
+      items.push('狀態：可打包');
+    }
+    return items;
+  }
+
+  function prefersReducedBatchMotion() {
+    return Boolean(
+      window.matchMedia?.(
+        '(prefers-reduced-motion: reduce)'
+      ).matches
+    );
+  }
+
+  function clearBatchMotionLifecycle(element) {
+    const lifecycle = batchMotionLifecycles.get(element);
+    if (!lifecycle) {
+      return;
+    }
+
+    if (lifecycle.timer !== null) {
+      window.clearTimeout(lifecycle.timer);
+    }
+    if (
+      lifecycle.transitionElement &&
+      lifecycle.transitionHandler
+    ) {
+      lifecycle.transitionElement.removeEventListener(
+        'transitionend',
+        lifecycle.transitionHandler
+      );
+    }
+
+    batchMotionLifecycles.delete(element);
+  }
+
+  function applyBatchMotionAccessibility(
+    element,
+    open
+  ) {
+    const isOpen = Boolean(open);
+    element.toggleAttribute('inert', !isOpen);
+    if (isOpen) {
+      element.removeAttribute('aria-hidden');
+    } else {
+      element.setAttribute('aria-hidden', 'true');
+    }
+  }
+
+  function setBatchMotionStateImmediately(
+    element,
+    open
+  ) {
+    if (!element) {
+      return;
+    }
+    clearBatchMotionLifecycle(element);
+    element.setAttribute(
+      'data-cgpt-motion-state',
+      open ? 'open' : 'closed'
+    );
+    applyBatchMotionAccessibility(
+      element,
+      open
+    );
+  }
+
+  /*
+   * 統一有限狀態動畫 lifecycle：
+   *
+   *   初次 mount：
+   *     JS 直接切到目標 state；CSS @starting-style 提供 before-change style。
+   *
+   *   已存在 DOM：
+   *     JS 直接切換 open / closed，交由既有 CSS transition 自然反向。
+   *
+   * 一般側邊欄 controls 從 header 變成 panel 時，元素本身不是新 DOM，
+   * 因此 entry 由 CSS keyframe 處理。整個 lifecycle 不再同步讀取
+   * getBoundingClientRect / offsetWidth，不強迫瀏覽器在 click handler 中
+   * 立即結算全頁 style / layout。
+   *
+   * 退場仍保留 DOM 到 transitionend 後才 cleanup。
+   * JS 只管理 state / accessibility / cleanup，不使用 WAAPI。
+   * setTimeout 只作 transitionend 未送達時的保險 fallback。
+   */
+  function transitionBatchMotionState(
+    element,
+    open,
+    {
+      transitionElement = element,
+      transitionProperty = null,
+      onSettled = null
+    } = {}
+  ) {
+    if (!element) {
+      if (typeof onSettled === 'function') {
+        onSettled();
+      }
+      return;
+    }
+
+    const targetState = open ? 'open' : 'closed';
+    const existing = batchMotionLifecycles.get(element);
+    if (existing?.targetState === targetState) {
+      return;
+    }
+
+    clearBatchMotionLifecycle(element);
+
+    let currentState = element.getAttribute(
+      'data-cgpt-motion-state'
+    );
+
+    if (currentState === targetState) {
+      applyBatchMotionAccessibility(
+        element,
+        open
+      );
+      if (typeof onSettled === 'function') {
+        window.queueMicrotask(onSettled);
+      }
+      return;
+    }
+
+    /*
+     * 若是剛建立、尚未有 motion state 的 DOM，先標記與目標相反的
+     * 邏輯 state；若同一 task 內隨即切 open，初次 render 的視覺起始值
+     * 由 CSS @starting-style 接手，不需要同步 layout flush。
+     */
+    if (!currentState) {
+      currentState = open ? 'closed' : 'open';
+      element.setAttribute(
+        'data-cgpt-motion-state',
+        currentState
+      );
+      applyBatchMotionAccessibility(
+        element,
+        !open
+      );
+    }
+
+    /*
+     * 退場一開始就停止新的互動，但 DOM / layout 仍保留到 transition 完成。
+     */
+    if (!open) {
+      applyBatchMotionAccessibility(
+        element,
+        false
+      );
+    }
+
+    if (
+      prefersReducedBatchMotion() ||
+      !element.isConnected
+    ) {
+      element.setAttribute(
+        'data-cgpt-motion-state',
+        targetState
+      );
+      applyBatchMotionAccessibility(
+        element,
+        open
+      );
+      if (typeof onSettled === 'function') {
+        onSettled();
+      }
+      return;
+    }
+
+    const lifecycle = {
+      targetState,
+      timer: null,
+      transitionElement: null,
+      transitionHandler: null
+    };
+
+    batchMotionLifecycles.set(
+      element,
+      lifecycle
+    );
+
+    const settle = () => {
+      if (
+        batchMotionLifecycles.get(element) !==
+        lifecycle
+      ) {
+        return;
+      }
+
+      clearBatchMotionLifecycle(element);
+
+      if (typeof onSettled === 'function') {
+        onSettled();
+      }
+    };
+
+    if (
+      typeof onSettled === 'function' &&
+      transitionElement
+    ) {
+      lifecycle.transitionElement =
+        transitionElement;
+
+      lifecycle.transitionHandler = (event) => {
+        if (event.target !== transitionElement) {
+          return;
+        }
+
+        if (
+          transitionProperty &&
+          event.propertyName !== transitionProperty
+        ) {
+          return;
+        }
+
+        settle();
+      };
+
+      transitionElement.addEventListener(
+        'transitionend',
+        lifecycle.transitionHandler
+      );
+    }
+
+    element.setAttribute(
+      'data-cgpt-motion-state',
+      targetState
+    );
+
+    if (open) {
+      applyBatchMotionAccessibility(
+        element,
+        true
+      );
+    }
+
+    if (typeof onSettled === 'function') {
+      lifecycle.timer = window.setTimeout(
+        settle,
+        BATCH_MOTION_TRANSITION_MS + 120
+      );
+    } else {
+      batchMotionLifecycles.delete(element);
+    }
+  }
+
+  function getOrCreateBatchActionSlot(
+    target,
+    action,
+    placement
+  ) {
+    let slot = Array.from(target.children).find(
+      (candidate) =>
+        candidate instanceof HTMLElement &&
+        candidate.getAttribute(
+          'data-cgpt-batch-action-slot'
+        ) === action
+    );
+
+    if (!slot) {
+      slot = document.createElement('div');
+      slot.setAttribute(
+        'data-cgpt-batch-action-slot',
+        action
+      );
+      slot.setAttribute(
+        'data-cgpt-batch-action-placement',
+        placement
+      );
+      setBatchMotionStateImmediately(
+        slot,
+        false
+      );
+      target.append(slot);
+    }
+
+    return slot;
+  }
+
+  function syncBatchActionSlots(
+    target,
+    definitions,
+    placement
+  ) {
+    const expectedActions = new Set(
+      definitions.map(
+        (definition) => definition.action
+      )
+    );
+
+    definitions.forEach(
+      (definition, definitionIndex) => {
+        const slot = getOrCreateBatchActionSlot(
+          target,
+          definition.action,
+          placement
+        );
+
+        const currentAtIndex =
+          target.children[definitionIndex] || null;
+        if (currentAtIndex !== slot) {
+          target.insertBefore(
+            slot,
+            currentAtIndex
+          );
+        }
+
+        const shouldShow = Boolean(
+          definition.visible
+        );
+
+        let button = slot.querySelector(
+          ':scope > [data-cgpt-batch-action]'
+        );
+
+        /*
+         * action 的 label / icon / handler 對同一 action 是穩定的。
+         * DOM 只在第一次建立，後續只更新 title；退場時不拆 DOM。
+         */
+        if (!button) {
+          button = createBatchActionButton({
+            scope: definition.scope,
+            action: definition.action,
+            label: definition.label,
+            iconSvg: definition.iconSvg,
+            disabled: false,
+            placement
+          });
+          if (
+            typeof definition.onClick === 'function'
+          ) {
+            button.addEventListener(
+              'click',
+              definition.onClick
+            );
+          }
+          slot.append(button);
+        }
+
+        button.title =
+          definition.title || definition.label;
+
+        transitionBatchMotionState(
+          slot,
+          shouldShow
+        );
+      }
+    );
+
+    for (const child of Array.from(target.children)) {
+      if (
+        !(child instanceof HTMLElement) ||
+        !child.hasAttribute(
+          'data-cgpt-batch-action-slot'
+        )
+      ) {
+        continue;
+      }
+      const action = child.getAttribute(
+        'data-cgpt-batch-action-slot'
+      );
+      if (!expectedActions.has(action)) {
+        transitionBatchMotionState(
+          child,
+          false
+        );
+      }
+    }
+  }
+
+  function buildBatchActionDefinitions(scope, state) {
+    const draftCount = state.selectedConversations.size;
+    const sessionActive = hasActiveBatchSession(state);
+    const packaging =
+      state.phase === BATCH_PHASE_PACKAGING;
+    const editable = isBatchSelectionEditableState(state);
+    const blocked = Boolean(state.sessionBlockedReason);
+
+    return [
+      {
+        scope,
+        action: 'export',
+        label: '匯出',
+        iconSvg: BATCH_EXPORT_ICON_SVG,
+        visible:
+          draftCount > 0 &&
+          editable &&
+          !blocked,
+        title: sessionActive
+          ? `把目前選取的 ${draftCount} 個對話加入既有批次`
+          : `確認要批次匯出的 ${draftCount} 個對話`,
+        onClick: () => {
+          showBatchConfirmationDialog(scope);
+        }
+      },
+      {
+        scope,
+        action: 'select-all',
+        label: '全選',
+        iconSvg: BATCH_SELECT_ALL_ICON_SVG,
+        visible:
+          editable &&
+          !blocked,
+        title: state.selectAllMode
+          ? '重新全選目前列表，並繼續自動選取後續載入的對話'
+          : '全選目前列表，並自動選取後續載入的對話',
+        onClick: () => {
+          selectAllBatchConversations(scope);
+        }
+      },
+      {
+        scope,
+        action: 'clear-current-selection',
+        label: '取消目前選取',
+        iconSvg: BATCH_CANCEL_ICON_SVG,
+        visible:
+          draftCount > 0 &&
+          editable,
+        title:
+          '只清除尚未加入佇列的目前藍色選取',
+        onClick: () => {
+          clearCurrentBatchSelection(scope);
+        }
+      },
+      {
+        scope,
+        action: 'package',
+        label: '打包',
+        iconSvg: BATCH_PACKAGE_ICON_SVG,
+        visible: canPackageBatchSession(state),
+        title:
+          '把目前 session 已取得的結果封裝成 STORE ZIP 並下載。',
+        onClick: () => {
+          void packageBatchSession(scope);
+        }
+      },
+      {
+        scope,
+        action: 'cancel-job',
+        label: '取消批次下載作業',
+        iconSvg: BATCH_STOP_ICON_SVG,
+        visible:
+          sessionActive &&
+          !packaging,
+        title:
+          '確認後會重新整理目前網頁，清除尚未打包的批次資料與作業狀態。',
+        onClick: () => {
+          showCancelBatchJobDialog(scope);
+        }
+      }
+    ];
+  }
+
+  function appendBatchActionSet(
+    scope,
+    target,
+    state,
+    placement
+  ) {
+    syncBatchActionSlots(
+      target,
+      buildBatchActionDefinitions(scope, state),
+      placement
+    );
+  }
+
+  function renderGeneralBatchControls(
+    controls,
+    context,
+    state
+  ) {
+    if (state.phase === BATCH_PHASE_IDLE) {
+      controls.replaceChildren();
+      controls.removeAttribute(
+        'data-cgpt-batch-panel-scaffold'
+      );
+
+      const entry = createBatchActionButton({
+        scope: BATCH_SCOPE_GENERAL,
+        action: 'start',
+        label: '批次匯出',
+        iconSvg: BATCH_ENTRY_ICON_SVG,
+        disabled: !context.active,
+        placement: 'header'
+      });
+      entry.addEventListener('click', () =>
+        beginBatchSelectionMode(
+          BATCH_SCOPE_GENERAL
+        )
+      );
+      controls.append(entry);
+      return;
+    }
+
+    let header = controls.querySelector(
+      ':scope > [data-cgpt-batch-general-panel-header]'
+    );
+    let title = controls.querySelector(
+      '[data-cgpt-batch-general-panel-title]'
+    );
+    let statusList = controls.querySelector(
+      '[data-cgpt-batch-general-panel-status-list]'
+    );
+    let actions = controls.querySelector(
+      ':scope > [data-cgpt-batch-general-panel-actions]'
+    );
+    let close = controls.querySelector(
+      '[data-cgpt-batch-general-panel-close]'
+    );
+
+    if (!header || !title || !statusList || !actions) {
+      controls.replaceChildren();
+      controls.setAttribute(
+        'data-cgpt-batch-panel-scaffold',
+        'true'
+      );
+
+      header = document.createElement('div');
+      header.setAttribute(
+        'data-cgpt-batch-general-panel-header',
+        'true'
+      );
+
+      const titleWrap = document.createElement('div');
+      titleWrap.className = 'min-w-0';
+
+      title = document.createElement('div');
+      title.setAttribute(
+        'data-cgpt-batch-general-panel-title',
+        'true'
+      );
+      title.textContent = '批次匯出';
+
+      statusList = document.createElement('ul');
+      statusList.setAttribute(
+        'data-cgpt-batch-general-panel-status-list',
+        'true'
+      );
+
+      titleWrap.append(title, statusList);
+      header.append(titleWrap);
+
+      close = document.createElement('button');
+      close.type = 'button';
+      close.setAttribute(
+        'data-cgpt-batch-general-panel-close',
+        'true'
+      );
+      setBatchMotionStateImmediately(
+        close,
+        false
+      );
+      close.setAttribute(
+        'aria-label',
+        '關閉批次模式'
+      );
+      close.title = '關閉批次模式';
+      close.innerHTML = BATCH_CANCEL_ICON_SVG;
+      close.addEventListener('click', () =>
+        closeBatchSelectionMode(
+          BATCH_SCOPE_GENERAL
+        )
+      );
+      header.append(close);
+
+      actions = document.createElement('div');
+      actions.setAttribute(
+        'data-cgpt-batch-general-panel-actions',
+        'true'
+      );
+
+      controls.append(header, actions);
+    }
+
+    title.textContent = '批次匯出';
+
+    statusList.replaceChildren();
+    for (
+      const statusText of getBatchPanelStatusItems(state)
+    ) {
+      const statusItem =
+        document.createElement('li');
+      statusItem.textContent = statusText;
+      statusList.append(statusItem);
+    }
+
+    const showClose = !hasActiveBatchSession(state);
+    transitionBatchMotionState(
+      close,
+      showClose
+    );
+
+    appendBatchActionSet(
+      BATCH_SCOPE_GENERAL,
+      actions,
+      state,
+      'general-panel'
+    );
+  }
+
+  function renderProjectBatchControls(
+    controls,
+    context,
+    state
+  ) {
+    const visible = Boolean(context.active);
+    controls.setAttribute(
+      'data-cgpt-batch-visible',
+      visible ? 'true' : 'false'
+    );
+
+    if (state.phase === BATCH_PHASE_IDLE) {
+      controls.replaceChildren();
+      controls.removeAttribute(
+        'data-cgpt-batch-project-action-host'
+      );
+
+      const entry = createBatchActionButton({
+        scope: BATCH_SCOPE_PROJECT,
+        action: 'start',
+        label: '批次匯出',
+        iconSvg: BATCH_ENTRY_ICON_SVG,
+        disabled: !context.active,
+        placement: 'project'
+      });
+      entry.addEventListener('click', () =>
+        beginBatchSelectionMode(
+          BATCH_SCOPE_PROJECT
+        )
+      );
+      controls.append(entry);
+      transitionBatchMotionState(
+        controls,
+        visible
+      );
+      return;
+    }
+
+    if (
+      controls.getAttribute(
+        'data-cgpt-batch-project-action-host'
+      ) !== 'true'
+    ) {
+      controls.replaceChildren();
+      controls.setAttribute(
+        'data-cgpt-batch-project-action-host',
+        'true'
+      );
+    }
+
+    const definitions =
+      buildBatchActionDefinitions(
+        BATCH_SCOPE_PROJECT,
+        state
+      );
+
+    definitions.push({
+      scope: BATCH_SCOPE_PROJECT,
+      action: 'close-mode',
+      label: '關閉',
+      iconSvg: BATCH_CANCEL_ICON_SVG,
+      visible:
+        !hasActiveBatchSession(state) &&
+        state.phase === BATCH_PHASE_SELECTING,
+      title: '關閉批次模式',
+      onClick: () => {
+        closeBatchSelectionMode(
+          BATCH_SCOPE_PROJECT
+        );
+      }
+    });
+
+    syncBatchActionSlots(
+      controls,
+      definitions,
+      'project'
+    );
+
+    transitionBatchMotionState(
+      controls,
+      visible
+    );
+  }
+
+  function renderBatchControlsForScope(scope, context) {
+    const state = getBatchSelectionState(scope);
+    if (!state) {
+      return;
+    }
+    const controls = getOrCreateBatchControls(scope);
+    placeBatchControls(scope, controls, context, state);
+
+    const signature = [
+      state.phase,
+      context.active ? 'active' : 'inactive',
+      state.selectedConversations.size,
+      state.selectAllMode ? 'all' : 'manual',
+      state.exportKind || 'none',
+      state.workerRunning ? 'working' : 'idle-worker',
+      state.pendingQueue.length,
+      state.sessionTargets.length,
+      countBatchStatus(state, BATCH_ITEM_SUCCESS),
+      countBatchStatus(state, BATCH_ITEM_FAILED),
+      state.sessionBlockedReason ? 'blocked' : 'open'
+    ].join(':');
+
+    if (controls.getAttribute('data-cgpt-batch-render-signature') === signature) {
+      return;
+    }
+    controls.setAttribute(
+      'data-cgpt-batch-render-signature',
+      signature
+    );
+    controls.setAttribute(
+      'data-cgpt-batch-mode',
+      state.phase
+    );
+
+    if (scope === BATCH_SCOPE_GENERAL) {
+      renderGeneralBatchControls(
+        controls,
+        context,
+        state
+      );
+    } else {
+      renderProjectBatchControls(
+        controls,
+        context,
+        state
+      );
+    }
+  }
+
+  function renderBatchControls() {
+    const general = findGeneralBatchUiContext();
+    if (general) {
+      renderBatchControlsForScope(BATCH_SCOPE_GENERAL, general);
+    } else {
+      removeBatchControlsIfContextMissing(BATCH_SCOPE_GENERAL);
+    }
+
+    const project = findProjectBatchUiContext();
+    if (project) {
+      renderBatchControlsForScope(BATCH_SCOPE_PROJECT, project);
+    } else {
+      removeBatchControlsIfContextMissing(BATCH_SCOPE_PROJECT);
+    }
+
+    syncBatchBeforeUnloadGuard();
+  }
+
+  function resetBatchDraftSelection(state) {
+    state.selectedConversations.clear();
+    state.manuallyExcludedIds.clear();
+    state.selectAllMode = false;
+    state.closingMode = false;
+    state.rangeAnchorConversationId = null;
+    state.selectionOrder = 0;
+  }
+
+  function resetBatchSessionState(state, { preserveLastResults = true } = {}) {
+    state.exportKind = null;
+    state.sessionStartedAt = null;
+    state.sessionUpdatedAt = null;
+    state.sessionBlockedReason = '';
+    state.sessionTargets = [];
+    state.sessionConversationIds.clear();
+    state.pendingQueue = [];
+    state.workerRunning = false;
+    state.currentConversationId = null;
+    state.itemRuntime.clear();
+    state.completedPayloads.clear();
+    state.sessionResults.clear();
+    state.removedWhileProcessingIds.clear();
+    state.zipFilename = null;
+    if (!preserveLastResults) {
+      state.lastBatchResults = null;
+    }
+  }
+
+  function findBatchScrollableAncestor(element) {
+    let node = element?.parentElement || null;
+    while (
+      node &&
+      node !== document.body &&
+      node !== document.documentElement
+    ) {
+      try {
+        const style = getComputedStyle(node);
+        const overflowY = style.overflowY;
+        const isScrollable =
+          /^(auto|scroll|overlay)$/.test(overflowY) &&
+          node.scrollHeight > node.clientHeight + 1;
+        if (isScrollable) {
+          return node;
+        }
+      } catch {
+        // 繼續往上尋找可捲動祖先。
+      }
+      node = node.parentElement;
+    }
+    return null;
+  }
+
+  /*
+   * 量測側邊欄 scroll container 頂端實際被 sticky / fixed UI 覆蓋的高度。
+   *
+   * ChatGPT 目前的側邊欄頂部包含 Logo / 搜尋 / 新對話等固定區塊；
+   * 單純把「聊天」header 對齊 scroll container.top，會讓它捲到這些 UI 下方。
+   *
+   * 不依賴 build class 或固定像素高度，而是在 sidebar 的實際 x 範圍內
+   * 掃描頂部一小段畫面，尋找 position: sticky / fixed 的 rendered element，
+   * 以最下方的遮蔽邊界作為 scroll offset。
+   */
+  function measureBatchSidebarTopOcclusion(
+    scrollContainer,
+    referenceElement
+  ) {
+    if (
+      !scrollContainer ||
+      !referenceElement ||
+      !scrollContainer.isConnected ||
+      !referenceElement.isConnected
+    ) {
+      return 0;
+    }
+
+    const containerRect =
+      scrollContainer.getBoundingClientRect();
+    const referenceRect =
+      referenceElement.getBoundingClientRect();
+
+    if (
+      containerRect.width <= 0 ||
+      containerRect.height <= 0
+    ) {
+      return 0;
+    }
+
+    const probeX = Math.min(
+      containerRect.right - 2,
+      Math.max(
+        containerRect.left + 2,
+        referenceRect.left +
+        Math.min(
+          Math.max(referenceRect.width * 0.5, 24),
+          80
+        )
+      )
+    );
+
+    const scanTop = containerRect.top + 1;
+    const scanBottom = Math.min(
+      containerRect.bottom - 1,
+      scanTop + Math.min(280, containerRect.height * 0.5)
+    );
+
+    let occlusionBottom = containerRect.top;
+
+    for (
+      let probeY = scanTop;
+      probeY <= scanBottom;
+      probeY += 8
+    ) {
+      const elements =
+        typeof document.elementsFromPoint === 'function'
+          ? document.elementsFromPoint(probeX, probeY)
+          : [];
+
+      for (const element of elements) {
+        if (
+          !(element instanceof Element) ||
+          element === scrollContainer ||
+          element === referenceElement ||
+          referenceElement.contains(element)
+        ) {
+          continue;
+        }
+
+        let style;
+        try {
+          style = getComputedStyle(element);
+        } catch {
+          continue;
+        }
+
+        if (
+          style.position !== 'sticky' &&
+          style.position !== 'fixed'
+        ) {
+          continue;
+        }
+
+        const rect = element.getBoundingClientRect();
+        const overlapsContainerHorizontally =
+          rect.right > containerRect.left + 1 &&
+          rect.left < containerRect.right - 1;
+        const overlapsContainerTopArea =
+          rect.bottom > containerRect.top &&
+          rect.top < scanBottom;
+
+        if (
+          !overlapsContainerHorizontally ||
+          !overlapsContainerTopArea ||
+          rect.width <= 0 ||
+          rect.height <= 0
+        ) {
+          continue;
+        }
+
+        occlusionBottom = Math.max(
+          occlusionBottom,
+          Math.min(rect.bottom, containerRect.bottom)
+        );
+      }
+    }
+
+    /*
+     * 額外保留 8px，避免剛好貼住 sticky 區塊下緣。
+     */
+    const measuredOffset = Math.max(
+      0,
+      occlusionBottom - containerRect.top
+    );
+    return measuredOffset > 0
+      ? measuredOffset + 8
+      : 0;
+  }
+
+  function scrollGeneralBatchSectionToTop(context) {
+    if (
+      context?.scope !== BATCH_SCOPE_GENERAL ||
+      !context.header ||
+      !context.header.isConnected
+    ) {
+      return;
+    }
+
+    const reducedMotion = window.matchMedia?.(
+      '(prefers-reduced-motion: reduce)'
+    ).matches;
+
+    /*
+     * 連續兩個 rAF：
+     * 第一個讓批次面板完成插入；
+     * 第二個再量 sticky 區域與最終幾何，避免使用插入前的位置。
+     */
+    window.requestAnimationFrame(() => {
+      window.requestAnimationFrame(() => {
+        if (!context.header.isConnected) {
+          return;
+        }
+
+        const scrollContainer =
+          findBatchScrollableAncestor(context.header);
+
+        if (scrollContainer) {
+          const headerRect =
+            context.header.getBoundingClientRect();
+          const containerRect =
+            scrollContainer.getBoundingClientRect();
+          const topOcclusion =
+            measureBatchSidebarTopOcclusion(
+              scrollContainer,
+              context.header
+            );
+
+          const targetTop = Math.max(
+            0,
+            scrollContainer.scrollTop +
+            headerRect.top -
+            containerRect.top -
+            topOcclusion
+          );
+
+          try {
+            scrollContainer.scrollTo({
+              top: targetTop,
+              behavior: reducedMotion
+                ? 'auto'
+                : 'smooth'
+            });
+          } catch {
+            scrollContainer.scrollTop = targetTop;
+          }
+          return;
+        }
+
+        /*
+         * 找不到明確 scroll container 時退回 scrollIntoView。
+         * 此 fallback 不自行猜固定 header 高度。
+         */
+        try {
+          context.header.scrollIntoView({
+            block: 'start',
+            inline: 'nearest',
+            behavior: reducedMotion
+              ? 'auto'
+              : 'smooth'
+          });
+        } catch {
+          context.header.scrollIntoView(true);
+        }
+      });
+    });
+  }
+
+  function beginBatchSelectionMode(scope) {
+    const state = getBatchSelectionState(scope);
+    if (!state || state.phase !== BATCH_PHASE_IDLE) {
+      return;
+    }
+    finalizeBatchConversationRowDecorations(scope);
+    const context = getBatchUiContext(scope);
+    if (!context?.listRoot || !context.active) {
+      alert(
+        scope === BATCH_SCOPE_PROJECT
+          ? '目前無法進入批次選擇模式。請先切換到此專案的「聊天」分頁。'
+          : '目前找不到可選取的一般聊天列表。請確認側邊欄「聊天」區塊已顯示。'
+      );
+      return;
+    }
+    resetBatchDraftSelection(state);
+    resetBatchSessionState(state);
+    state.phase = BATCH_PHASE_SELECTING;
+    state.routePathname = location.pathname;
+    bindBatchSelectionList(context);
+    renderBatchControls();
+
+    if (scope === BATCH_SCOPE_GENERAL) {
+      scrollGeneralBatchSectionToTop(context);
+    }
+  }
+
+  function finalizeCloseBatchSelectionMode(
+    scope,
+    { silent = false } = {}
+  ) {
+    const state = getBatchSelectionState(scope);
+    if (!state || hasActiveBatchSession(state)) {
+      return;
+    }
+
+    removeBatchConfirmationDialog();
+    detachBatchSelectionListBinding(scope);
+    clearBatchConversationRowDecorations(scope);
+    resetBatchDraftSelection(state);
+    resetBatchSessionState(state);
+    state.phase = BATCH_PHASE_IDLE;
+    state.routePathname = null;
+    state.closingMode = false;
+
+    const controls = document.getElementById(
+      scope === BATCH_SCOPE_GENERAL
+        ? BATCH_GENERAL_CONTROLS_ID
+        : BATCH_PROJECT_CONTROLS_ID
+    );
+    if (controls) {
+      clearBatchMotionLifecycle(controls);
+      controls.removeAttribute(
+        'data-cgpt-motion-state'
+      );
+      controls.removeAttribute('inert');
+      controls.removeAttribute('aria-hidden');
+    }
+
+    renderBatchControls();
+
+    if (!silent) {
+      logInfo(
+        `已關閉 ${scope === BATCH_SCOPE_PROJECT
+          ? '專案'
+          : '一般聊天'
+        }批次模式。`
+      );
+    }
+  }
+
+  function closeBatchSelectionMode(
+    scope,
+    { silent = false } = {}
+  ) {
+    const state = getBatchSelectionState(scope);
+    if (
+      !state ||
+      state.phase === BATCH_PHASE_IDLE ||
+      hasActiveBatchSession(state) ||
+      state.closingMode
+    ) {
+      return;
+    }
+
+    const controls = document.getElementById(
+      scope === BATCH_SCOPE_GENERAL
+        ? BATCH_GENERAL_CONTROLS_ID
+        : BATCH_PROJECT_CONTROLS_ID
+    );
+
+    if (!controls) {
+      finalizeCloseBatchSelectionMode(
+        scope,
+        { silent }
+      );
+      return;
+    }
+
+    state.closingMode = true;
+    transitionBatchMotionState(
+      controls,
+      false,
+      {
+        transitionElement: controls,
+        transitionProperty:
+          scope === BATCH_SCOPE_GENERAL
+            ? 'max-height'
+            : 'max-width',
+        onSettled: () => {
+          finalizeCloseBatchSelectionMode(
+            scope,
+            { silent }
+          );
+        }
+      }
+    );
+  }
+
+  function cancelBatchSelectionMode(scope, options = {}) {
+    closeBatchSelectionMode(scope, options);
+  }
+
+  function clearCurrentBatchSelection(scope) {
+    const state = getBatchSelectionState(scope);
+    if (!state || !isBatchSelectionEditableState(state)) {
+      return;
+    }
+    resetBatchDraftSelection(state);
+    syncBatchConversationRows(scope);
+    renderBatchControls();
+  }
+
+  function selectAllBatchConversations(scope) {
+    const state = getBatchSelectionState(scope);
+    if (!state || !isBatchSelectionEditableState(state)) {
+      return;
+    }
+    state.selectAllMode = true;
+    state.manuallyExcludedIds.clear();
+    syncBatchConversationRows(scope, { autoSelectNew: true });
+  }
+
+  function removeBatchDialogImmediatelyById(id) {
+    const element = document.getElementById(id);
+    if (!element) {
+      return;
+    }
+    clearBatchMotionLifecycle(element);
+    element.remove();
+  }
+
+  function removeBatchConfirmationDialog() {
+    removeBatchDialogImmediatelyById(
+      BATCH_DIALOG_ID
+    );
+  }
+
+  function removeCancelBatchJobDialog() {
+    removeBatchDialogImmediatelyById(
+      BATCH_CANCEL_JOB_DIALOG_ID
+    );
+  }
+
+  function ensureBatchSelectionBinding(scope) {
+    const state = getBatchSelectionState(scope);
+    if (!state || !isBatchListLockedPhase(state.phase)) {
+      return;
+    }
+    const context = getBatchUiContext(scope);
+    if (!context?.listRoot) {
+      return;
+    }
+    if (!context.active && !hasActiveBatchSession(state)) {
+      closeBatchSelectionMode(scope, { silent: true });
+      return;
+    }
+    bindBatchSelectionList(context);
+  }
+
+  function ensureAllBatchSelectionBindings() {
+    ensureBatchSelectionBinding(BATCH_SCOPE_GENERAL);
+    ensureBatchSelectionBinding(BATCH_SCOPE_PROJECT);
+  }
+
+  function getBatchSelectionSnapshot(scope) {
+    const state = getBatchSelectionState(scope);
+    if (!state) {
+      return [];
+    }
+    return Array.from(state.selectedConversations.values())
+      .sort((a, b) => a.selectionOrder - b.selectionOrder)
+      .map((item) => ({
+        conversationId: item.conversationId,
+        title: item.title,
+        hrefPath: item.hrefPath
+      }));
+  }
+
+  function freezeBatchTargets(snapshot) {
+    return Object.freeze(
+      snapshot.map((item) =>
+        Object.freeze({
+          conversationId: item.conversationId,
+          title: item.title,
+          hrefPath: item.hrefPath
+        })
+      )
+    );
+  }
+
+  function clampBatchProgress(value) {
+    return Math.min(1, Math.max(0, Number(value) || 0));
+  }
+
+  function updateBatchItemRuntime(scope, conversationId, patch, { renderControls = false } = {}) {
+    const state = getBatchSelectionState(scope);
+    if (!state) {
+      return;
+    }
+    const current = state.itemRuntime.get(conversationId) || {
+      status: BATCH_ITEM_PENDING,
+      stage: 'pending',
+      progress: 0,
+      progressMode: 'indeterminate',
+      error: null
+    };
+    const next = { ...current, ...patch };
+    next.progress = clampBatchProgress(next.progress);
+    state.itemRuntime.set(conversationId, next);
+    syncSingleBatchConversationRow(scope, conversationId);
+    if (renderControls) {
+      renderBatchControls();
+    }
+  }
+
+  function createBatchTransferProgressHandler(scope, conversationId, start, end, stage) {
+    const span = Math.max(0, end - start);
+    return ({ loaded, total, lengthComputable }) => {
+      const state = getBatchSelectionState(scope);
+      const current = state?.itemRuntime.get(conversationId);
+      if (
+        !state ||
+        !hasActiveBatchSession(state) ||
+        !current ||
+        current.status !== BATCH_ITEM_EXPORTING
+      ) {
+        return;
+      }
+      if (lengthComputable && total > 0) {
+        const ratio = Math.min(1, Math.max(0, loaded / total));
+        updateBatchItemRuntime(scope, conversationId, {
+          stage,
+          progress: start + span * ratio,
+          progressMode: 'determinate'
+        });
+      } else {
+        updateBatchItemRuntime(scope, conversationId, {
+          stage,
+          progress: Math.max(current.progress || 0, start),
+          progressMode: 'indeterminate'
+        });
+      }
+    };
+  }
+
+  function applyBatchExportStage(scope, conversationId, stage) {
+    const stages = {
+      'conversation-start': BATCH_PROGRESS_CONVERSATION_START,
+      'conversation-ready': BATCH_PROGRESS_CONVERSATION_END,
+      'textdocs-start': BATCH_PROGRESS_TEXTDOCS_START,
+      'textdocs-ready': BATCH_PROGRESS_TEXTDOCS_END,
+      'raw-build': BATCH_PROGRESS_HANDOFF_BUILD,
+      'raw-ready': BATCH_PROGRESS_HANDOFF_READY,
+      'handoff-build': BATCH_PROGRESS_HANDOFF_BUILD,
+      'handoff-ready': BATCH_PROGRESS_HANDOFF_READY
+    };
+    const progress = stages[stage];
+    if (!Number.isFinite(progress)) {
+      return;
+    }
+    updateBatchItemRuntime(scope, conversationId, {
+      stage,
+      progress,
+      progressMode: 'indeterminate'
+    });
+  }
+
+  function summarizeBatchError(error) {
+    const message = toErrorMessage(error).replace(/\s+/g, ' ').trim();
+    return message.length <= 700 ? message : `${message.slice(0, 697)}…`;
+  }
+
+  function isSystemicBatchFailure(error) {
+    const message = toErrorMessage(error);
+    return (
+      /\bHTTP\s+(401|403)\b/i.test(message) ||
+      /無法取得[^。]*request context/i.test(message) ||
+      /缺少[^。]*request context/i.test(message) ||
+      /目前無法取得此對話的[^。]*請求資訊/i.test(message)
+    );
+  }
+
+  function releaseBatchConversationLargeData(conversationId) {
+    capturedRawByConversationId.delete(conversationId);
+  }
+
+  function buildBatchZipFilename(scope, exportKind, timestamp) {
+    const scopeLabel = scope === BATCH_SCOPE_PROJECT ? '專案聊天' : '一般聊天';
+    const kindLabel = exportKind === BATCH_EXPORT_RAW ? '原始JSON' : '交接JSON';
+    return `ChatGPT-${scopeLabel}-批次${kindLabel}-${timestamp}.zip`;
+  }
+
+  function buildBatchManifest({ scope, exportKind, startedAt, finishedAt, zipFilename, results }) {
+    const success = results.filter((x) => x.status === BATCH_ITEM_SUCCESS).length;
+    const failed = results.filter((x) => x.status === BATCH_ITEM_FAILED).length;
+    const skipped = results.filter((x) => x.status === BATCH_ITEM_SKIPPED).length;
+    return JSON.stringify({
+      schema_version: 1,
+      export_type: exportKind,
+      scope,
+      generated_at: new Date(finishedAt).toISOString(),
+      started_at: new Date(startedAt).toISOString(),
+      finished_at: new Date(finishedAt).toISOString(),
+      zip: {
+        filename: zipFilename,
+        format: 'zip',
+        compression: 'store',
+        compression_method: 0
+      },
+      total: results.length,
+      success,
+      failed,
+      skipped,
+      items: results.map((item) => ({
+        conversation_id: item.conversationId,
+        title: item.title,
+        href_path: item.hrefPath,
+        status: item.status,
+        files: (item.files || []).map((file) => ({
+          kind: file.kind,
+          filename: file.filename,
+          bytes: file.bytes
+        })),
+        textdoc_count: Number.isInteger(item.textdocCount) ? item.textdocCount : null,
+        error: item.error || null
+      }))
+    }, null, 4);
+  }
+
+  function createStoredPayloadFile(kind, payload) {
+    return {
+      kind,
+      filename: payload.filename,
+      text: payload.text,
+      bytes: getUtf8ByteLength(payload.text)
+    };
+  }
+
+  function clearCommittedDraftTargets(state, targets) {
+    for (const target of targets) {
+      state.selectedConversations.delete(target.conversationId);
+      state.manuallyExcludedIds.delete(target.conversationId);
+    }
+    state.rangeAnchorConversationId = null;
+  }
+
+  function commitTargetsToBatchSession(scope, exportKind, targets) {
+    const state = getBatchSelectionState(scope);
+    if (
+      !state ||
+      targets.length === 0 ||
+      ![BATCH_EXPORT_RAW, BATCH_EXPORT_HANDOFF].includes(exportKind)
+    ) {
+      return false;
+    }
+
+    if (!hasActiveBatchSession(state)) {
+      state.exportKind = exportKind;
+      state.sessionStartedAt = Date.now();
+      state.sessionUpdatedAt = state.sessionStartedAt;
+      state.sessionBlockedReason = '';
+      state.zipFilename = buildBatchZipFilename(
+        scope,
+        exportKind,
+        getTimestampString(new Date(state.sessionStartedAt))
+      );
+    } else if (state.exportKind !== exportKind) {
+      return false;
+    }
+
+    const added = [];
+    for (const target of targets) {
+      if (state.sessionConversationIds.has(target.conversationId)) {
+        continue;
+      }
+      state.sessionConversationIds.add(target.conversationId);
+      state.sessionTargets.push(target);
+      state.pendingQueue.push(target);
+      state.itemRuntime.set(target.conversationId, {
+        status: BATCH_ITEM_PENDING,
+        stage: 'pending',
+        progress: 0,
+        progressMode: 'indeterminate',
+        error: null
+      });
+      added.push(target);
+    }
+
+    if (added.length === 0) {
+      return false;
+    }
+
+    clearCommittedDraftTargets(state, added);
+    state.phase = BATCH_PHASE_SESSION;
+    state.sessionUpdatedAt = Date.now();
+
+    const context = getBatchUiContext(scope);
+    if (context?.listRoot) {
+      bindBatchSelectionList(context);
+    }
+    syncBatchConversationRows(scope);
+    renderBatchControls();
+    ensureBatchSessionWorker(scope);
+    return true;
+  }
+
+  function storeSuccessfulBatchPayload(state, target, buildResult) {
+    const files = [];
+    if (state.exportKind === BATCH_EXPORT_RAW) {
+      files.push(createStoredPayloadFile('conversation', buildResult.rawPayload));
+      if (buildResult.textdocsPayload) {
+        files.push(createStoredPayloadFile('textdocs', buildResult.textdocsPayload));
+      }
+    } else {
+      files.push(createStoredPayloadFile('handoff', buildResult.handoffPayload));
+    }
+
+    state.completedPayloads.set(target.conversationId, { files });
+    state.sessionResults.set(target.conversationId, {
+      conversationId: target.conversationId,
+      title: target.title,
+      hrefPath: target.hrefPath,
+      status: BATCH_ITEM_SUCCESS,
+      files: files.map((file) => ({
+        kind: file.kind,
+        filename: file.filename,
+        bytes: file.bytes
+      })),
+      textdocCount: buildResult.textdocCount,
+      transport: buildResult.transport || null,
+      error: null
+    });
+  }
+
+  function markRemainingQueueSkipped(state, reason) {
+    for (const target of state.pendingQueue.splice(0)) {
+      updateBatchItemRuntime(state.scope, target.conversationId, {
+        status: BATCH_ITEM_SKIPPED,
+        stage: 'skipped',
+        progress: 0,
+        progressMode: 'indeterminate',
+        error: reason
+      });
+      state.sessionResults.set(target.conversationId, {
+        conversationId: target.conversationId,
+        title: target.title,
+        hrefPath: target.hrefPath,
+        status: BATCH_ITEM_SKIPPED,
+        files: [],
+        textdocCount: null,
+        transport: null,
+        error: reason
+      });
+    }
+  }
+
+  function getNextBatchRequestScope() {
+    const scopes = [BATCH_SCOPE_GENERAL, BATCH_SCOPE_PROJECT];
+    const startIndex = batchRequestSchedulerLastScope === BATCH_SCOPE_GENERAL
+      ? 1
+      : 0;
+
+    for (let offset = 0; offset < scopes.length; offset += 1) {
+      const scope = scopes[(startIndex + offset) % scopes.length];
+      const state = getBatchSelectionState(scope);
+      if (
+        state &&
+        hasActiveBatchSession(state) &&
+        state.phase !== BATCH_PHASE_PACKAGING &&
+        !state.workerRunning &&
+        !state.sessionBlockedReason &&
+        state.pendingQueue.length > 0
+      ) {
+        return scope;
+      }
+    }
+    return null;
+  }
+
+  function hasPendingBatchRequestWork() {
+    return [BATCH_SCOPE_GENERAL, BATCH_SCOPE_PROJECT].some((scope) => {
+      const state = getBatchSelectionState(scope);
+      return Boolean(
+        state &&
+        hasActiveBatchSession(state) &&
+        state.phase !== BATCH_PHASE_PACKAGING &&
+        !state.sessionBlockedReason &&
+        state.pendingQueue.length > 0
+      );
+    });
+  }
+
+  async function processSingleBatchSessionTarget(scope) {
+    const state = getBatchSelectionState(scope);
+    if (
+      !state ||
+      !hasActiveBatchSession(state) ||
+      state.workerRunning ||
+      state.pendingQueue.length === 0 ||
+      state.sessionBlockedReason
+    ) {
+      return;
+    }
+
+    const target = state.pendingQueue.shift();
+    if (!target) return;
+
+    state.workerRunning = true;
+    state.currentConversationId = target.conversationId;
+    state.phase = BATCH_PHASE_SESSION;
+    updateBatchItemRuntime(scope, target.conversationId, {
+      status: BATCH_ITEM_EXPORTING,
+      stage: 'prepare',
+      progress: 0.01,
+      progressMode: 'indeterminate',
+      error: null
+    }, { renderControls: true });
+
+    try {
+      const options = {
+        onStage(stage) {
+          applyBatchExportStage(scope, target.conversationId, stage);
+        },
+        onConversationProgress: createBatchTransferProgressHandler(
+          scope,
+          target.conversationId,
+          BATCH_PROGRESS_CONVERSATION_START,
+          BATCH_PROGRESS_CONVERSATION_END,
+          'conversation-transfer'
+        ),
+        onTextdocsProgress: createBatchTransferProgressHandler(
+          scope,
+          target.conversationId,
+          BATCH_PROGRESS_TEXTDOCS_START,
+          BATCH_PROGRESS_TEXTDOCS_END,
+          'textdocs-transfer'
+        )
+      };
+
+      const buildResult = state.exportKind === BATCH_EXPORT_RAW
+        ? await createRawPayloadForConversationId(target.conversationId, options)
+        : await createHandoffPayloadForConversationId(
+          target.conversationId,
+          { enforceCurrentPage: false, ...options }
+        );
+
+      if (!state.removedWhileProcessingIds.has(target.conversationId)) {
+        storeSuccessfulBatchPayload(state, target, buildResult);
+        updateBatchItemRuntime(scope, target.conversationId, {
+          status: BATCH_ITEM_SUCCESS,
+          stage: 'complete',
+          progress: 1,
+          progressMode: 'determinate',
+          error: null
+        });
+      }
+    } catch (error) {
+      const errorMessage = summarizeBatchError(error);
+      const removed = state.removedWhileProcessingIds.has(target.conversationId);
+
+      if (!removed) {
+        updateBatchItemRuntime(scope, target.conversationId, {
+          status: BATCH_ITEM_FAILED,
+          stage: 'failed',
+          progress: state.itemRuntime.get(target.conversationId)?.progress || 0,
+          progressMode: 'indeterminate',
+          error: errorMessage
+        });
+        state.sessionResults.set(target.conversationId, {
+          conversationId: target.conversationId,
+          title: target.title,
+          hrefPath: target.hrefPath,
+          status: BATCH_ITEM_FAILED,
+          files: [],
+          textdocCount: null,
+          transport: null,
+          error: errorMessage
+        });
+      }
+
+      if (isSystemicBatchFailure(error)) {
+        state.sessionBlockedReason = errorMessage;
+        resetBatchDraftSelection(state);
+        markRemainingQueueSkipped(
+          state,
+          '因此批次的 request context / 驗證狀態失效而未處理。'
+        );
+      }
+    } finally {
+      releaseBatchConversationLargeData(target.conversationId);
+
+      if (state.removedWhileProcessingIds.delete(target.conversationId)) {
+        state.itemRuntime.delete(target.conversationId);
+        state.completedPayloads.delete(target.conversationId);
+        state.sessionResults.delete(target.conversationId);
+      }
+
+      state.workerRunning = false;
+      state.currentConversationId = null;
+      state.sessionUpdatedAt = Date.now();
+      syncSingleBatchConversationRow(scope, target.conversationId);
+      renderBatchControls();
+    }
+  }
+
+  async function runBatchRequestScheduler() {
+    if (batchRequestSchedulerRunning) return;
+    batchRequestSchedulerRunning = true;
+    try {
+      while (true) {
+        const scope = getNextBatchRequestScope();
+        if (!scope) break;
+        batchRequestSchedulerLastScope = scope;
+        await processSingleBatchSessionTarget(scope);
+      }
+    } finally {
+      batchRequestSchedulerRunning = false;
+      renderBatchControls();
+      if (hasPendingBatchRequestWork()) {
+        window.queueMicrotask(() => ensureBatchSessionWorker());
+      }
+    }
+  }
+
+  function ensureBatchSessionWorker() {
+    if (batchRequestSchedulerRunning || !hasPendingBatchRequestWork()) {
+      return;
+    }
+    void runBatchRequestScheduler();
+  }
+
+  function buildBatchCompletionSummary(state, results, zipFilename, zipBytes) {
+    const success = results.filter((x) => x.status === BATCH_ITEM_SUCCESS).length;
+    const failed = results.filter((x) => x.status === BATCH_ITEM_FAILED).length;
+    const skipped = results.filter((x) => x.status === BATCH_ITEM_SKIPPED).length;
+    return [
+      '批次打包完成。',
+      '',
+      `類型：${getBatchExportKindLabel(state.exportKind)}`,
+      `成功：${success}`,
+      `失敗：${failed}`,
+      `未處理：${skipped}`,
+      '',
+      `ZIP：${zipFilename}`,
+      `ZIP 大小：${zipBytes.toLocaleString()} bytes`,
+      '壓縮方式：STORE（不壓縮）'
+    ].join('\n');
+  }
+
+  function cleanupPackagedBatchSession(scope, lastBatchResults) {
+    const state = getBatchSelectionState(scope);
+    if (!state) {
+      return;
+    }
+    detachBatchSelectionListBinding(scope);
+    clearBatchConversationRowDecorations(scope);
+    removeBatchConfirmationDialog();
+    removeCancelBatchJobDialog();
+    resetBatchDraftSelection(state);
+    resetBatchSessionState(state, { preserveLastResults: true });
+    state.lastBatchResults = lastBatchResults;
+    state.phase = BATCH_PHASE_IDLE;
+    state.routePathname = null;
+
+    renderBatchControls();
+  }
+
+  async function packageBatchSession(scope) {
+    const state = getBatchSelectionState(scope);
+    if (!state || !canPackageBatchSession(state)) {
+      return;
+    }
+
+    state.phase = BATCH_PHASE_PACKAGING;
+    renderBatchControls();
+
+    try {
+      const zipBuilder = createStoredZipBuilder();
+
+      for (const target of state.sessionTargets) {
+        const result = state.sessionResults.get(target.conversationId);
+        if (!result || result.status !== BATCH_ITEM_SUCCESS) {
+          continue;
+        }
+
+        const payload = state.completedPayloads.get(target.conversationId);
+        if (!payload) {
+          throw new Error(
+            `打包失敗：缺少已完成對話 ${target.conversationId} 的記憶體 payload。`
+          );
+        }
+
+        const checkpoint = zipBuilder.createCheckpoint();
+        try {
+          const actualFiles = [];
+          for (const file of payload.files) {
+            const zipFile = zipBuilder.addTextFile(file.filename, file.text);
+            actualFiles.push({
+              kind: file.kind,
+              filename: zipFile.filename,
+              bytes: zipFile.bytes
+            });
+          }
+          result.files = actualFiles;
+        } catch (error) {
+          zipBuilder.rollback(checkpoint);
+          throw error;
+        }
+      }
+
+      const finishedAt = Date.now();
+      const results = getBatchSessionResultArray(state);
+      const manifestText = buildBatchManifest({
+        scope,
+        exportKind: state.exportKind,
+        startedAt: state.sessionStartedAt,
+        finishedAt,
+        zipFilename: state.zipFilename,
+        results
+      });
+      zipBuilder.addTextFile('batch-manifest.json', manifestText, new Date(finishedAt));
+
+      const zipBlob = zipBuilder.finalize();
+      const zipBytes = zipBlob.size;
+      downloadBlobFile(zipBlob, state.zipFilename);
+
+      const lastBatchResults = Object.freeze({
+        scope,
+        exportKind: state.exportKind,
+        zipFilename: state.zipFilename,
+        zipBytes,
+        startedAt: state.sessionStartedAt,
+        finishedAt,
+        total: state.sessionTargets.length,
+        results: Object.freeze(
+          results.map((item) =>
+            Object.freeze({
+              ...item,
+              files: Object.freeze(
+                (item.files || []).map((file) => Object.freeze({ ...file }))
+              )
+            })
+          )
+        )
+      });
+
+      const summary = buildBatchCompletionSummary(
+        state,
+        results,
+        state.zipFilename,
+        zipBytes
+      );
+
+      await new Promise((resolve) => {
+        window.requestAnimationFrame(() => window.requestAnimationFrame(resolve));
+      });
+      alert(summary);
+      cleanupPackagedBatchSession(scope, lastBatchResults);
+    } catch (error) {
+      state.phase = BATCH_PHASE_SESSION;
+      renderBatchControls();
+      alert(
+        '批次打包失敗。\n\n' +
+        `${summarizeBatchError(error)}\n\n` +
+        '目前 session 與已取得資料仍保留在頁面記憶體中；' +
+        '你可以再次嘗試打包，或使用「取消批次下載作業」重新整理頁面。'
+      );
+    }
+  }
+
+  function createBatchDialogShell({ id, titleText, testId }) {
+    const overlay = document.createElement('div');
+    overlay.id = id;
+    overlay.setAttribute('data-ignore-for-page-load', 'true');
+    if (testId) {
+      overlay.setAttribute('data-testid', testId);
+    }
+    overlay.className = 'absolute inset-0';
+    overlay.setAttribute(
+      'data-cgpt-batch-dialog-shell',
+      'true'
+    );
+    setBatchMotionStateImmediately(
+      overlay,
+      false
+    );
+
+    const backdrop = document.createElement('div');
+    backdrop.setAttribute('data-state', 'open');
+    backdrop.setAttribute(
+      'data-cgpt-batch-dialog-backdrop',
+      'true'
+    );
+    backdrop.className =
+      'fixed inset-0 z-50 before:absolute before:inset-0 before:bg-gray-200/50 before:backdrop-blur-[1px] dark:before:bg-black/50';
+
+    const grid = document.createElement('div');
+    grid.className =
+      'z-50 h-full w-full overflow-y-auto keyboard-open:h-[calc(100%-var(--screen-keyboard-height,0px))] grid grid-cols-[10px_1fr_10px] grid-rows-[minmax(10px,1fr)_auto_minmax(10px,1fr)] md:grid-rows-[minmax(20px,0.8fr)_auto_minmax(20px,1fr)]';
+
+    const dialog = document.createElement('div');
+    dialog.setAttribute('role', 'dialog');
+    dialog.setAttribute('aria-modal', 'true');
+    dialog.setAttribute('data-state', 'open');
+    dialog.setAttribute(
+      'data-cgpt-batch-dialog-surface',
+      'true'
+    );
+    dialog.className =
+      'popover bg-token-bg-primary relative col-auto col-start-2 row-auto row-start-2 h-full text-start start-1/2 ltr:-translate-x-1/2 rtl:translate-x-1/2 rounded-2xl shadow-long flex flex-col focus:outline-hidden overflow-hidden';
+    dialog.style.width = 'max(40vw, 36rem)';
+    dialog.style.maxWidth = 'calc(100vw - 2rem)';
+    dialog.tabIndex = -1;
+
+    const titleId = `${id}-title`;
+    dialog.setAttribute('aria-labelledby', titleId);
+
+    const header = document.createElement('header');
+    header.className = 'min-h-header-height flex justify-between p-2.5 ps-4 select-none';
+    header.innerHTML = `
+      <div class="flex max-w-full items-center">
+        <div class="flex max-w-full min-w-0 grow flex-col">
+          <h2 id="${titleId}" class="text-token-text-primary text-lg font-normal"></h2>
+        </div>
+      </div>
+      <div class="flex h-[max-content] items-center gap-2"></div>
+    `;
+    header.querySelector('h2').textContent = titleText;
+
+    const body = document.createElement('div');
+    body.className = 'grow overflow-y-auto p-4 pt-1';
+
+    dialog.append(header, body);
+    grid.append(dialog);
+    backdrop.append(grid);
+    overlay.append(backdrop);
+    document.body.append(overlay);
+
+    const shell = {
+      overlay,
+      backdrop,
+      dialog,
+      body,
+      closing: false
+    };
+
+    transitionBatchMotionState(
+      overlay,
+      true,
+      {
+        transitionElement: dialog,
+        transitionProperty: 'opacity',
+        onSettled: () => {
+          if (dialog.isConnected) {
+            dialog.focus();
+          }
+        }
+      }
+    );
+
+    return shell;
+  }
+
+  function closeBatchDialogShell(
+    shell,
+    onClosed = null
+  ) {
+    if (
+      !shell?.overlay ||
+      shell.closing
+    ) {
+      return;
+    }
+
+    shell.closing = true;
+    transitionBatchMotionState(
+      shell.overlay,
+      false,
+      {
+        transitionElement: shell.dialog,
+        transitionProperty: 'opacity',
+        onSettled: () => {
+          clearBatchMotionLifecycle(
+            shell.overlay
+          );
+          shell.overlay.remove();
+          if (typeof onClosed === 'function') {
+            onClosed();
+          }
+        }
+      }
+    );
+  }
+
+  function createBatchDialogButton(
+    label,
+    { primary = false, white = false, danger = false, iconSvg = '' } = {}
+  ) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = [
+      'btn',
+      'relative',
+      'group-focus-within/dialog:focus-visible:[outline-width:1.5px]',
+      'group-focus-within/dialog:focus-visible:[outline-offset:2.5px]',
+      'group-focus-within/dialog:focus-visible:[outline-style:solid]',
+      'group-focus-within/dialog:focus-visible:[outline-color:var(--text-primary)]',
+      primary ? 'btn-primary' : 'btn-secondary'
+    ].join(' ');
+    if (white) {
+      button.setAttribute('data-cgpt-batch-dialog-download', 'true');
+    }
+    if (danger) {
+      button.setAttribute('data-cgpt-batch-dialog-danger', 'true');
+    }
+    button.innerHTML =
+      `<div class="flex items-center justify-center gap-2">${iconSvg}<span>${label}</span></div>`;
+    return button;
+  }
+
+  function showBatchConfirmationDialog(scope) {
+    const state = getBatchSelectionState(scope);
+    if (!state || !isBatchSelectionEditableState(state)) {
+      return;
+    }
+    const snapshot = getBatchSelectionSnapshot(scope);
+    if (snapshot.length === 0) {
+      alert('尚未選取任何對話。');
+      return;
+    }
+
+    const sessionActive = hasActiveBatchSession(state);
+    state.phase = BATCH_PHASE_CONFIRMING;
+    renderBatchControls();
+    removeBatchConfirmationDialog();
+
+    const shell = createBatchDialogShell({
+      id: BATCH_DIALOG_ID,
+      titleText: sessionActive ? '確認追加批次匯出' : '確認批次匯出',
+      testId: 'modal-cgpt-batch-export-confirmation'
+    });
+    shell.overlay.setAttribute('data-cgpt-batch-export-dialog', 'true');
+
+    const intro = document.createElement('p');
+    intro.className = 'text-token-text-primary';
+    intro.textContent = sessionActive
+      ? `準備追加 ${snapshot.length} 個對話：`
+      : `已選取 ${snapshot.length} 個對話：`;
+
+    const list = document.createElement('ol');
+    list.setAttribute('data-cgpt-batch-dialog-list', 'true');
+    list.className = 'mt-3 list-decimal space-y-2 ps-6 text-sm';
+    for (const item of snapshot) {
+      const listItem = document.createElement('li');
+      listItem.className = 'text-token-text-primary';
+      const link = document.createElement('a');
+      link.href = new URL(item.hrefPath, location.origin).href;
+      link.target = '_blank';
+      link.rel = 'noopener noreferrer';
+      link.className =
+        'text-token-text-primary underline decoration-token-text-tertiary underline-offset-2 hover:text-token-text-secondary';
+      link.textContent = item.title || item.conversationId;
+      link.setAttribute(
+        'aria-label',
+        `在新分頁開啟對話：${item.title || item.conversationId}`
+      );
+      listItem.append(link);
+      list.append(listItem);
+    }
+
+    const actions = document.createElement('div');
+    actions.className =
+      'mt-5 flex w-full items-center justify-between gap-4 text-sm select-none sm:mt-4';
+    const cancelButton = createBatchDialogButton('取消');
+    const rightActions = document.createElement('div');
+    rightActions.className = 'flex items-center justify-end gap-3';
+
+    const resumePhase = sessionActive ? BATCH_PHASE_SESSION : BATCH_PHASE_SELECTING;
+    const closeDialog = ({ resumeSelection = true } = {}) => {
+      closeBatchDialogShell(
+        shell,
+        () => {
+          if (
+            resumeSelection &&
+            state.phase === BATCH_PHASE_CONFIRMING
+          ) {
+            state.phase = resumePhase;
+            renderBatchControls();
+          }
+        }
+      );
+    };
+    cancelButton.addEventListener('click', () => closeDialog());
+
+    const targets = freezeBatchTargets(snapshot);
+    if (!sessionActive) {
+      const rawButton = createBatchDialogButton(
+        '批次下載原始 JSON',
+        { white: true, iconSvg: RAW_JSON_ICON_SVG }
+      );
+      const handoffButton = createBatchDialogButton(
+        '批次下載交接 JSON',
+        { white: true, iconSvg: HANDOFF_ICON_SVG }
+      );
+      const start = (kind) => {
+        const added = commitTargetsToBatchSession(scope, kind, targets);
+        if (!added) {
+          closeDialog();
+          return;
+        }
+        closeDialog({ resumeSelection: false });
+      };
+      rawButton.addEventListener('click', () => start(BATCH_EXPORT_RAW));
+      handoffButton.addEventListener('click', () => start(BATCH_EXPORT_HANDOFF));
+      rightActions.append(rawButton, handoffButton);
+    } else {
+      const kind = state.exportKind;
+      const addButton = createBatchDialogButton(
+        `加入批次${getBatchExportKindLabel(kind)}`,
+        {
+          white: true,
+          iconSvg: kind === BATCH_EXPORT_RAW ? RAW_JSON_ICON_SVG : HANDOFF_ICON_SVG
+        }
+      );
+      addButton.addEventListener('click', () => {
+        const added = commitTargetsToBatchSession(scope, kind, targets);
+        if (!added) {
+          closeDialog();
+          return;
+        }
+        closeDialog({ resumeSelection: false });
+      });
+      rightActions.append(addButton);
+    }
+
+    shell.backdrop.addEventListener('mousedown', (event) => {
+      if (!(event.target instanceof Node) || shell.dialog.contains(event.target)) {
+        return;
+      }
+      closeDialog();
+    });
+    shell.overlay.addEventListener('keydown', (event) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        closeDialog();
+      }
+    });
+
+    actions.append(cancelButton, rightActions);
+    shell.body.append(intro, list, actions);
+  }
+
+  function showCancelBatchJobDialog(scope) {
+    const state = getBatchSelectionState(scope);
+    if (!state || !hasActiveBatchSession(state)) {
+      return;
+    }
+    removeCancelBatchJobDialog();
+
+    const shell = createBatchDialogShell({
+      id: BATCH_CANCEL_JOB_DIALOG_ID,
+      titleText: '取消批次下載作業',
+      testId: 'modal-cgpt-batch-cancel-job-confirmation'
+    });
+
+    const message = document.createElement('p');
+    message.className = 'text-token-text-primary';
+    message.textContent =
+      '確認取消後會直接重新整理目前網頁。尚未打包的批次資料、佇列與目前頁面中的批次作業狀態都會被清除。';
+
+    const actions = document.createElement('div');
+    actions.className =
+      'mt-5 flex w-full items-center justify-between gap-4 text-sm select-none sm:mt-4';
+    const backButton = createBatchDialogButton('返回');
+    const confirmButton = createBatchDialogButton(
+      '確認取消並重新整理',
+      { danger: true, iconSvg: BATCH_STOP_ICON_SVG }
+    );
+
+    const closeDialog = () => {
+      closeBatchDialogShell(shell);
+    };
+    backButton.addEventListener('click', closeDialog);
+    confirmButton.addEventListener('click', () => {
+      allowBatchUnloadOnce = true;
+      try {
+        window.location.reload();
+      } catch (error) {
+        allowBatchUnloadOnce = false;
+        syncBatchBeforeUnloadGuard();
+        throw error;
+      }
+    });
+
+    shell.backdrop.addEventListener('mousedown', (event) => {
+      if (!(event.target instanceof Node) || shell.dialog.contains(event.target)) {
+        return;
+      }
+      closeDialog();
+    });
+    shell.overlay.addEventListener('keydown', (event) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        closeDialog();
+      }
+    });
+
+    actions.append(backButton, confirmButton);
+    shell.body.append(message, actions);
+  }
+  function disconnectBatchProjectTabObserver() {
+    if (batchProjectTabObserver) {
+      batchProjectTabObserver.disconnect();
+    }
+    batchProjectTabObserver = null;
+    batchProjectObservedTablist = null;
+  }
+  function ensureBatchProjectTabObserver() {
+    const context = findProjectBatchUiContext();
+    if (!context?.tablist) {
+      disconnectBatchProjectTabObserver();
+      return;
+    }
+    if (batchProjectObservedTablist === context.tablist && batchProjectTabObserver) {
+      return;
+    }
+    disconnectBatchProjectTabObserver();
+    batchProjectObservedTablist = context.tablist;
+    batchProjectTabObserver = new MutationObserver(() => {
+      /*
+       * 只監看專案 tab 的 active state。
+       * 尚未建立 session 時切到「資料來源」會退出批次選取模式；
+       * session 建立後不因 tab 切換而取消，回到「聊天」時可繼續追加或打包。
+       */
+      ensureAllBatchSelectionBindings();
+      renderBatchControls();
+    });
+    batchProjectTabObserver.observe(context.tablist, {
+      subtree: true,
+      attributes: true,
+      attributeFilter: ['data-state', 'aria-selected']
+    });
+  }
+  /*
+   * 低頻 UI 維護：確保一般側邊欄與專案頁的批次入口存在，
+   * 並在 selection / session 狀態中重新綁定被 React 重建的列表。
+   */
+  function ensureBatchUi() {
+    ensureBatchSelectionStyles();
+    ensureBatchProjectTabObserver();
+    ensureAllBatchSelectionBindings();
+    renderBatchControls();
+  }
+
   /*
    * 偵測 SPA path 是否改變。
    */
@@ -4251,11 +8459,29 @@
     if (location.pathname === lastPathname) {
       return;
     }
+    for (const scope of [BATCH_SCOPE_GENERAL, BATCH_SCOPE_PROJECT]) {
+      const state = getBatchSelectionState(scope);
+      if (
+        state &&
+        !hasActiveBatchSession(state) &&
+        (
+          state.phase === BATCH_PHASE_SELECTING ||
+          state.phase === BATCH_PHASE_CONFIRMING
+        )
+      ) {
+        cancelBatchSelectionMode(scope, { silent: true });
+      }
+      /*
+       * 已建立的 session 不因 SPA route change 軟取消。
+       * 若要中止，使用「取消批次下載作業」並在確認後重新整理頁面。
+       */
+    }
     lastPathname = location.pathname;
     activeExportState = null;
     setAllButtonsBusy(false);
     updateButtonState();
     ensureButtonsSoon();
+    ensureBatchUi();
   }
   /*
    * 包裝 history.pushState / replaceState。
@@ -4298,6 +8524,7 @@
       } else {
         removeButtonsIfNeeded();
       }
+      ensureBatchUi();
     }, 1000);
   }
   /*
@@ -4331,6 +8558,7 @@
     installHistoryListener();
     installTitleObserver();
     ensureButtonsSoon();
+    ensureBatchUi();
     startLightPolling();
   }
   // ============================================================
