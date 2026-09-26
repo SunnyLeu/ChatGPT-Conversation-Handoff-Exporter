@@ -2,9 +2,9 @@
 // @name         ChatGPT 對話 JSON 與交接檔匯出工具
 // @name:en      ChatGPT Conversation Handoff Exporter
 // @namespace    https://github.com/SunnyLeu/ChatGPT-Conversation-Handoff-Exporter
-// @version      1.5.3
-// @description  匯出 ChatGPT raw / handoff JSON；handoff v2 採 Structure-first / Preserve-on-unknown 完整保留交接文字，並支援受控批次原始、交接與完整 JSON session。
-// @description:en Export ChatGPT raw / handoff JSON; handoff v2 uses structure-first, preserve-on-unknown semantics and supports controlled raw, handoff, and complete batch sessions.
+// @version      1.5.9
+// @description  匯出 ChatGPT raw / handoff / complete JSON；handoff v2 採 Structure-first / Preserve-on-unknown 完整保留交接文字，並支援受控批次原始、交接與完整 JSON session。
+// @description:en Export ChatGPT raw / handoff / complete JSON; handoff v2 uses structure-first, preserve-on-unknown semantics and supports controlled raw, handoff, and complete batch sessions.
 // @author       SunnyLeu
 // @license      MIT
 // @homepageURL  https://github.com/SunnyLeu/ChatGPT-Conversation-Handoff-Exporter
@@ -22,9 +22,10 @@
  * 這是一個 Tampermonkey / Userscript 腳本。
  *
  * 主要用途：
- *   1. 在 ChatGPT 對話頁右上角新增兩個按鈕：
+ *   1. 在 ChatGPT 對話頁右上角新增三個按鈕：
  *      -「下載原始 JSON」
  *      -「下載交接 JSON」
+ *      -「下載完整 JSON」
  *
  *   2.「下載原始 JSON」會匯出目前對話的 raw conversation JSON。
  *
@@ -32,7 +33,11 @@
  *      適合上傳到新 ChatGPT 對話接續前情的 handoff JSON；schema v2
  *      會保留附件、回覆 / 來源關聯、可理解的推理摘要、結構化執行狀態與原始可讀工具文字。
  *
- *   4. 一般聊天側邊欄與專案聊天列表提供受控批次 raw / handoff / complete 功能：
+ *   4.「下載完整 JSON」會以同一份 authoritative conversation / textdocs snapshot
+ *      依序下載 raw conversation JSON、可用的 textdocs JSON 與 handoff JSON；
+ *      單一對話完整匯出不建立 ZIP，也不壓縮檔案。
+ *
+ *   5. 一般聊天側邊欄與專案聊天列表提供受控批次 raw / handoff / complete 功能：
  *      使用者可在同一個批次 session 中多次選取並追加 conversation 到佇列；
  *      資料取得完成後仍保留在目前頁面記憶體，只有使用者按下「打包」時，
  *      才以 ZIP STORE（不壓縮）封裝並下載。
@@ -79,7 +84,7 @@
    *   - 多次包裝 window.fetch
    *   - 重複的 timer / listener
    */
-  const INSTALL_FLAG = '__chatgptConversationHandoffExporterInstalled_v153';
+  const INSTALL_FLAG = '__chatgptConversationHandoffExporterInstalled_v159';
   /*
    * 匯出按鈕事件綁定標記。
    *
@@ -87,7 +92,7 @@
    * click listener 是否屬於目前腳本，必要時重建按鈕以避免殘留
    * listener 或 conversation 狀態。
    */
-  const EXPORT_BUTTON_LISTENER_VERSION = '1.5.3';
+  const EXPORT_BUTTON_LISTENER_VERSION = '1.5.9';
   /*
    * 匯出器與 handoff schema 版本。
    *
@@ -97,7 +102,7 @@
    * HANDOFF_SCHEMA_VERSION：
    *   與 userscript 版本分離；只有 handoff 結構或語意改版時才升版。
    */
-  const EXPORTER_VERSION = '1.5.3';
+  const EXPORTER_VERSION = '1.5.9';
   const HANDOFF_SCHEMA_VERSION = '2.0';
   /*
    * Structure-first / Preserve-on-unknown：
@@ -107,16 +112,21 @@
    */
   const NORMAL_MESSAGE_STATUS = 'finished_successfully';
   /*
-   * 兩個按鈕的 DOM id。
+   * 三個單一對話匯出按鈕的 DOM id。
    *
    * raw button：
    *   下載 ChatGPT 原始 conversation JSON。
    *
    * handoff button：
    *   將原始 conversation JSON 轉換成 handoff JSON 後下載。
+   *
+   * complete button：
+   *   使用同一份 authoritative snapshot，分別下載 raw / textdocs / handoff JSON；
+   *   不建立 ZIP。
    */
   const RAW_BUTTON_ID = 'cgpt-export-raw-json-button';
   const HANDOFF_BUTTON_ID = 'cgpt-export-handoff-json-button';
+  const COMPLETE_BUTTON_ID = 'cgpt-export-complete-json-button';
   /*
    * Header action 共用 selector 與幾何量測容差。
    *
@@ -288,7 +298,7 @@
     'time'
   ]);
   /*
-   * 兩個按鈕使用的 inline SVG。
+   * 單一對話匯出按鈕使用的 inline SVG。
    *
    * 使用 inline SVG 的理由：
    *   - 不需要額外載入圖片。
@@ -307,6 +317,13 @@
           <path d="M5 4h9l5 5v11a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/>
           <path d="M14 4v5h5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
           <path d="M8 15h8M8 18h5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+        </svg>
+  `;
+  const COMPLETE_JSON_ICON_SVG = `
+        <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" aria-hidden="true" class="-ms-0.5 icon" fill="none">
+          <path d="M12 3v11" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+          <path d="m8 10 4 4 4-4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+          <path d="M5 16v2.5A2.5 2.5 0 0 0 7.5 21h9a2.5 2.5 0 0 0 2.5-2.5V16" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
         </svg>
   `;
   // ============================================================
@@ -1397,7 +1414,7 @@
     if (
       typeof currentFetch === 'function' &&
       currentFetch.__chatgptConversationHandoffExporterWrapperVersion ===
-        EXPORTER_VERSION
+      EXPORTER_VERSION
     ) {
       return;
     }
@@ -6342,11 +6359,12 @@
     }
   }
   /*
-   * 同步設定兩個匯出按鈕的 busy 狀態。
+   * 同步設定三個單一對話匯出按鈕的 busy 狀態。
    */
   function setAllButtonsBusy(isBusy) {
     setButtonBusy(RAW_BUTTON_ID, isBusy);
     setButtonBusy(HANDOFF_BUTTON_ID, isBusy);
+    setButtonBusy(COMPLETE_BUTTON_ID, isBusy);
   }
   /*
    * 標記目前有匯出流程正在進行。
@@ -6406,7 +6424,7 @@
    *   - 流程結束後恢復 UI
    *
    * 實際的 raw / handoff 匯出邏輯由 operation callback 提供，
-   * callback 可透過 updateProgress() 更新目前階段，讓兩個按鈕共用相同的 UI 狀態管理。
+   * callback 可透過 updateProgress() 更新目前階段，讓三個單一對話匯出按鈕共用相同的 UI 狀態管理。
    */
   async function runExportFlow({ buttonId, initialProgressText, errorLogMessage, operation, triggerEvent = null }) {
     const triggerButton = triggerEvent && triggerEvent.currentTarget
@@ -6452,7 +6470,7 @@
   /*
    * 建立按鈕 tooltip。
    *
-   * 兩個按鈕會使用不同 actionName，避免 title 看起來像共用同一段說明。
+   * 三個按鈕會使用不同 actionName，避免 title 看起來像共用同一段說明。
    * tooltip 只顯示對話標題、conversation ID 與捕捉時間，不顯示 headers 或 raw JSON。
    */
   function buildBaseTooltip({ actionName, conversationId, capture, replayRequest }) {
@@ -6484,24 +6502,31 @@
     if (!isConversationPage() || !conversationId) {
       setButtonConversationId(RAW_BUTTON_ID, null);
       setButtonConversationId(HANDOFF_BUTTON_ID, null);
+      setButtonConversationId(COMPLETE_BUTTON_ID, null);
       if (!isExporting) {
         setButtonText(RAW_BUTTON_ID, '下載原始 JSON');
         setButtonText(HANDOFF_BUTTON_ID, '下載交接 JSON');
+        setButtonText(COMPLETE_BUTTON_ID, '下載完整 JSON');
         setButtonTooltip(RAW_BUTTON_ID, '');
         setButtonTooltip(HANDOFF_BUTTON_ID, '');
+        setButtonTooltip(COMPLETE_BUTTON_ID, '');
         setAllButtonsBusy(false);
       }
       return;
     }
     setButtonConversationId(RAW_BUTTON_ID, conversationId);
     setButtonConversationId(HANDOFF_BUTTON_ID, conversationId);
+    setButtonConversationId(COMPLETE_BUTTON_ID, conversationId);
     if (!isExporting) {
       setButtonText(RAW_BUTTON_ID, '下載原始 JSON');
       setButtonText(HANDOFF_BUTTON_ID, '下載交接 JSON');
+      setButtonText(COMPLETE_BUTTON_ID, '下載完整 JSON');
       setAllButtonsBusy(false);
     }
     const rawActionName = '下載目前對話的原始 raw conversation JSON';
     const handoffActionName = '產出並下載目前對話的交接 handoff JSON';
+    const completeActionName =
+      '以同一份 authoritative snapshot 分別下載原始、textdocs（若有）與交接 JSON；不建立 ZIP';
     setButtonTooltip(
       RAW_BUTTON_ID,
       buildBaseTooltip({
@@ -6520,6 +6545,15 @@
         replayRequest
       })
     );
+    setButtonTooltip(
+      COMPLETE_BUTTON_ID,
+      buildBaseTooltip({
+        actionName: completeActionName,
+        conversationId,
+        capture,
+        replayRequest
+      })
+    );
   }
   /*
    * 離開對話頁時移除匯出按鈕。
@@ -6530,11 +6564,15 @@
     stopObservingHeaderActionLayout();
     const rawButton = document.querySelector(`#${RAW_BUTTON_ID}`);
     const handoffButton = document.querySelector(`#${HANDOFF_BUTTON_ID}`);
+    const completeButton = document.querySelector(`#${COMPLETE_BUTTON_ID}`);
     if (rawButton) {
       rawButton.remove();
     }
     if (handoffButton) {
       handoffButton.remove();
+    }
+    if (completeButton) {
+      completeButton.remove();
     }
     clearCurrentAppShellHeaderMarkers();
   }
@@ -6637,6 +6675,45 @@
     downloadHandoffPayload(result.handoffPayload);
   }
   /*
+   * 執行「下載完整 JSON」。
+   *
+   * 使用 createCompletePayloadForConversationId() 取得同一份 authoritative
+   * conversation / textdocs snapshot，再依序觸發三種獨立檔案下載：
+   *   - raw conversation JSON
+   *   - textdocs JSON（有內容時）
+   *   - handoff JSON
+   *
+   * 單一對話完整匯出不建立 ZIP，也不壓縮。
+   */
+  async function exportCompleteConversationFiles(conversationId, updateProgress) {
+    const result = await createCompletePayloadForConversationId(conversationId, {
+      onStage(stage) {
+        if (stage === 'conversation-start') {
+          updateProgress('正在擷取原始 JSON…');
+        } else if (stage === 'textdocs-start') {
+          updateProgress('正在擷取 textdocs…');
+        } else if (stage === 'raw-build') {
+          updateProgress('正在產出原始 JSON…');
+        } else if (stage === 'handoff-build') {
+          updateProgress('正在產出交接 JSON…');
+        } else if (stage === 'complete-ready') {
+          updateProgress('正在準備下載完整 JSON…');
+        }
+      }
+    });
+    assertConversationStillCurrent(conversationId, '下載完整 JSON 前');
+    updateProgress('正在下載原始 JSON…');
+    downloadTextFile(result.rawPayload.text, result.rawPayload.filename);
+    if (result.textdocsPayload) {
+      assertConversationStillCurrent(conversationId, '下載 textdocs 前');
+      updateProgress('正在下載 textdocs…');
+      downloadTextFile(result.textdocsPayload.text, result.textdocsPayload.filename);
+    }
+    assertConversationStillCurrent(conversationId, '下載交接 JSON 前');
+    updateProgress('正在下載交接 JSON…');
+    downloadHandoffPayload(result.handoffPayload);
+  }
+  /*
    * 點擊「下載原始 JSON」。
    *
    * raw JSON 會輸出為 4 空白縮排，方便閱讀與版本管理。
@@ -6662,6 +6739,20 @@
       initialProgressText: '正在擷取原始 JSON…',
       errorLogMessage: '下載交接 JSON 失敗。',
       operation: exportHandoffFile,
+      triggerEvent: event
+    });
+  }
+  /*
+   * 點擊「下載完整 JSON」。
+   *
+   * 三份資料分別以一般 JSON 檔下載，不經 ZIP。
+   */
+  async function handleDownloadCompleteClick(event) {
+    await runExportFlow({
+      buttonId: COMPLETE_BUTTON_ID,
+      initialProgressText: '正在擷取原始 JSON…',
+      errorLogMessage: '下載完整 JSON 失敗。',
+      operation: exportCompleteConversationFiles,
       triggerEvent: event
     });
   }
@@ -6846,15 +6937,15 @@
    * 將匯出按鈕放到 ChatGPT header 的適當位置。
    *
    * 目標順序：
-   *   分享 → 下載原始 JSON → 下載交接 JSON → 更多選單
+   *   分享 → 下載原始 JSON → 下載交接 JSON → 下載完整 JSON → 更多選單
    *
    * 使用 header action 的直接子元素作為插入錨點，避免匯出按鈕被放到
    * ChatGPT 原生按鈕的內層 wrapper 裡。
    *
-   * 若找不到分享按鈕或更多選單，仍會把兩顆匯出按鈕插入 action 容器中，
+   * 若找不到分享按鈕或更多選單，仍會把三顆匯出按鈕插入 action 容器中，
    * 避免 ChatGPT DOM 結構小幅變動時按鈕直接消失。
    */
-  function placeExportButtons(headerActions, rawButton, handoffButton) {
+  function placeExportButtons(headerActions, rawButton, handoffButton, completeButton) {
     const shareButton = findNativeShareButton(headerActions);
     const optionsButton =
       headerActions.querySelector('[data-testid="conversation-options-button"]') ||
@@ -6876,6 +6967,9 @@
     }
     if (rawButton.nextElementSibling !== handoffButton) {
       rawButton.insertAdjacentElement('afterend', handoffButton);
+    }
+    if (handoffButton.nextElementSibling !== completeButton) {
+      handoffButton.insertAdjacentElement('afterend', completeButton);
     }
   }
   /*
@@ -6911,21 +7005,29 @@
   let headerActionLayoutResizeHandler = null;
   let observedHeaderActionLayoutTargets = null;
   /*
-   * 將 compact 狀態同步寫入 action 容器與兩顆匯出按鈕。
+   * 將 compact 狀態同步寫入 action 容器與三顆匯出按鈕。
    *
-   * data-cgpt-header-compact：三顆主要按鈕共用的版面狀態。
+   * data-cgpt-header-compact：分享 + 三顆匯出按鈕共用的版面狀態。
    * data-cgpt-export-compact：保留既有 CSS 相依介面，避免舊規則失效。
    */
-  function setHeaderActionsCompact(headerActions, rawButton, handoffButton, isCompact) {
+  function setHeaderActionsCompact(
+    headerActions,
+    rawButton,
+    handoffButton,
+    completeButton,
+    isCompact
+  ) {
     const value = isCompact ? 'true' : 'false';
     if (headerActions.getAttribute('data-cgpt-header-compact') !== value) {
       headerActions.setAttribute('data-cgpt-header-compact', value);
     }
-    if (rawButton.getAttribute('data-cgpt-export-compact') !== value) {
-      rawButton.setAttribute('data-cgpt-export-compact', value);
-    }
-    if (handoffButton.getAttribute('data-cgpt-export-compact') !== value) {
-      handoffButton.setAttribute('data-cgpt-export-compact', value);
+    for (const button of [rawButton, handoffButton, completeButton]) {
+      if (
+        button &&
+        button.getAttribute('data-cgpt-export-compact') !== value
+      ) {
+        button.setAttribute('data-cgpt-export-compact', value);
+      }
     }
   }
   /*
@@ -7214,7 +7316,7 @@
     return false;
   }
   /*
-   * 將離屏 clone 的三顆主要 Header action 切成指定版面狀態。
+   * 將離屏 clone 的分享 + 三顆匯出 Header action 切成指定版面狀態。
    *
    * 只修改 clone 上既有的 data attribute；正式頁面的 DOM 不會在量測過程
    * 中切換，因此不會造成可見閃動或 ResizeObserver 回授迴圈。
@@ -7333,10 +7435,15 @@
     }
   }
   /*
-   * 排程分享 fallback reconciliation 與三顆按鈕的共用版面狀態同步。
+   * 排程分享 fallback reconciliation 與三顆匯出按鈕的共用版面狀態同步。
    */
-  function syncHeaderActionLayout(headerActions, rawButton, handoffButton) {
-    if (!headerActions || !rawButton || !handoffButton) {
+  function syncHeaderActionLayout(
+    headerActions,
+    rawButton,
+    handoffButton,
+    completeButton
+  ) {
+    if (!headerActions || !rawButton || !handoffButton || !completeButton) {
       return;
     }
     if (headerActionLayoutTimer !== null) {
@@ -7344,12 +7451,23 @@
     }
     headerActionLayoutTimer = requestAnimationFrame(() => {
       headerActionLayoutTimer = null;
-      if (!headerActions.isConnected || !rawButton.isConnected || !handoffButton.isConnected) {
+      if (
+        !headerActions.isConnected ||
+        !rawButton.isConnected ||
+        !handoffButton.isConnected ||
+        !completeButton.isConnected
+      ) {
         return;
       }
       reconcileShareButtonLabel(headerActions);
       const isCompact = shouldUseCompactHeaderLayout(headerActions);
-      setHeaderActionsCompact(headerActions, rawButton, handoffButton, isCompact);
+      setHeaderActionsCompact(
+        headerActions,
+        rawButton,
+        handoffButton,
+        completeButton,
+        isCompact
+      );
     });
   }
   /*
@@ -7382,15 +7500,21 @@
    * observer；DOM 與尺寸變化會由 MutationObserver / ResizeObserver 觸發同步，
    * 避免每秒重建 observer 或重做離屏寬度測量。
    */
-  function observeHeaderActionLayout(headerActions, rawButton, handoffButton) {
-    if (!headerActions || !rawButton || !handoffButton) {
+  function observeHeaderActionLayout(
+    headerActions,
+    rawButton,
+    handoffButton,
+    completeButton
+  ) {
+    if (!headerActions || !rawButton || !handoffButton || !completeButton) {
       return;
     }
     if (
       observedHeaderActionLayoutTargets &&
       observedHeaderActionLayoutTargets.headerActions === headerActions &&
       observedHeaderActionLayoutTargets.rawButton === rawButton &&
-      observedHeaderActionLayoutTargets.handoffButton === handoffButton
+      observedHeaderActionLayoutTargets.handoffButton === handoffButton &&
+      observedHeaderActionLayoutTargets.completeButton === completeButton
     ) {
       return;
     }
@@ -7401,12 +7525,13 @@
     observedHeaderActionLayoutTargets = {
       headerActions,
       rawButton,
-      handoffButton
+      handoffButton,
+      completeButton
     };
     const parts = getHeaderLayoutParts(headerActions);
     const mutationRoot = parts?.pageHeader || headerActions;
     headerActionLayoutObserver = new MutationObserver(() => {
-      syncHeaderActionLayout(headerActions, rawButton, handoffButton);
+      syncHeaderActionLayout(headerActions, rawButton, handoffButton, completeButton);
     });
     headerActionLayoutObserver.observe(mutationRoot, {
       attributes: true,
@@ -7425,7 +7550,7 @@
     });
     if (typeof ResizeObserver === 'function') {
       headerActionLayoutResizeObserver = new ResizeObserver(() => {
-        syncHeaderActionLayout(headerActions, rawButton, handoffButton);
+        syncHeaderActionLayout(headerActions, rawButton, handoffButton, completeButton);
       });
       const resizeTargets = new Set([
         parts?.pageHeader,
@@ -7442,15 +7567,15 @@
       }
     }
     headerActionLayoutResizeHandler = () => {
-      syncHeaderActionLayout(headerActions, rawButton, handoffButton);
+      syncHeaderActionLayout(headerActions, rawButton, handoffButton, completeButton);
     };
     window.addEventListener('resize', headerActionLayoutResizeHandler, {
       passive: true
     });
-    syncHeaderActionLayout(headerActions, rawButton, handoffButton);
+    syncHeaderActionLayout(headerActions, rawButton, handoffButton, completeButton);
   }
   /*
-   * 將兩個按鈕插入 ChatGPT 對話頁 header。
+   * 將三個單一對話匯出按鈕插入 ChatGPT 對話頁 header。
    *
    * 這個函式同時負責建立、去重、搬移與狀態更新。
    * ChatGPT header 若因 SPA 導航或 React 重繪被重建，下一次 ensureButtonsSoon() 會把按鈕放回正確位置。
@@ -7462,6 +7587,7 @@
     }
     removeDuplicateButtons(RAW_BUTTON_ID);
     removeDuplicateButtons(HANDOFF_BUTTON_ID);
+    removeDuplicateButtons(COMPLETE_BUTTON_ID);
     const headerActions = findHeaderActionsContainer();
     if (!headerActions) {
       return;
@@ -7482,10 +7608,33 @@
       iconSvg: HANDOFF_ICON_SVG,
       onClick: handleDownloadHandoffClick
     });
-    syncCurrentHeaderButtonPresentation(headerActions, rawButton, handoffButton);
-    placeExportButtons(headerActions, rawButton, handoffButton);
+    const completeButton = getOrCreateExportButton({
+      id: COMPLETE_BUTTON_ID,
+      label: '下載完整 JSON',
+      ariaLabel: '分別下載目前對話原始、textdocs（若有）與交接 JSON',
+      testId: 'complete-json-export-button',
+      iconSvg: COMPLETE_JSON_ICON_SVG,
+      onClick: handleDownloadCompleteClick
+    });
+    syncCurrentHeaderButtonPresentation(
+      headerActions,
+      rawButton,
+      handoffButton,
+      completeButton
+    );
+    placeExportButtons(
+      headerActions,
+      rawButton,
+      handoffButton,
+      completeButton
+    );
     updateButtonState();
-    observeHeaderActionLayout(headerActions, rawButton, handoffButton);
+    observeHeaderActionLayout(
+      headerActions,
+      rawButton,
+      handoffButton,
+      completeButton
+    );
   }
   /*
    * 節流插入按鈕。
@@ -7830,12 +7979,26 @@
         a[data-sidebar-item="true"][href^="/c/"] > .trailing {
         display: none !important;
       }
+      /* Current App Shell：批次模式時隱藏 conversation row 自己的 hover actions。 */
+      [data-cgpt-batch-selection-list="true"][data-cgpt-batch-selection-scope="general"]
+        [data-sidebar-chatgpt-conversation-key] [data-hover-card-open-immediately="true"] {
+        display: none !important;
+      }
       [data-cgpt-batch-selection-list="true"][data-cgpt-batch-selection-scope="project"]
         [data-testid="project-conversation-overflow-menu"] {
         display: none !important;
       }
       [data-cgpt-batch-selection-list="true"][data-cgpt-batch-selection-scope="project"]
         [data-testid="project-conversation-overflow-date"] {
+        opacity: 1 !important;
+      }
+      /* Current project list：保留日期，但隱藏列尾原生 menu button。 */
+      [data-cgpt-batch-selection-row="true"][data-cgpt-batch-selection-scope="project"]
+        button[aria-haspopup="menu"] {
+        display: none !important;
+      }
+      [data-cgpt-batch-selection-row="true"][data-cgpt-batch-selection-scope="project"]
+        > :last-child > span[aria-hidden="true"] {
         opacity: 1 !important;
       }
       [data-cgpt-batch-controls="general"][data-cgpt-batch-general-mode="panel"] {
@@ -8005,6 +8168,11 @@
       [data-cgpt-batch-controls="project"] [data-cgpt-batch-action] > div {
         gap: 0.4rem;
       }
+      /* 專案頁整組 batch action（入口、匯出、全選、取消選取、打包、取消作業、關閉）統一縮小一號。 */
+      [data-cgpt-batch-controls="project"] [data-cgpt-batch-action] {
+        font-size: 0.8125rem;
+        line-height: 1.125rem;
+      }
       [data-cgpt-batch-action-slot][data-cgpt-batch-action-placement="project"] {
         display: inline-flex;
         flex: 0 0 auto;
@@ -8025,6 +8193,52 @@
         opacity: 0;
         transform: translateX(-4px);
         pointer-events: none;
+      }
+      /*
+       * Current App Shell 已不再提供舊版 .btn / .btn-secondary 的基礎幾何。
+       * 批次確認視窗仍保留那些 class 作 legacy 相容，但在本 dialog 內自行補回
+       * 舊版 ChatGPT .btn 的 36px / text-sm / px-3 比例，避免目前 build 只剩
+       * 顏色覆寫而讓文字、padding、邊框與取消按鈕比例失真。
+       */
+      [data-cgpt-batch-dialog-button="true"] {
+        pointer-events: auto;
+        min-height: 2.25rem;
+        padding-inline: 0.75rem;
+        border-style: solid;
+        border-width: 1px;
+        border-color: var(--border-medium, rgba(255,255,255,0.14));
+        border-radius: 9999px;
+        background-color: var(--bg-primary, var(--main-surface-primary, transparent));
+        color: var(--text-primary, currentColor);
+        box-sizing: border-box;
+        display: inline-flex;
+        flex: 0 0 auto;
+        align-items: center;
+        justify-content: center;
+        font-size: var(--text-sm, 0.875rem);
+        line-height: var(--text-sm--line-height, 1.25rem);
+        font-weight: var(--font-weight-medium, 500);
+        white-space: nowrap;
+      }
+      [data-cgpt-batch-dialog-button="true"] > div {
+        display: flex;
+        min-width: 0;
+        align-items: center;
+        justify-content: center;
+        gap: 0.5rem;
+      }
+      [data-cgpt-batch-dialog-button="true"] svg {
+        flex: 0 0 auto;
+      }
+      [data-cgpt-batch-dialog-button="true"]:not([data-cgpt-batch-dialog-download="true"]):not([data-cgpt-batch-dialog-danger="true"]):is(:hover,:focus-visible) {
+        background-color: var(--main-surface-secondary, rgba(255,255,255,0.08));
+      }
+      [data-cgpt-batch-dialog-button="true"]:active:not(:disabled) {
+        opacity: 0.8;
+      }
+      [data-cgpt-batch-dialog-button="true"]:disabled {
+        cursor: not-allowed;
+        opacity: 0.5;
       }
       [data-cgpt-batch-dialog-download="true"] {
         background-color: #ffffff !important;
@@ -8187,7 +8401,7 @@
       return null;
     }
   }
-  function findGeneralBatchUiContext() {
+  function findLegacyGeneralBatchUiContext() {
     const history = document.getElementById('history');
     if (!history || !history.parentElement) {
       return null;
@@ -8205,6 +8419,7 @@
     }
     return {
       scope: BATCH_SCOPE_GENERAL,
+      layout: 'legacy',
       active: true,
       controlsHost: actionHost,
       panelHost: history.parentElement,
@@ -8212,28 +8427,145 @@
       listRoot: history
     };
   }
-  function findProjectBatchUiContext() {
-    const tablist = document.querySelector('[role="tablist"][id^="project-home-tabs-"]');
+  function findCurrentGeneralBatchUiContext() {
+    /*
+     * Current App Shell 沒有 #history。
+     * 由實際 conversation listitem 往上找 role=list 與同一個 sidebar section，
+     * 再從 section toggle 找到 header / action host。這避免依賴「最近項目」文字或語系。
+     */
+    const conversationRow = document.querySelector(
+      '[data-sidebar-chatgpt-conversation-key][role="listitem"]'
+    );
+    if (!conversationRow) {
+      return null;
+    }
+    const listRoot = conversationRow.closest('[role="list"]');
+    const section = conversationRow.closest('section[data-app-action-sidebar-section]');
+    if (!listRoot || !section || !section.contains(listRoot)) {
+      return null;
+    }
+    const toggle = section.querySelector('[data-app-action-sidebar-section-toggle]');
+    const header = toggle?.closest?.('[data-state][aria-expanded]') || null;
+    const actionHost = header?.lastElementChild || null;
+    const panelHost = listRoot.parentElement;
+    if (
+      !header ||
+      !actionHost ||
+      actionHost === header.firstElementChild ||
+      !panelHost
+    ) {
+      return null;
+    }
+    return {
+      scope: BATCH_SCOPE_GENERAL,
+      layout: 'current',
+      active: true,
+      controlsHost: actionHost,
+      panelHost,
+      header,
+      listRoot
+    };
+  }
+  function findGeneralBatchUiContext() {
+    return (
+      findLegacyGeneralBatchUiContext() ||
+      findCurrentGeneralBatchUiContext()
+    );
+  }
+  function getProjectTabsFromTablist(tablist, mode) {
     if (!tablist) {
       return null;
     }
-    const chatTab = tablist.querySelector('[role="tab"][id$="-chats"]');
-    const sourcesTab = tablist.querySelector('[role="tab"][id$="-sources"]');
-    if (!chatTab || !sourcesTab) {
+    if (mode === 'legacy') {
+      const chatTab = tablist.querySelector('[role="tab"][id$="-chats"]');
+      const sourcesTab = tablist.querySelector('[role="tab"][id$="-sources"]');
+      return chatTab && sourcesTab
+        ? { chatTab, sourcesTab }
+        : null;
+    }
+    const tabs = Array.from(
+      tablist.querySelectorAll('[role="tab"][aria-controls]')
+    );
+    const chatTab = tabs.find((tab) =>
+      /-chats$/.test(tab.getAttribute('aria-controls') || '')
+    ) || null;
+    const sourcesTab = tabs.find((tab) =>
+      /-sources$/.test(tab.getAttribute('aria-controls') || '')
+    ) || null;
+    return chatTab && sourcesTab
+      ? { chatTab, sourcesTab }
+      : null;
+  }
+  function buildProjectBatchUiContext(tablist, tabs, layout) {
+    if (!tablist || !tabs?.chatTab || !tabs?.sourcesTab) {
       return null;
     }
+    const { chatTab, sourcesTab } = tabs;
     const panelId = chatTab.getAttribute('aria-controls');
     const panel = panelId ? document.getElementById(panelId) : null;
     const listRoot = panel ? panel.querySelector('section > ol') : null;
+    const active =
+      (
+        chatTab.getAttribute('data-state') === 'active' ||
+        chatTab.getAttribute('aria-selected') === 'true'
+      ) &&
+      Boolean(listRoot);
+    const sourcesTabSlot =
+      sourcesTab.parentElement?.parentElement === tablist
+        ? sourcesTab.parentElement
+        : sourcesTab;
     return {
       scope: BATCH_SCOPE_PROJECT,
-      active: chatTab.getAttribute('data-state') === 'active' && Boolean(listRoot),
+      layout,
+      active,
       controlsHost: tablist,
       tablist,
       chatTab,
       sourcesTab,
+      sourcesTabSlot,
       listRoot
     };
+  }
+  function findProjectBatchUiContext() {
+    // Legacy project-home-tabs branch first, for rollback compatibility.
+    const legacyTablist = document.querySelector(
+      '[role="tablist"][id^="project-home-tabs-"]'
+    );
+    const legacyTabs = getProjectTabsFromTablist(
+      legacyTablist,
+      'legacy'
+    );
+    if (legacyTabs) {
+      return buildProjectBatchUiContext(
+        legacyTablist,
+        legacyTabs,
+        'legacy'
+      );
+    }
+    /*
+     * Current project home：
+     * tablist id 是 React generated / may be absent；tab 本身改成 *-chats-tab，
+     * 但 aria-controls 仍穩定指向 *-chats / *-sources panel。
+     * 因此只以 role + aria-controls 的語意配對，不依賴中文 tab 文字。
+     */
+    for (const tablist of document.querySelectorAll('[role="tablist"]')) {
+      const currentTabs = getProjectTabsFromTablist(
+        tablist,
+        'current'
+      );
+      if (!currentTabs) {
+        continue;
+      }
+      const context = buildProjectBatchUiContext(
+        tablist,
+        currentTabs,
+        'current'
+      );
+      if (context) {
+        return context;
+      }
+    }
+    return null;
   }
   function getBatchUiContext(scope) {
     return scope === BATCH_SCOPE_GENERAL
@@ -8242,11 +8574,34 @@
         ? findProjectBatchUiContext()
         : null;
   }
+  function getGeneralBatchConversationLink(row) {
+    if (!row) {
+      return null;
+    }
+    if (
+      row.matches?.(
+        'a[data-sidebar-item="true"][href^="/c/"], ' +
+        'a[data-interactive-row-link="true"][href^="/c/"]'
+      )
+    ) {
+      return row;
+    }
+    return row.querySelector?.(
+      'a[data-interactive-row-link="true"][href^="/c/"], a[href^="/c/"]'
+    ) || null;
+  }
   function getBatchConversationRows(context) {
     if (!context?.listRoot) {
       return [];
     }
     if (context.scope === BATCH_SCOPE_GENERAL) {
+      if (context.layout === 'current') {
+        return Array.from(
+          context.listRoot.querySelectorAll(
+            '[data-sidebar-chatgpt-conversation-key][role="listitem"]'
+          )
+        ).filter((row) => Boolean(getGeneralBatchConversationLink(row)));
+      }
       return Array.from(
         context.listRoot.querySelectorAll('a[data-sidebar-item="true"][href^="/c/"]')
       );
@@ -8260,7 +8615,7 @@
       return null;
     }
     const link = scope === BATCH_SCOPE_GENERAL
-      ? row
+      ? getGeneralBatchConversationLink(row)
       : row.querySelector('a[href*="/c/"]');
     if (!link) {
       return null;
@@ -8273,7 +8628,11 @@
     }
     let title = '';
     if (scope === BATCH_SCOPE_GENERAL) {
-      title = String(link.getAttribute('aria-label') || '').trim();
+      title = String(
+        link.getAttribute('aria-label') ||
+        row.querySelector?.('[data-thread-title="true"]')?.textContent ||
+        ''
+      ).replace(/\s+/g, ' ').trim();
     } else {
       title = String(
         link.querySelector('.text-sm.font-medium')?.textContent || ''
@@ -8376,14 +8735,18 @@
     if (!state || state.scope !== BATCH_SCOPE_GENERAL || !row) {
       return;
     }
-    if (!state.originalDraggableByLink.has(row)) {
-      state.originalDraggableByLink.set(row, {
-        hadAttribute: row.hasAttribute('draggable'),
-        value: row.getAttribute('draggable')
+    const link = getGeneralBatchConversationLink(row);
+    if (!link) {
+      return;
+    }
+    if (!state.originalDraggableByLink.has(link)) {
+      state.originalDraggableByLink.set(link, {
+        hadAttribute: link.hasAttribute('draggable'),
+        value: link.getAttribute('draggable')
       });
     }
-    row.setAttribute('draggable', 'false');
-    row.setAttribute('data-cgpt-batch-drag-disabled', 'true');
+    link.setAttribute('draggable', 'false');
+    link.setAttribute('data-cgpt-batch-drag-disabled', 'true');
   }
   function restoreGeneralBatchRowDragging(state) {
     if (!state) {
@@ -8514,6 +8877,18 @@
       return null;
     }
     if (context.scope === BATCH_SCOPE_GENERAL) {
+      if (context.layout === 'current') {
+        const row = target.closest(
+          '[data-sidebar-chatgpt-conversation-key][role="listitem"]'
+        );
+        return (
+          row &&
+          context.listRoot.contains(row) &&
+          getGeneralBatchConversationLink(row)
+        )
+          ? row
+          : null;
+      }
       const row = target.closest('a[data-sidebar-item="true"][href^="/c/"]');
       return row && context.listRoot.contains(row) ? row : null;
     }
@@ -8821,6 +9196,8 @@
         'focus-visible:opacity-100',
         'can-hover:opacity-0',
         'can-hover:group-hover/sidebar-expando-section-header:opacity-100',
+        'group-hover/nav-section-title:opacity-100',
+        'group-focus-within/nav-section-title:opacity-100',
         'cant-hover:opacity-100'
       ].join(' ');
       button.setAttribute('data-trailing-button', '');
@@ -8857,6 +9234,63 @@
       `<div class="flex items-center justify-center">${iconSvg}<span>${label}</span></div>`;
     return button;
   }
+  function applyCurrentGeneralBatchEntryAppearance(button, context, iconSvg) {
+    if (!button || context?.layout !== 'current') {
+      return;
+    }
+    /*
+     * Current App Shell 的三顆原生 header action 都包在會於 hover/focus 才展開的
+     * wrapper 內。自訂批次入口刻意放在該 wrapper 之後，並直接沿用其中一顆
+     * secondary / transparent 原生按鈕的外觀，讓它永遠顯示、維持最右側，
+     * 顏色與原生按鈕一致，同時不把另外三顆原生按鈕強制顯示。
+     */
+    const nativeButton = context.controlsHost?.querySelector?.(
+      'button[data-color="secondary"][data-variant="transparent"]'
+    ) || null;
+    if (nativeButton) {
+      button.className = nativeButton.className;
+      for (const attributeName of [
+        'data-color',
+        'data-size',
+        'data-icon-size',
+        'data-uniform',
+        'data-variant'
+      ]) {
+        if (nativeButton.hasAttribute(attributeName)) {
+          button.setAttribute(
+            attributeName,
+            nativeButton.getAttribute(attributeName) ?? ''
+          );
+        } else {
+          button.removeAttribute(attributeName);
+        }
+      }
+      const nativeInner = nativeButton.firstElementChild;
+      if (nativeInner instanceof Element) {
+        const inner = nativeInner.cloneNode(false);
+        inner.innerHTML = iconSvg;
+        button.replaceChildren(inner);
+      } else {
+        button.innerHTML = iconSvg;
+      }
+    } else {
+      /*
+       * 若未來 header 原生 action 暫時不存在，至少解除 legacy hover-only
+       * opacity class，並使用目前 secondary 文字 token 作保守 fallback。
+       */
+      for (const className of [
+        'can-hover:opacity-0',
+        'can-hover:group-hover/sidebar-expando-section-header:opacity-100',
+        'group-hover/nav-section-title:opacity-100',
+        'group-focus-within/nav-section-title:opacity-100'
+      ]) {
+        button.classList.remove(className);
+      }
+      button.style.opacity = '1';
+      button.style.color = 'var(--text-secondary)';
+    }
+    button.removeAttribute('data-trailing-button');
+  }
   function getOrCreateBatchControls(scope) {
     const id = scope === BATCH_SCOPE_GENERAL
       ? BATCH_GENERAL_CONTROLS_ID
@@ -8888,7 +9322,18 @@
           'header'
         );
         controls.className = 'contents';
-        if (
+        if (context.layout === 'current') {
+          if (
+            controls.parentElement !==
+            context.controlsHost ||
+            context.controlsHost.lastElementChild !==
+            controls
+          ) {
+            context.controlsHost.appendChild(
+              controls
+            );
+          }
+        } else if (
           controls.parentElement !==
           context.controlsHost ||
           context.controlsHost.firstElementChild !==
@@ -8950,14 +9395,17 @@
         false
       );
     }
+    const projectInsertBefore =
+      context.sourcesTabSlot ||
+      context.sourcesTab;
     if (
       controls.parentElement !== context.tablist ||
       controls.nextElementSibling !==
-      context.sourcesTab
+      projectInsertBefore
     ) {
       context.tablist.insertBefore(
         controls,
-        context.sourcesTab
+        projectInsertBefore
       );
     }
   }
@@ -9430,6 +9878,11 @@
         disabled: !context.active,
         placement: 'header'
       });
+      applyCurrentGeneralBatchEntryAppearance(
+        entry,
+        context,
+        BATCH_ENTRY_ICON_SVG
+      );
       entry.addEventListener('click', () =>
         beginBatchSelectionMode(
           BATCH_SCOPE_GENERAL
@@ -10691,6 +11144,7 @@
     dialog.className =
       'popover bg-token-bg-primary relative col-auto col-start-2 row-auto row-start-2 h-full text-start start-1/2 ltr:-translate-x-1/2 rtl:translate-x-1/2 rounded-2xl shadow-long flex flex-col focus:outline-hidden overflow-hidden';
     dialog.style.width = 'max(40vw, 36rem)';
+    dialog.style.minWidth = '40vw';
     dialog.style.maxWidth = 'calc(100vw - 2rem)';
     dialog.tabIndex = -1;
     const titleId = `${id}-title`;
@@ -10770,6 +11224,7 @@
   ) {
     const button = document.createElement('button');
     button.type = 'button';
+    button.setAttribute('data-cgpt-batch-dialog-button', 'true');
     button.className = [
       'btn',
       'relative',
@@ -10808,6 +11263,8 @@
       titleText: sessionActive ? '確認追加批次匯出' : '確認批次匯出',
       testId: 'modal-cgpt-batch-export-confirmation'
     });
+    shell.dialog.style.width = 'max(50vw, 36rem)';
+    shell.dialog.style.minWidth = '50vw';
     shell.overlay.setAttribute('data-cgpt-batch-export-dialog', 'true');
     const intro = document.createElement('p');
     intro.className = 'text-token-text-primary';
