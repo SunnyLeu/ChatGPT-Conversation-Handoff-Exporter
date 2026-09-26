@@ -2,7 +2,7 @@
 // @name         ChatGPT 對話 JSON 與交接檔匯出工具
 // @name:en      ChatGPT Conversation Handoff Exporter
 // @namespace    https://github.com/SunnyLeu/ChatGPT-Conversation-Handoff-Exporter
-// @version      1.5.0
+// @version      1.5.3
 // @description  匯出 ChatGPT raw / handoff JSON；handoff v2 採 Structure-first / Preserve-on-unknown 完整保留交接文字，並支援受控批次原始、交接與完整 JSON session。
 // @description:en Export ChatGPT raw / handoff JSON; handoff v2 uses structure-first, preserve-on-unknown semantics and supports controlled raw, handoff, and complete batch sessions.
 // @author       SunnyLeu
@@ -79,7 +79,7 @@
    *   - 多次包裝 window.fetch
    *   - 重複的 timer / listener
    */
-  const INSTALL_FLAG = '__chatgptConversationHandoffExporterInstalled_v150';
+  const INSTALL_FLAG = '__chatgptConversationHandoffExporterInstalled_v153';
   /*
    * 匯出按鈕事件綁定標記。
    *
@@ -87,7 +87,7 @@
    * click listener 是否屬於目前腳本，必要時重建按鈕以避免殘留
    * listener 或 conversation 狀態。
    */
-  const EXPORT_BUTTON_LISTENER_VERSION = '1.5.0';
+  const EXPORT_BUTTON_LISTENER_VERSION = '1.5.3';
   /*
    * 匯出器與 handoff schema 版本。
    *
@@ -97,7 +97,7 @@
    * HANDOFF_SCHEMA_VERSION：
    *   與 userscript 版本分離；只有 handoff 結構或語意改版時才升版。
    */
-  const EXPORTER_VERSION = '1.5.0';
+  const EXPORTER_VERSION = '1.5.3';
   const HANDOFF_SCHEMA_VERSION = '2.0';
   /*
    * Structure-first / Preserve-on-unknown：
@@ -130,8 +130,23 @@
    *   - expanded 相較 compact 新增左側文字裁切 / 截斷。
    */
   const SHARE_BUTTON_SELECTOR = '[data-testid="share-chat-button"]';
-  const HEADER_ACTIONS_SELECTOR = '#conversation-header-actions';
+  const LEGACY_HEADER_ACTIONS_SELECTOR = '#conversation-header-actions';
+  const CURRENT_HEADER_ACTIONS_SELECTOR = '[data-cgpt-export-header-actions="true"]';
+  const HEADER_ACTIONS_SELECTOR = `${LEGACY_HEADER_ACTIONS_SELECTOR}, ${CURRENT_HEADER_ACTIONS_SELECTOR}`;
   const HEADER_LAYOUT_TOLERANCE = 1;
+  /*
+   * conversation request-context endpoint 世代。
+   *
+   * Legacy：/backend-api/conversation/{conversation_id}
+   * Current：/backend-api/conversations/{conversation_id}
+   *
+   * 2026-09 App Shell build 已確認：current plural endpoint 是分頁 messages schema，
+   * authoritative full raw conversation 仍由 legacy singular endpoint 提供 mapping。
+   * 因此此世代值只用來判斷「來源 request context 應如何整理 headers」，
+   * 不再決定正式 raw / handoff 匯出的 authoritative endpoint。
+   */
+  const CONVERSATION_ENDPOINT_LEGACY = 'legacy';
+  const CONVERSATION_ENDPOINT_CURRENT = 'current';
   /*
    * backend JSON response 完整性驗證用容差。
    *
@@ -191,7 +206,7 @@
    *
    * 用途：
    *   新對話剛建立完成時，ChatGPT 不一定會立刻發出
-   *   /backend-api/conversation/{conversation_id} 這個完整對話 JSON 請求。
+   *   /backend-api/conversation/{conversation_id} 或 /backend-api/conversations/{conversation_id} 完整對話 JSON 請求。
    *
    *   但新對話送出訊息或接收回覆時，通常仍會呼叫其他 /backend-api/...
    *   endpoint。這些同源請求可提供匯出時重新抓取 JSON 所需的安全
@@ -205,6 +220,11 @@
    *   - 不輸出 headers。
    */
   let latestReplayRequestTemplate = null;
+  /*
+   * 最近一次實際觀察到的 raw/scoped conversation endpoint 世代。
+   * 只保存在目前頁面記憶體，不寫入任何永久儲存區。
+   */
+  let latestConversationEndpointKind = null;
   /*
    * SPA 導航與 UI 插入控制用狀態。
    *
@@ -478,20 +498,44 @@
     return Boolean(getConversationIdFromUrl());
   }
   /*
-   * 從 ChatGPT 原始 conversation endpoint 取得 conversation ID。
+   * 判斷 conversation 相關 endpoint 屬於哪一代。
    *
-   * 只接受精確 endpoint：
+   * Legacy：
    *   /backend-api/conversation/{conversation_id}
-   *
-   * 不接受：
    *   /backend-api/conversation/{conversation_id}/...
    *
-   * 這樣可以避免把 stream_status、textdocs 等子路徑回應誤認為 raw conversation JSON。
+   * Current：
+   *   /backend-api/conversations/{conversation_id}
+   *   /backend-api/conversations/{conversation_id}/...
+   *
+   * /backend-api/conversations/batch 等非 UUID 路徑不會被誤認。
+   */
+  function getConversationApiEndpointKind(url) {
+    try {
+      const parsedUrl = new URL(url, location.origin);
+      if (/^\/backend-api\/conversations\/[^/]+(?:\/|$)/.test(parsedUrl.pathname)) {
+        return CONVERSATION_ENDPOINT_CURRENT;
+      }
+      if (/^\/backend-api\/conversation\/[^/]+(?:\/|$)/.test(parsedUrl.pathname)) {
+        return CONVERSATION_ENDPOINT_LEGACY;
+      }
+      return null;
+    } catch {
+      return null;
+    }
+  }
+  /*
+   * 從 ChatGPT raw conversation endpoint 取得 conversation ID。
+   *
+   * 同時接受 legacy singular 與 current plural endpoint，但只接受精確 raw 路徑，
+   * 不把 stream_status、textdocs 等子路徑回應誤認為 raw conversation JSON。
    */
   function getConversationIdFromExactApiUrl(url) {
     try {
       const parsedUrl = new URL(url, location.origin);
-      const match = parsedUrl.pathname.match(/^\/backend-api\/conversation\/([^/]+)\/?$/);
+      const match = parsedUrl.pathname.match(
+        /^\/backend-api\/(?:conversation|conversations)\/([^/]+)\/?$/
+      );
       if (!match) {
         return null;
       }
@@ -504,17 +548,15 @@
   /*
    * 從 conversation 相關子路徑取得 conversation ID。
    *
-   * 新對話完成後，ChatGPT 常見請求可能是：
-   *   /backend-api/conversation/{conversation_id}/stream_status
-   *   /backend-api/conversation/{conversation_id}/textdocs
-   *
-   * 這些不是 raw conversation JSON，但它們帶有目前 conversation ID，
-   * 可以作為重新抓取 raw JSON 時的 request context 來源。
+   * Legacy 與 current endpoint 都可提供 request context；真正 raw JSON 是否為精確
+   * endpoint 仍由 getConversationIdFromExactApiUrl() 判斷。
    */
   function getConversationIdFromScopedApiUrl(url) {
     try {
       const parsedUrl = new URL(url, location.origin);
-      const match = parsedUrl.pathname.match(/^\/backend-api\/conversation\/([^/]+)(?:\/|$)/);
+      const match = parsedUrl.pathname.match(
+        /^\/backend-api\/(?:conversation|conversations)\/([^/]+)(?:\/|$)/
+      );
       if (!match) {
         return null;
       }
@@ -1086,13 +1128,28 @@
     if (!headers || !headers.has('authorization')) {
       return false;
     }
-    return (
+    const hasLegacyClientContext = (
       headers.has('x-oai-is') ||
       headers.has('oai-session-id') ||
       headers.has('oai-device-id') ||
       headers.has('oai-client-version') ||
       headers.has('oai-client-build-number')
     );
+    /*
+     * 2026-09 App Shell build 已觀察到新版同源 backend request 使用：
+     *   oai-did + x-openai-web-frontend / x-openai-codex-window-type / chatgpt-account-id
+     *
+     * 仍要求 Authorization + client context；不放寬成只要 Authorization 就接受。
+     */
+    const hasCurrentClientContext = (
+      headers.has('oai-did') &&
+      (
+        headers.has('x-openai-web-frontend') ||
+        headers.has('x-openai-codex-window-type') ||
+        headers.has('chatgpt-account-id')
+      )
+    );
+    return hasLegacyClientContext || hasCurrentClientContext;
   }
   /*
    * 保存最近一次 backend API 請求樣板。
@@ -1125,10 +1182,18 @@
     if (!hasReusableAuthHeaders(headers)) {
       return;
     }
+    const exactConversationId = getConversationIdFromExactApiUrl(requestUrl);
+    const endpointKind = exactConversationId === conversationId
+      ? getConversationApiEndpointKind(requestUrl)
+      : null;
+    if (endpointKind) {
+      latestConversationEndpointKind = endpointKind;
+    }
     const replayRequest = {
       url: new URL(requestUrl, location.origin).href,
       headers,
-      capturedAt: Date.now()
+      capturedAt: Date.now(),
+      endpointKind
     };
     replayRequestByConversationId.set(conversationId, replayRequest);
     latestReplayRequestTemplate = {
@@ -1288,13 +1353,22 @@
     if (typeof originalFetch !== 'function') {
       return;
     }
-    if (originalFetch.__chatgptConversationHandoffExporterWrapped) {
+    if (
+      originalFetch.__chatgptConversationHandoffExporterWrapperVersion ===
+      EXPORTER_VERSION
+    ) {
       return;
     }
     function interceptedFetch(input, init) {
       const requestUrl = getRequestUrl(input);
       const exactConversationId = getConversationIdFromExactApiUrl(requestUrl);
       const scopedConversationId = getConversationIdFromScopedApiUrl(requestUrl);
+      const endpointKind = exactConversationId
+        ? getConversationApiEndpointKind(requestUrl)
+        : null;
+      if (endpointKind) {
+        latestConversationEndpointKind = endpointKind;
+      }
       if (isReusableBackendApiRequest(requestUrl)) {
         captureReplayTemplate(input, init);
       }
@@ -1309,12 +1383,33 @@
       });
     }
     interceptedFetch.__chatgptConversationHandoffExporterWrapped = true;
+    interceptedFetch.__chatgptConversationHandoffExporterWrapperVersion =
+      EXPORTER_VERSION;
     window.fetch = interceptedFetch;
   }
   /*
-   * 建立目前 conversation ID 專用的 conversation endpoint。
+   * ChatGPT 新版 SPA 可能在 userscript document-start 之後重新指定 window.fetch。
+   * 低頻 UI heartbeat 只檢查目前 fetch 是否仍為本版 wrapper；遺失時才重新掛接。
+   * 這裡不主動發送任何 API request。
+   */
+  function ensureFetchInterceptor() {
+    const currentFetch = window.fetch;
+    if (
+      typeof currentFetch === 'function' &&
+      currentFetch.__chatgptConversationHandoffExporterWrapperVersion ===
+        EXPORTER_VERSION
+    ) {
+      return;
+    }
+    installFetchInterceptor();
+  }
+  /*
+   * 建立 authoritative full raw conversation URL。
    *
-   * 只負責組出同源 URL；驗證資訊由先前捕捉到的 request context 與瀏覽器 cookie 處理。
+   * 2026-09 App Shell build 的 plural /conversations/{id} 是分頁 messages schema，
+   * 不含 handoff / raw 完整性驗證所需的 mapping。實機診斷已確認 singular
+   * /conversation/{id} 仍回傳完整 mapping + current_node，因此正式 raw / handoff
+   * 重抓固定使用 singular full endpoint。
    */
   function buildConversationApiUrl(conversationId) {
     return new URL(
@@ -1324,6 +1419,9 @@
   }
   /*
    * 建立目前 conversation ID 專用的 textdocs endpoint。
+   *
+   * 本輪沒有新版 textdocs endpoint 的直接 request 證據，因此保留 legacy singular
+   * 路徑與既有容錯；raw conversation 的 plural 遷移不在此推測套用。
    */
   function buildTextdocsApiUrl(conversationId) {
     return new URL(
@@ -1334,29 +1432,42 @@
   /*
    * 將可重用 headers 調整成指定 ChatGPT backend endpoint 專用。
    *
-   * 某些 ChatGPT backend 請求會帶有 x-openai-target-path /
+   * 某些 legacy ChatGPT backend 請求會帶有 x-openai-target-path /
    * x-openai-target-route 這類路由提示 header。
    *
    * 若直接重用其他 endpoint 的 request template，這些 header 可能仍指向
    * 原本的 API 路徑，導致實際請求 URL 與 target headers 不一致。
-   *
-   * 因此在按下匯出按鈕、準備抓目前資料時，需要把它們改成目標 endpoint。
    */
   function applyTargetHeaders(headers, targetPath, targetRoute) {
     headers.set('accept', 'application/json');
     headers.set('x-openai-target-path', targetPath);
     headers.set('x-openai-target-route', targetRoute);
-    /*
-     * GET 請求不需要 content-type。
-     * 若 request template 來自 POST endpoint，留下 content-type 可能造成誤導。
-     */
     headers.delete('content-type');
     return headers;
   }
   /*
-   * 將重用 headers 調整為 conversation JSON endpoint 使用。
+   * Current plural conversation request 的實際 header 集合中沒有 target path / route。
+   * 因此 current branch 不額外製造這兩個 header；若樣板來自其他 endpoint，先移除。
    */
-  function applyConversationTargetHeaders(headers, conversationId) {
+  function applyCurrentConversationHeaders(headers) {
+    headers.set('accept', 'application/json');
+    headers.delete('content-type');
+    headers.delete('x-openai-target-path');
+    headers.delete('x-openai-target-route');
+    return headers;
+  }
+  /*
+   * 將重用 headers 調整為 authoritative singular full endpoint 使用。
+   *
+   * endpointKind 描述的是「request context 來源世代」，不是目標 endpoint：
+   * - current plural context：保留新版 header 形狀並移除 legacy target hints；
+   *   實機診斷已確認這組 context 可直接 GET singular full endpoint。
+   * - legacy singular context：維持既有 x-openai-target-* 行為。
+   */
+  function applyConversationTargetHeaders(headers, conversationId, endpointKind) {
+    if (endpointKind === CONVERSATION_ENDPOINT_CURRENT) {
+      return applyCurrentConversationHeaders(headers);
+    }
     const targetPath = `/backend-api/conversation/${encodeURIComponent(conversationId)}`;
     return applyTargetHeaders(
       headers,
@@ -1381,25 +1492,41 @@
    * 優先使用此 conversation ID 專屬 request context。
    * 若沒有，改用最近一次 ChatGPT backend API 請求樣板。
    *
-   * 回傳的 headers 會被調整為 conversation endpoint 專用，避免重用其他 API 的 target headers。
+   * 正式 URL 固定指向 singular full endpoint；來源 endpoint 世代只決定 headers
+   * 要沿用 current 形狀或 legacy target hints。
    * 這個函式只在使用者按下匯出按鈕後的抓取流程中使用。
    */
   function getReplayRequestForConversation(conversationId) {
     const replayRequest = replayRequestByConversationId.get(conversationId);
     if (replayRequest) {
+      const endpointKind = replayRequest.endpointKind ||
+        latestConversationEndpointKind ||
+        CONVERSATION_ENDPOINT_CURRENT;
       return {
         url: buildConversationApiUrl(conversationId),
-        headers: applyConversationTargetHeaders(new Headers(replayRequest.headers), conversationId),
-        capturedAt: replayRequest.capturedAt
+        headers: applyConversationTargetHeaders(
+          new Headers(replayRequest.headers),
+          conversationId,
+          endpointKind
+        ),
+        capturedAt: replayRequest.capturedAt,
+        endpointKind
       };
     }
     if (!latestReplayRequestTemplate) {
       return null;
     }
+    const endpointKind = latestConversationEndpointKind ||
+      CONVERSATION_ENDPOINT_CURRENT;
     return {
       url: buildConversationApiUrl(conversationId),
-      headers: applyConversationTargetHeaders(new Headers(latestReplayRequestTemplate.headers), conversationId),
-      capturedAt: latestReplayRequestTemplate.capturedAt
+      headers: applyConversationTargetHeaders(
+        new Headers(latestReplayRequestTemplate.headers),
+        conversationId,
+        endpointKind
+      ),
+      capturedAt: latestReplayRequestTemplate.capturedAt,
+      endpointKind
     };
   }
   /*
@@ -6409,6 +6536,7 @@
     if (handoffButton) {
       handoffButton.remove();
     }
+    clearCurrentAppShellHeaderMarkers();
   }
   /*
    * 建立和 ChatGPT header action 風格接近的按鈕。
@@ -6550,25 +6678,117 @@
     }
   }
   /*
+   * 取得目前 Header action 中的原生分享按鈕。
+   *
+   * 舊版優先使用固定 data-testid；新版 App Shell 則使用 userscript 自己標記的
+   * native share button。若 marker 尚未建立，最後才依「更多」action 前一個原生
+   * action 的結構關係辨識，避免把介面語言文案當成主要 selector。
+   */
+  function findNativeShareButton(headerActions) {
+    if (!headerActions) {
+      return null;
+    }
+    const legacyShareButton = headerActions.querySelector(SHARE_BUTTON_SELECTOR);
+    if (legacyShareButton) {
+      return legacyShareButton;
+    }
+    const markedShareButton = headerActions.querySelector(
+      'button[data-cgpt-native-share-button="true"]'
+    );
+    if (markedShareButton) {
+      return markedShareButton;
+    }
+    const optionsButton = headerActions.querySelector('button[aria-haspopup="menu"]');
+    const optionsAction = getDirectChildWithin(headerActions, optionsButton);
+    let candidateAction = optionsAction?.previousElementSibling || null;
+    while (candidateAction?.matches?.('[data-cgpt-export-button="true"]')) {
+      candidateAction = candidateAction.previousElementSibling;
+    }
+    const candidateButton = candidateAction?.matches?.('button')
+      ? candidateAction
+      : candidateAction?.querySelector?.('button');
+    if (candidateButton && !candidateButton.hasAttribute('data-cgpt-export-button')) {
+      return candidateButton;
+    }
+    return null;
+  }
+  /*
+   * 在新版 App Shell Header 上建立 userscript 專用 marker。
+   *
+   * marker 只標記目前已由穩定 App Shell 結構辨識出的 action group 與原生分享按鈕，
+   * 讓 CSS 與後續量測不必依賴模組 class 或本地化文字。
+   */
+  function markCurrentAppShellHeaderActions(headerActions) {
+    if (!headerActions) {
+      return headerActions;
+    }
+    headerActions.setAttribute('data-cgpt-export-header-actions', 'true');
+    const shareButton = findNativeShareButton(headerActions);
+    if (shareButton) {
+      shareButton.setAttribute('data-cgpt-native-share-button', 'true');
+    }
+    return headerActions;
+  }
+  /*
+   * 離開對話頁時清除新版 App Shell 專用 marker。
+   */
+  function clearCurrentAppShellHeaderMarkers() {
+    for (const shareButton of document.querySelectorAll('[data-cgpt-native-share-button="true"]')) {
+      shareButton.removeAttribute('data-cgpt-native-share-button');
+    }
+    for (const headerActions of document.querySelectorAll(CURRENT_HEADER_ACTIONS_SELECTOR)) {
+      headerActions.removeAttribute('data-cgpt-header-compact');
+      headerActions.removeAttribute('data-cgpt-export-header-actions');
+    }
+  }
+  /*
+   * 取得新版 App Shell 對話頁右側 action group。
+   *
+   * 先用固定 App Shell titlebar / context-menu surface / obstacle attribute 收斂範圍，
+   * 再從右側 obstacle 內的原生 menu button 反推同列 action group。
+   * 不依賴 build/module class，也不使用「分享」「更多」等介面文案作主要錨點。
+   */
+  function findCurrentAppShellHeaderActionsContainer() {
+    const titlebar = document.querySelector('header[data-app-shell-titlebar="true"]');
+    const surface = titlebar?.querySelector(
+      '[data-testid="app-shell-header-context-menu-surface"]'
+    );
+    if (!surface) {
+      return null;
+    }
+    const obstacles = Array.from(
+      surface.querySelectorAll('[data-app-shell-header-obstacle="true"]')
+    );
+    for (const obstacle of obstacles) {
+      const optionsButton = obstacle.querySelector('button[aria-haspopup="menu"]');
+      const actionGroup = optionsButton?.parentElement || null;
+      if (!actionGroup || !obstacle.contains(actionGroup)) {
+        continue;
+      }
+      return markCurrentAppShellHeaderActions(actionGroup);
+    }
+    return null;
+  }
+  /*
    * 取得匯出按鈕應插入的 header action 容器。
    *
-   * 優先使用目前最精準的 #conversation-header-actions；
-   * 若 ChatGPT 前端調整 DOM，則依序退回 thread header 右側 action 區與 page header。
+   * 先保留舊版 #conversation-header-actions 與 thread header fallback；
+   * 若舊路徑不存在，再使用 2026-09 App Shell 的穩定結構建立 current branch。
    */
   function findHeaderActionsContainer() {
-    const selectors = [
-      '#conversation-header-actions',
+    const legacySelectors = [
+      LEGACY_HEADER_ACTIONS_SELECTOR,
       '[data-testid="thread-header-right-actions"]',
       '[data-testid="thread-header-right-actions-container"]',
       '#page-header'
     ];
-    for (const selector of selectors) {
+    for (const selector of legacySelectors) {
       const element = document.querySelector(selector);
       if (element) {
         return element;
       }
     }
-    return null;
+    return findCurrentAppShellHeaderActionsContainer();
   }
   /*
    * 取得或建立指定匯出按鈕。
@@ -6635,8 +6855,12 @@
    * 避免 ChatGPT DOM 結構小幅變動時按鈕直接消失。
    */
   function placeExportButtons(headerActions, rawButton, handoffButton) {
-    const shareButton = headerActions.querySelector(SHARE_BUTTON_SELECTOR);
-    const optionsButton = headerActions.querySelector('[data-testid="conversation-options-button"]');
+    const shareButton = findNativeShareButton(headerActions);
+    const optionsButton =
+      headerActions.querySelector('[data-testid="conversation-options-button"]') ||
+      (headerActions.matches(CURRENT_HEADER_ACTIONS_SELECTOR)
+        ? headerActions.querySelector('button[aria-haspopup="menu"]')
+        : null);
     const shareAction = getDirectChildWithin(headerActions, shareButton);
     const optionsAction = getDirectChildWithin(headerActions, optionsButton);
     if (shareAction) {
@@ -6652,6 +6876,26 @@
     }
     if (rawButton.nextElementSibling !== handoffButton) {
       rawButton.insertAdjacentElement('afterend', handoffButton);
+    }
+  }
+  /*
+   * 新版 App Shell 中沿用原生分享按鈕的 class，讓匯出按鈕維持同一套 toolbar 外觀。
+   *
+   * 只同步 className，不複製原生 event listener、ARIA menu 狀態或其他互動屬性。
+   */
+  function syncCurrentHeaderButtonPresentation(headerActions, ...buttons) {
+    if (!headerActions?.matches?.(CURRENT_HEADER_ACTIONS_SELECTOR)) {
+      return;
+    }
+    const shareButton = findNativeShareButton(headerActions);
+    if (!shareButton?.className) {
+      return;
+    }
+    for (const button of buttons) {
+      if (!button) {
+        continue;
+      }
+      button.className = shareButton.className;
     }
   }
   /*
@@ -6803,7 +7047,7 @@
    * 螢幕閱讀器把可見文字與 aria-label 重複朗讀。
    */
   function reconcileShareButtonLabel(headerActions) {
-    const shareButton = headerActions?.querySelector(SHARE_BUTTON_SELECTOR);
+    const shareButton = findNativeShareButton(headerActions);
     if (!shareButton) {
       return null;
     }
@@ -6854,7 +7098,10 @@
     for (const nativeLabel of document.querySelectorAll('[data-cgpt-share-label="native"]')) {
       nativeLabel.removeAttribute('data-cgpt-share-label');
     }
-    for (const headerActions of document.querySelectorAll(`${HEADER_ACTIONS_SELECTOR}[data-cgpt-header-compact]`)) {
+    for (const headerActions of document.querySelectorAll(
+      `${LEGACY_HEADER_ACTIONS_SELECTOR}[data-cgpt-header-compact], ` +
+      `${CURRENT_HEADER_ACTIONS_SELECTOR}[data-cgpt-header-compact]`
+    )) {
       headerActions.removeAttribute('data-cgpt-header-compact');
     }
   }
@@ -6862,30 +7109,44 @@
    * 取得 page header 左右主要區塊，供 expanded 狀態的實際碰撞檢查使用。
    */
   function getHeaderLayoutParts(headerActions) {
-    const pageHeader = headerActions?.closest('header#page-header');
-    if (!pageHeader) {
+    const legacyPageHeader = headerActions?.closest('header#page-header');
+    if (legacyPageHeader) {
+      const rightActions = headerActions.closest('[data-testid="thread-header-right-actions"]');
+      const rightActionsContainer = headerActions.closest(
+        '[data-testid="thread-header-right-actions-container"]'
+      );
+      const rightRegion = getDirectChildWithin(
+        legacyPageHeader,
+        rightActionsContainer || rightActions || headerActions
+      );
+      const leftRegion = Array.from(legacyPageHeader.children).find((child) => {
+        if (child === rightRegion) {
+          return false;
+        }
+        const style = getComputedStyle(child);
+        const rect = child.getBoundingClientRect();
+        return style.position !== 'absolute' && style.display !== 'none' && rect.width > 0 && rect.height > 0;
+      }) || null;
+      return {
+        pageHeader: legacyPageHeader,
+        rightActions,
+        rightActionsContainer,
+        rightRegion,
+        leftRegion
+      };
+    }
+    const appShellSurface = headerActions?.closest(
+      '[data-testid="app-shell-header-context-menu-surface"]'
+    );
+    if (!appShellSurface) {
       return null;
     }
-    const rightActions = headerActions.closest('[data-testid="thread-header-right-actions"]');
-    const rightActionsContainer = headerActions.closest(
-      '[data-testid="thread-header-right-actions-container"]'
-    );
-    const rightRegion = getDirectChildWithin(
-      pageHeader,
-      rightActionsContainer || rightActions || headerActions
-    );
-    const leftRegion = Array.from(pageHeader.children).find((child) => {
-      if (child === rightRegion) {
-        return false;
-      }
-      const style = getComputedStyle(child);
-      const rect = child.getBoundingClientRect();
-      return style.position !== 'absolute' && style.display !== 'none' && rect.width > 0 && rect.height > 0;
-    }) || null;
+    const rightRegion = headerActions.closest('[data-app-shell-header-obstacle="true"]');
+    const leftRegion = rightRegion?.previousElementSibling || null;
     return {
-      pageHeader,
-      rightActions,
-      rightActionsContainer,
+      pageHeader: appShellSurface,
+      rightActions: headerActions,
+      rightActionsContainer: rightRegion,
       rightRegion,
       leftRegion
     };
@@ -7134,6 +7395,9 @@
       return;
     }
     stopObservingHeaderActionLayout();
+    if (headerActions.closest('[data-testid="app-shell-header-context-menu-surface"]')) {
+      markCurrentAppShellHeaderActions(headerActions);
+    }
     observedHeaderActionLayoutTargets = {
       headerActions,
       rawButton,
@@ -7218,6 +7482,7 @@
       iconSvg: HANDOFF_ICON_SVG,
       onClick: handleDownloadHandoffClick
     });
+    syncCurrentHeaderButtonPresentation(headerActions, rawButton, handoffButton);
     placeExportButtons(headerActions, rawButton, handoffButton);
     updateButtonState();
     observeHeaderActionLayout(headerActions, rawButton, handoffButton);
@@ -10774,6 +11039,7 @@
     activeExportState = null;
     setAllButtonsBusy(false);
     updateButtonState();
+    ensureFetchInterceptor();
     ensureButtonsSoon();
     ensureBatchUi();
   }
@@ -10812,6 +11078,7 @@
    */
   function startLightPolling() {
     window.setInterval(() => {
+      ensureFetchInterceptor();
       handleRouteMaybeChanged();
       if (isConversationPage()) {
         insertButtonsOnce();
@@ -10864,7 +11131,7 @@
    *
    * UI 插入則等 DOM 可用後再開始。
    */
-  installFetchInterceptor();
+  ensureFetchInterceptor();
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', startUi, { once: true });
   } else {
