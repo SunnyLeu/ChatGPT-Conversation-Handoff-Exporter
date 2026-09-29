@@ -2,7 +2,7 @@
 // @name         ChatGPT 對話 JSON 與交接檔匯出工具
 // @name:en      ChatGPT Conversation Handoff Exporter
 // @namespace    https://github.com/SunnyLeu/ChatGPT-Conversation-Handoff-Exporter
-// @version      1.5.10
+// @version      1.5.11
 // @description  匯出 ChatGPT raw / handoff / complete JSON；handoff v2 採 Structure-first / Preserve-on-unknown 完整保留交接文字，並支援受控批次原始、交接與完整 JSON session。
 // @description:en Export ChatGPT raw / handoff / complete JSON; handoff v2 uses structure-first, preserve-on-unknown semantics and supports controlled raw, handoff, and complete batch sessions.
 // @author       SunnyLeu
@@ -22,7 +22,8 @@
  * 這是一個 Tampermonkey / Userscript 腳本。
  *
  * 主要用途：
- *   1. 在 ChatGPT 對話頁右上角新增三個按鈕：
+ *   1. 在 ChatGPT 對話頁右上角、原生「分享」旁新增一個「匯出」選單按鈕。
+ *      按鈕沿用交接 JSON 圖示；點擊後使用目前 ChatGPT 原生選單結構與既有樣式提供：
  *      -「下載原始 JSON」
  *      -「下載交接 JSON」
  *      -「下載完整 JSON」
@@ -84,7 +85,7 @@
    *   - 多次包裝 window.fetch
    *   - 重複的 timer / listener
    */
-  const INSTALL_FLAG = '__chatgptConversationHandoffExporterInstalled_v1510';
+  const INSTALL_FLAG = '__chatgptConversationHandoffExporterInstalled_v1511';
   /*
    * 匯出按鈕事件綁定標記。
    *
@@ -92,7 +93,7 @@
    * click listener 是否屬於目前腳本，必要時重建按鈕以避免殘留
    * listener 或 conversation 狀態。
    */
-  const EXPORT_BUTTON_LISTENER_VERSION = '1.5.10';
+  const EXPORT_BUTTON_LISTENER_VERSION = '1.5.11';
   /*
    * 匯出器與 handoff schema 版本。
    *
@@ -102,7 +103,7 @@
    * HANDOFF_SCHEMA_VERSION：
    *   與 userscript 版本分離；只有 handoff 結構或語意改版時才升版。
    */
-  const EXPORTER_VERSION = '1.5.10';
+  const EXPORTER_VERSION = '1.5.11';
   const HANDOFF_SCHEMA_VERSION = '2.0';
   /*
    * Structure-first / Preserve-on-unknown：
@@ -112,21 +113,19 @@
    */
   const NORMAL_MESSAGE_STATUS = 'finished_successfully';
   /*
-   * 三個單一對話匯出按鈕的 DOM id。
+   * 單一對話匯出選單的 DOM id。
    *
-   * raw button：
-   *   下載 ChatGPT 原始 conversation JSON。
-   *
-   * handoff button：
-   *   將原始 conversation JSON 轉換成 handoff JSON 後下載。
-   *
-   * complete button：
-   *   使用同一份 authoritative snapshot，分別下載 raw / textdocs / handoff JSON；
-   *   不建立 ZIP。
+   * Header 常駐只保留一顆「匯出」觸發按鈕；選單內再提供 raw / handoff /
+   * complete 三種既有匯出動作。舊版三顆 Header 按鈕 id 只保留給升版時清理
+   * SPA 可能殘留的節點，不再作為正式操作入口。
    */
-  const RAW_BUTTON_ID = 'cgpt-export-raw-json-button';
-  const HANDOFF_BUTTON_ID = 'cgpt-export-handoff-json-button';
-  const COMPLETE_BUTTON_ID = 'cgpt-export-complete-json-button';
+  const EXPORT_MENU_BUTTON_ID = 'cgpt-export-menu-button';
+  const EXPORT_MENU_ID = 'cgpt-export-menu';
+  const LEGACY_SINGLE_EXPORT_BUTTON_IDS = [
+    'cgpt-export-raw-json-button',
+    'cgpt-export-handoff-json-button',
+    'cgpt-export-complete-json-button'
+  ];
   /*
    * Header action 共用 selector 與幾何量測容差。
    *
@@ -247,6 +246,8 @@
   let ensureTimer = null;
   let uiStarted = false;
   let activeExportState = null;
+  let exportMenuAbortController = null;
+  let exportMenuTriggerNode = null;
   /*
    * ChatGPT 回覆中的內嵌引用標記，例如：
    *   citeturn0search0
@@ -6359,12 +6360,13 @@
     }
   }
   /*
-   * 同步設定三個單一對話匯出按鈕的 busy 狀態。
+   * 同步設定單一對話匯出選單觸發按鈕的 busy 狀態。
+   *
+   * 選單項目不在 Header 常駐，因此匯出期間只需要鎖住觸發按鈕；
+   * 已開啟的選單會在開始匯出前關閉。
    */
   function setAllButtonsBusy(isBusy) {
-    setButtonBusy(RAW_BUTTON_ID, isBusy);
-    setButtonBusy(HANDOFF_BUTTON_ID, isBusy);
-    setButtonBusy(COMPLETE_BUTTON_ID, isBusy);
+    setButtonBusy(EXPORT_MENU_BUTTON_ID, isBusy);
   }
   /*
    * 標記目前有匯出流程正在進行。
@@ -6424,9 +6426,10 @@
    *   - 流程結束後恢復 UI
    *
    * 實際的 raw / handoff 匯出邏輯由 operation callback 提供，
-   * callback 可透過 updateProgress() 更新目前階段，讓三個單一對話匯出按鈕共用相同的 UI 狀態管理。
+   * callback 可透過 updateProgress() 更新目前階段，讓三種單一對話匯出動作共用相同的 UI 狀態管理。
    */
   async function runExportFlow({ buttonId, initialProgressText, errorLogMessage, operation, triggerEvent = null }) {
+    closeExportMenu({ restoreFocus: false });
     const triggerButton = triggerEvent && triggerEvent.currentTarget
       ? triggerEvent.currentTarget
       : document.querySelector(`#${buttonId}`);
@@ -6468,10 +6471,10 @@
     }
   }
   /*
-   * 建立按鈕 tooltip。
+   * 建立單一匯出觸發按鈕 tooltip。
    *
-   * 三個按鈕會使用不同 actionName，避免 title 看起來像共用同一段說明。
-   * tooltip 只顯示對話標題、conversation ID 與捕捉時間，不顯示 headers 或 raw JSON。
+   * tooltip 只顯示目前「匯出」入口、對話標題、conversation ID 與捕捉時間，
+   * 不顯示 headers 或 raw JSON。
    */
   function buildBaseTooltip({ actionName, conversationId, capture, replayRequest }) {
     const title = conversationId ? getKnownConversationTitle(conversationId) : '';
@@ -6491,64 +6494,32 @@
     return lines.join('\n');
   }
   /*
-   * 根據目前頁面狀態更新按鈕文字與 tooltip。
+   * 根據目前頁面狀態更新單一「匯出」觸發按鈕文字與 tooltip。
    *
-   * 按鈕文字維持動作名稱，避免在 SPA 導航或新對話頁面中殘留暫時狀態。
-   * 詳細狀態放在 tooltip 與錯誤訊息中呈現。
+   * Header 平時只顯示「匯出」；實際 raw / handoff / complete 動作由彈出選單
+   * 提供。匯出進行中時仍沿用既有進度文字，避免失去目前工作階段提示。
    */
   function updateButtonState() {
     const { conversationId, capture, replayRequest } = getCurrentState();
     const isExporting = applyExportInProgressState();
     if (!isConversationPage() || !conversationId) {
-      setButtonConversationId(RAW_BUTTON_ID, null);
-      setButtonConversationId(HANDOFF_BUTTON_ID, null);
-      setButtonConversationId(COMPLETE_BUTTON_ID, null);
+      setButtonConversationId(EXPORT_MENU_BUTTON_ID, null);
       if (!isExporting) {
-        setButtonText(RAW_BUTTON_ID, '下載原始 JSON');
-        setButtonText(HANDOFF_BUTTON_ID, '下載交接 JSON');
-        setButtonText(COMPLETE_BUTTON_ID, '下載完整 JSON');
-        setButtonTooltip(RAW_BUTTON_ID, '');
-        setButtonTooltip(HANDOFF_BUTTON_ID, '');
-        setButtonTooltip(COMPLETE_BUTTON_ID, '');
+        setButtonText(EXPORT_MENU_BUTTON_ID, '匯出');
+        setButtonTooltip(EXPORT_MENU_BUTTON_ID, '');
         setAllButtonsBusy(false);
       }
       return;
     }
-    setButtonConversationId(RAW_BUTTON_ID, conversationId);
-    setButtonConversationId(HANDOFF_BUTTON_ID, conversationId);
-    setButtonConversationId(COMPLETE_BUTTON_ID, conversationId);
+    setButtonConversationId(EXPORT_MENU_BUTTON_ID, conversationId);
     if (!isExporting) {
-      setButtonText(RAW_BUTTON_ID, '下載原始 JSON');
-      setButtonText(HANDOFF_BUTTON_ID, '下載交接 JSON');
-      setButtonText(COMPLETE_BUTTON_ID, '下載完整 JSON');
+      setButtonText(EXPORT_MENU_BUTTON_ID, '匯出');
       setAllButtonsBusy(false);
     }
-    const rawActionName = '下載目前對話的原始 raw conversation JSON';
-    const handoffActionName = '產出並下載目前對話的交接 handoff JSON';
-    const completeActionName =
-      '以同一份 authoritative snapshot 分別下載原始、textdocs（若有）與交接 JSON；不建立 ZIP';
     setButtonTooltip(
-      RAW_BUTTON_ID,
+      EXPORT_MENU_BUTTON_ID,
       buildBaseTooltip({
-        actionName: rawActionName,
-        conversationId,
-        capture,
-        replayRequest
-      })
-    );
-    setButtonTooltip(
-      HANDOFF_BUTTON_ID,
-      buildBaseTooltip({
-        actionName: handoffActionName,
-        conversationId,
-        capture,
-        replayRequest
-      })
-    );
-    setButtonTooltip(
-      COMPLETE_BUTTON_ID,
-      buildBaseTooltip({
-        actionName: completeActionName,
+        actionName: '匯出目前對話 JSON',
         conversationId,
         capture,
         replayRequest
@@ -6556,30 +6527,37 @@
     );
   }
   /*
-   * 離開對話頁時移除匯出按鈕。
+   * 離開對話頁時移除單一匯出觸發按鈕與彈出選單。
    *
    * ChatGPT 是 SPA，網址切換時不一定重新載入頁面，因此需要主動清理既有 UI 狀態。
+   * 同時清除 v1.5.10 以前可能殘留的三顆單一匯出 Header 按鈕。
    */
   function removeButtonsIfNeeded() {
     stopObservingHeaderActionLayout();
-    const rawButton = document.querySelector(`#${RAW_BUTTON_ID}`);
-    const handoffButton = document.querySelector(`#${HANDOFF_BUTTON_ID}`);
-    const completeButton = document.querySelector(`#${COMPLETE_BUTTON_ID}`);
-    if (rawButton) {
-      rawButton.remove();
+    closeExportMenu({ restoreFocus: false });
+    const exportButton = document.querySelector(`#${EXPORT_MENU_BUTTON_ID}`);
+    if (exportButton) {
+      exportButton.remove();
     }
-    if (handoffButton) {
-      handoffButton.remove();
-    }
-    if (completeButton) {
-      completeButton.remove();
+    for (const legacyButtonId of LEGACY_SINGLE_EXPORT_BUTTON_IDS) {
+      for (const legacyButton of document.querySelectorAll(`#${legacyButtonId}`)) {
+        legacyButton.remove();
+      }
     }
     clearCurrentAppShellHeaderMarkers();
   }
   /*
    * 建立和 ChatGPT header action 風格接近的按鈕。
    */
-  function createHeaderButton({ id, label, ariaLabel, testId, iconSvg, onClick }) {
+  function createHeaderButton({
+    id,
+    label,
+    ariaLabel,
+    testId,
+    iconSvg,
+    onClick,
+    onKeyDown = null
+  }) {
     const button = document.createElement('button');
     button.id = id;
     button.type = 'button';
@@ -6621,8 +6599,420 @@
       updateButtonState();
     });
     button.addEventListener('click', onClick);
+    if (typeof onKeyDown === 'function') {
+      button.addEventListener('keydown', onKeyDown);
+    }
     button.setAttribute('data-cgpt-export-listener-version', EXPORT_BUTTON_LISTENER_VERSION);
     return button;
+  }
+  /*
+   * 單一對話匯出選單直接沿用目前 ChatGPT 原生 Radix menu content 的
+   * DOM attribute 與既有 utility class；不另外注入 <style>，也不新增
+   * Exporter 專用選單樣式。
+   *
+   * 目的：
+   *   - ChatGPT 自己的 menu 樣式直接生效。
+   *   - 專案現有針對 div[data-radix-menu-content][role="menu"] 的 CSS
+   *     自動套用，不需要另外維護一套 Exporter 選單規則。
+   *   - data-cgpt-* 只保留作為腳本辨識、互動與清理錨點。
+   */
+  const NATIVE_EXPORT_MENU_CLASS = [
+    'no-drag',
+    'z-50',
+    'm-px',
+    'flex',
+    'select-none',
+    'flex-col',
+    'overflow-y-auto',
+    'bg-surface-elevated-secondary/90',
+    'text-default',
+    'ring-border',
+    'ring-[0.5px]',
+    'shadow-xl-spread',
+    'backdrop-blur-sm',
+    'rounded-2xl',
+    'p-[var(--app-menu-gutter,var(--spacing))]',
+    'min-w-[var(--app-menu-min-width,220px)]'
+  ].join(' ');
+  const NATIVE_EXPORT_MENU_ITEM_CLASS = [
+    'no-drag',
+    'outline-hidden',
+    'flex',
+    'min-h-[var(--app-menu-item-height,0px)]',
+    'shrink-0',
+    'items-center',
+    'justify-center',
+    'p-[var(--app-menu-item-padding,var(--padding-row-y)_var(--padding-row-x))]',
+    'text-(length:--app-menu-item-font-size,var(--text-sm))',
+    'leading-(--app-menu-item-line-height,var(--text-sm--line-height))',
+    'rounded-xl',
+    'text-default',
+    'group',
+    'hover:bg-primary-ghost-hover',
+    'focus:bg-primary-ghost-hover',
+    'focus-visible:bg-primary-ghost-hover',
+    'data-[highlighted]:bg-primary-ghost-hover',
+    'cursor-interaction',
+    'flex-col'
+  ].join(' ');
+  /*
+   * 將匯出選單的 popper wrapper 放在 Header 觸發按鈕附近。
+   *
+   * wrapper / menu 的 attribute 與目前 ChatGPT 原生 Radix DropdownMenu
+   * 結構一致；定位仍由 userscript 自己計算，避免依賴 React / Radix runtime。
+   */
+  function positionExportMenu(menu, triggerButton) {
+    if (!menu?.isConnected || !triggerButton?.isConnected) {
+      return;
+    }
+    const wrapper = menu.closest('[data-cgpt-export-menu-wrapper="true"]');
+    if (!wrapper) {
+      return;
+    }
+    const triggerRect = triggerButton.getBoundingClientRect();
+    if (triggerRect.width <= 0 || triggerRect.height <= 0) {
+      return;
+    }
+    const viewportEdge = 8;
+    const triggerGap = 1;
+    const menuRect = menu.getBoundingClientRect();
+    const menuWidth = Math.max(menuRect.width, 1);
+    const menuHeight = Math.max(menuRect.height, 1);
+    let left = triggerRect.left;
+    left = Math.min(left, window.innerWidth - menuWidth - viewportEdge);
+    left = Math.max(viewportEdge, left);
+    const spaceBelow = window.innerHeight - triggerRect.bottom - viewportEdge;
+    const spaceAbove = triggerRect.top - viewportEdge;
+    let top;
+    let side = 'bottom';
+    if (spaceBelow >= menuHeight || spaceBelow >= spaceAbove) {
+      top = triggerRect.bottom + triggerGap;
+    } else {
+      side = 'top';
+      top = triggerRect.top - menuHeight - triggerGap;
+    }
+    top = Math.min(top, window.innerHeight - menuHeight - viewportEdge);
+    top = Math.max(viewportEdge, top);
+    menu.dataset.side = side;
+    menu.dataset.align = 'start';
+    wrapper.style.transform = `translate(${Math.round(left * 100) / 100}px, ${Math.round(top * 100) / 100}px)`;
+    wrapper.style.setProperty(
+      '--radix-popper-available-width',
+      `${Math.max(0, window.innerWidth - viewportEdge * 2)}px`
+    );
+    wrapper.style.setProperty(
+      '--radix-popper-available-height',
+      `${Math.max(0, window.innerHeight - viewportEdge * 2)}px`
+    );
+    wrapper.style.setProperty('--radix-popper-anchor-width', `${triggerRect.width}px`);
+    wrapper.style.setProperty('--radix-popper-anchor-height', `${triggerRect.height}px`);
+  }
+  /*
+   * 關閉匯出選單並清理暫時 listener / popper wrapper。
+   */
+  function closeExportMenu({ restoreFocus = false } = {}) {
+    if (exportMenuAbortController) {
+      exportMenuAbortController.abort();
+      exportMenuAbortController = null;
+    }
+    const menu = document.getElementById(EXPORT_MENU_ID);
+    const wrapper = menu?.closest('[data-cgpt-export-menu-wrapper="true"]') || null;
+    if (wrapper) {
+      wrapper.remove();
+    } else if (menu) {
+      menu.remove();
+    }
+    const triggerButton = exportMenuTriggerNode || document.getElementById(EXPORT_MENU_BUTTON_ID);
+    exportMenuTriggerNode = null;
+    if (triggerButton) {
+      triggerButton.setAttribute('aria-expanded', 'false');
+      triggerButton.setAttribute('data-state', 'closed');
+      triggerButton.removeAttribute('aria-controls');
+      if (restoreFocus && triggerButton.isConnected && !triggerButton.disabled) {
+        triggerButton.focus({ preventScroll: true });
+      }
+    }
+  }
+  function setExportMenuHighlightedItem(item) {
+    const menu = item?.closest?.(`#${EXPORT_MENU_ID}`);
+    if (!menu) {
+      return;
+    }
+    for (const sibling of menu.querySelectorAll(
+      '[data-cgpt-export-menu-item="true"][data-highlighted]'
+    )) {
+      if (sibling !== item) {
+        sibling.removeAttribute('data-highlighted');
+      }
+    }
+    item.setAttribute('data-highlighted', '');
+  }
+  /*
+   * 建立目前 ChatGPT 原生 action menu 同型的單一選單項目。
+   * 三個 inline SVG 直接沿用 v1.5.10 既有圖示，不修改圖形本身。
+   */
+  function createExportMenuItem({ label, iconSvg, onSelect, conversationId }) {
+    const item = document.createElement('div');
+    item.setAttribute('role', 'menuitem');
+    item.setAttribute('tabindex', '-1');
+    item.setAttribute('data-orientation', 'vertical');
+    item.setAttribute('data-radix-collection-item', '');
+    item.setAttribute('data-cgpt-export-menu-item', 'true');
+    item.className = NATIVE_EXPORT_MENU_ITEM_CLASS;
+    if (conversationId) {
+      item.setAttribute('data-cgpt-export-conversation-id', conversationId);
+    }
+    item.innerHTML = `
+      <div data-menu-row-content="true" data-cgpt-export-menu-row="true" class="flex w-full min-w-0 items-center gap-[var(--spacing-menu-item-content,calc(var(--spacing)*1.5))]">
+        <span class="flex-1 min-w-0 truncate">
+          <span class="flex w-full items-center gap-1.5">
+            <span data-cgpt-export-menu-icon="true" class="flex h-[var(--icon-leading-size)] w-[var(--icon-leading-size)] shrink-0 items-center justify-center">${iconSvg || ''}</span>
+            <span data-cgpt-export-menu-label="true" class="truncate">${label}</span>
+          </span>
+        </span>
+      </div>
+    `;
+    item.addEventListener('mouseenter', () => {
+      setExportMenuHighlightedItem(item);
+    });
+    item.addEventListener('focus', () => {
+      setExportMenuHighlightedItem(item);
+    });
+    item.addEventListener('mouseleave', () => {
+      if (document.activeElement !== item) {
+        item.removeAttribute('data-highlighted');
+      }
+    });
+    item.addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      const triggerButton = document.getElementById(EXPORT_MENU_BUTTON_ID);
+      closeExportMenu({ restoreFocus: false });
+      if (!triggerButton || triggerButton.disabled) {
+        return;
+      }
+      onSelect({ currentTarget: triggerButton });
+    });
+    return item;
+  }
+  /*
+   * 匯出選單鍵盤操作：
+   * ArrowUp / ArrowDown、Home / End、Enter / Space、Escape。
+   */
+  function handleExportMenuKeyDown(event) {
+    const menu = document.getElementById(EXPORT_MENU_ID);
+    if (!menu) {
+      return;
+    }
+    const items = Array.from(
+      menu.querySelectorAll('[data-cgpt-export-menu-item="true"]')
+    );
+    if (!items.length) {
+      return;
+    }
+    const currentIndex = items.indexOf(document.activeElement);
+    let nextIndex = currentIndex;
+    if (event.key === 'ArrowDown') {
+      nextIndex = currentIndex < 0 ? 0 : (currentIndex + 1) % items.length;
+    } else if (event.key === 'ArrowUp') {
+      nextIndex = currentIndex < 0
+        ? items.length - 1
+        : (currentIndex - 1 + items.length) % items.length;
+    } else if (event.key === 'Home') {
+      nextIndex = 0;
+    } else if (event.key === 'End') {
+      nextIndex = items.length - 1;
+    } else if (event.key === 'Escape') {
+      event.preventDefault();
+      event.stopPropagation();
+      closeExportMenu({ restoreFocus: true });
+      return;
+    } else if (event.key === 'Enter' || event.key === ' ') {
+      if (currentIndex >= 0) {
+        event.preventDefault();
+        items[currentIndex].click();
+      }
+      return;
+    } else if (event.key === 'Tab') {
+      closeExportMenu({ restoreFocus: false });
+      return;
+    } else {
+      return;
+    }
+    event.preventDefault();
+    items[nextIndex].focus({ preventScroll: true });
+  }
+  /*
+   * 開啟單一對話匯出選單。
+   */
+  function openExportMenu(triggerButton, { focusLast = false } = {}) {
+    if (
+      !triggerButton?.isConnected ||
+      triggerButton.disabled ||
+      !isConversationPage()
+    ) {
+      return;
+    }
+    closeExportMenu({ restoreFocus: false });
+    const conversationId = getConversationIdFromUrl();
+    const direction = document.documentElement.dir || 'ltr';
+    const wrapper = document.createElement('div');
+    wrapper.setAttribute('data-radix-popper-content-wrapper', '');
+    wrapper.setAttribute('data-cgpt-export-menu-wrapper', 'true');
+    wrapper.dir = direction;
+    Object.assign(wrapper.style, {
+      position: 'fixed',
+      left: '0px',
+      top: '0px',
+      transform: 'translate(0px, 0px)',
+      minWidth: 'max-content',
+      willChange: 'transform',
+      zIndex: '50'
+    });
+    wrapper.style.setProperty('--radix-popper-transform-origin', '0% 0px');
+    const menu = document.createElement('div');
+    menu.id = EXPORT_MENU_ID;
+    menu.setAttribute('role', 'menu');
+    menu.setAttribute('aria-orientation', 'vertical');
+    menu.setAttribute('aria-labelledby', triggerButton.id);
+    menu.setAttribute('tabindex', '-1');
+    menu.setAttribute('data-state', 'open');
+    menu.setAttribute('data-radix-menu-content', '');
+    menu.setAttribute('data-orientation', 'vertical');
+    menu.setAttribute('data-cgpt-export-menu', 'true');
+    menu.dir = direction;
+    menu.className = NATIVE_EXPORT_MENU_CLASS;
+    Object.assign(menu.style, {
+      outline: 'none',
+      maxWidth: 'min(var(--radix-dropdown-menu-content-available-width), calc(100vw - 16px))',
+      maxHeight: 'min(var(--radix-dropdown-menu-content-available-height), calc(100vh - 16px))'
+    });
+    menu.style.setProperty(
+      '--radix-dropdown-menu-content-transform-origin',
+      'var(--radix-popper-transform-origin)'
+    );
+    menu.style.setProperty(
+      '--radix-dropdown-menu-content-available-width',
+      'var(--radix-popper-available-width)'
+    );
+    menu.style.setProperty(
+      '--radix-dropdown-menu-content-available-height',
+      'var(--radix-popper-available-height)'
+    );
+    menu.style.setProperty(
+      '--radix-dropdown-menu-trigger-width',
+      'var(--radix-popper-anchor-width)'
+    );
+    menu.style.setProperty(
+      '--radix-dropdown-menu-trigger-height',
+      'var(--radix-popper-anchor-height)'
+    );
+    const itemConfigs = [
+      {
+        label: '下載原始 JSON',
+        iconSvg: RAW_JSON_ICON_SVG,
+        onSelect: handleDownloadRawClick
+      },
+      {
+        label: '下載交接 JSON',
+        iconSvg: HANDOFF_ICON_SVG,
+        onSelect: handleDownloadHandoffClick
+      },
+      {
+        label: '下載完整 JSON',
+        iconSvg: COMPLETE_JSON_ICON_SVG,
+        onSelect: handleDownloadCompleteClick
+      }
+    ];
+    for (const config of itemConfigs) {
+      menu.append(
+        createExportMenuItem({
+          ...config,
+          conversationId
+        })
+      );
+    }
+    wrapper.append(menu);
+    document.body.append(wrapper);
+    exportMenuTriggerNode = triggerButton;
+    triggerButton.setAttribute('aria-haspopup', 'menu');
+    triggerButton.setAttribute('aria-expanded', 'true');
+    triggerButton.setAttribute('aria-controls', EXPORT_MENU_ID);
+    triggerButton.setAttribute('data-state', 'open');
+    positionExportMenu(menu, triggerButton);
+    exportMenuAbortController = new AbortController();
+    const { signal } = exportMenuAbortController;
+    document.addEventListener(
+      'pointerdown',
+      (event) => {
+        const target = event.target;
+        if (
+          menu.contains(target) ||
+          triggerButton.contains(target)
+        ) {
+          return;
+        }
+        closeExportMenu({ restoreFocus: false });
+      },
+      { capture: true, signal }
+    );
+    window.addEventListener(
+      'resize',
+      () => {
+        positionExportMenu(menu, triggerButton);
+      },
+      { passive: true, signal }
+    );
+    window.addEventListener(
+      'scroll',
+      () => {
+        positionExportMenu(menu, triggerButton);
+      },
+      { capture: true, passive: true, signal }
+    );
+    menu.addEventListener('keydown', handleExportMenuKeyDown, { signal });
+    const items = Array.from(
+      menu.querySelectorAll('[data-cgpt-export-menu-item="true"]')
+    );
+    const focusTarget = focusLast ? items.at(-1) : items[0];
+    if (focusTarget) {
+      requestAnimationFrame(() => {
+        if (menu.isConnected) {
+          focusTarget.focus({ preventScroll: true });
+        }
+      });
+    }
+  }
+  /*
+   * Header「匯出」觸發按鈕 click / keyboard 行為。
+   */
+  function toggleExportMenu(event) {
+    const triggerButton = event.currentTarget;
+    const existingMenu = document.getElementById(EXPORT_MENU_ID);
+    if (existingMenu) {
+      closeExportMenu({ restoreFocus: false });
+      return;
+    }
+    openExportMenu(triggerButton);
+  }
+  function handleExportMenuTriggerKeyDown(event) {
+    if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp') {
+      return;
+    }
+    event.preventDefault();
+    const triggerButton = event.currentTarget;
+    const existingMenu = document.getElementById(EXPORT_MENU_ID);
+    if (existingMenu) {
+      const items = Array.from(
+        existingMenu.querySelectorAll('[data-cgpt-export-menu-item="true"]')
+      );
+      const target = event.key === 'ArrowUp' ? items.at(-1) : items[0];
+      target?.focus({ preventScroll: true });
+      return;
+    }
+    openExportMenu(triggerButton, {
+      focusLast: event.key === 'ArrowUp'
+    });
   }
   /*
    * 執行「下載原始 JSON」的實際匯出工作。
@@ -6720,7 +7110,7 @@
    */
   async function handleDownloadRawClick(event) {
     await runExportFlow({
-      buttonId: RAW_BUTTON_ID,
+      buttonId: EXPORT_MENU_BUTTON_ID,
       initialProgressText: '正在擷取原始 JSON…',
       errorLogMessage: '下載原始 JSON 失敗。',
       operation: exportRawConversationFiles,
@@ -6735,7 +7125,7 @@
    */
   async function handleDownloadHandoffClick(event) {
     await runExportFlow({
-      buttonId: HANDOFF_BUTTON_ID,
+      buttonId: EXPORT_MENU_BUTTON_ID,
       initialProgressText: '正在擷取原始 JSON…',
       errorLogMessage: '下載交接 JSON 失敗。',
       operation: exportHandoffFile,
@@ -6749,7 +7139,7 @@
    */
   async function handleDownloadCompleteClick(event) {
     await runExportFlow({
-      buttonId: COMPLETE_BUTTON_ID,
+      buttonId: EXPORT_MENU_BUTTON_ID,
       initialProgressText: '正在擷取原始 JSON…',
       errorLogMessage: '下載完整 JSON 失敗。',
       operation: exportCompleteConversationFiles,
@@ -6934,6 +7324,9 @@
     const existingButton = document.querySelector(`#${config.id}`);
     if (existingButton) {
       if (existingButton.getAttribute('data-cgpt-export-listener-version') !== EXPORT_BUTTON_LISTENER_VERSION) {
+        if (config.id === EXPORT_MENU_BUTTON_ID) {
+          closeExportMenu({ restoreFocus: false });
+        }
         const replacementButton = createHeaderButton(config);
         const existingCompact = existingButton.getAttribute('data-cgpt-export-compact');
         const existingConversationId = existingButton.getAttribute('data-cgpt-export-conversation-id');
@@ -6977,42 +7370,36 @@
     return current && current.parentElement === parent ? current : null;
   }
   /*
-   * 將匯出按鈕放到 ChatGPT header 的適當位置。
+   * 將單一「匯出」觸發按鈕放到 ChatGPT header 的適當位置。
    *
    * 目標順序：
-   *   分享 → 下載原始 JSON → 下載交接 JSON → 下載完整 JSON → 更多選單
+   *   分享 → 匯出 → 更多選單
    *
    * 使用 header action 的直接子元素作為插入錨點，避免匯出按鈕被放到
    * ChatGPT 原生按鈕的內層 wrapper 裡。
    *
-   * 若找不到分享按鈕或更多選單，仍會把三顆匯出按鈕插入 action 容器中，
+   * 若找不到分享按鈕或更多選單，仍會把匯出觸發按鈕插入 action 容器中，
    * 避免 ChatGPT DOM 結構小幅變動時按鈕直接消失。
    */
-  function placeExportButtons(headerActions, rawButton, handoffButton, completeButton) {
+  function placeExportButton(headerActions, exportButton) {
     const shareButton = findNativeShareButton(headerActions);
     const optionsButton =
       headerActions.querySelector('[data-testid="conversation-options-button"]') ||
       (headerActions.matches(CURRENT_HEADER_ACTIONS_SELECTOR)
-        ? headerActions.querySelector('button[aria-haspopup="menu"]')
+        ? headerActions.querySelector('button[aria-haspopup="menu"]:not([data-cgpt-export-button="true"])')
         : null);
     const shareAction = getDirectChildWithin(headerActions, shareButton);
     const optionsAction = getDirectChildWithin(headerActions, optionsButton);
     if (shareAction) {
-      if (shareAction.nextElementSibling !== rawButton) {
-        shareAction.insertAdjacentElement('afterend', rawButton);
+      if (shareAction.nextElementSibling !== exportButton) {
+        shareAction.insertAdjacentElement('afterend', exportButton);
       }
     } else if (optionsAction) {
-      if (optionsAction.previousElementSibling !== rawButton) {
-        optionsAction.insertAdjacentElement('beforebegin', rawButton);
+      if (optionsAction.previousElementSibling !== exportButton) {
+        optionsAction.insertAdjacentElement('beforebegin', exportButton);
       }
-    } else if (rawButton.parentElement !== headerActions) {
-      headerActions.append(rawButton);
-    }
-    if (rawButton.nextElementSibling !== handoffButton) {
-      rawButton.insertAdjacentElement('afterend', handoffButton);
-    }
-    if (handoffButton.nextElementSibling !== completeButton) {
-      handoffButton.insertAdjacentElement('afterend', completeButton);
+    } else if (exportButton.parentElement !== headerActions) {
+      headerActions.append(exportButton);
     }
   }
   /*
@@ -7048,29 +7435,25 @@
   let headerActionLayoutResizeHandler = null;
   let observedHeaderActionLayoutTargets = null;
   /*
-   * 將 compact 狀態同步寫入 action 容器與三顆匯出按鈕。
+   * 將 compact 狀態同步寫入 action 容器與單一匯出觸發按鈕。
    *
-   * data-cgpt-header-compact：分享 + 三顆匯出按鈕共用的版面狀態。
+   * data-cgpt-header-compact：分享 + 匯出觸發按鈕共用的版面狀態。
    * data-cgpt-export-compact：保留既有 CSS 相依介面，避免舊規則失效。
    */
   function setHeaderActionsCompact(
     headerActions,
-    rawButton,
-    handoffButton,
-    completeButton,
+    exportButton,
     isCompact
   ) {
     const value = isCompact ? 'true' : 'false';
     if (headerActions.getAttribute('data-cgpt-header-compact') !== value) {
       headerActions.setAttribute('data-cgpt-header-compact', value);
     }
-    for (const button of [rawButton, handoffButton, completeButton]) {
-      if (
-        button &&
-        button.getAttribute('data-cgpt-export-compact') !== value
-      ) {
-        button.setAttribute('data-cgpt-export-compact', value);
-      }
+    if (
+      exportButton &&
+      exportButton.getAttribute('data-cgpt-export-compact') !== value
+    ) {
+      exportButton.setAttribute('data-cgpt-export-compact', value);
     }
   }
   /*
@@ -7078,6 +7461,23 @@
    */
   function normalizeUiText(value) {
     return String(value || '').replace(/\s+/g, ' ').trim();
+  }
+  /*
+   * 只在分享按鈕自己的 subtree 內搜尋符合 selector 的節點。
+   *
+   * ChatGPT 開啟 Dialog 時會把背景 Header 設為 aria-hidden="true"，但 Header
+   * 仍維持可見。若直接使用 Element.closest()，搜尋會越過 shareButton 命中
+   * 背景 Header，進而把原生「分享」文字誤判為隱藏並建立重複 fallback。
+   */
+  function closestWithinShareButton(element, shareButton, selector) {
+    let current = element;
+    while (current && current !== shareButton) {
+      if (current.matches(selector)) {
+        return current;
+      }
+      current = current.parentElement;
+    }
+    return null;
   }
   /*
    * 判斷 element 是否為可接管顯示狀態的原生分享文字元素。
@@ -7092,10 +7492,13 @@
     if (element.matches('[data-cgpt-share-label="fallback"]')) {
       return false;
     }
-    if (element.closest('svg, [aria-hidden="true"]')) {
-      return false;
-    }
-    if (element.matches('.sr-only, [hidden]') || element.closest('.sr-only, [hidden]')) {
+    if (
+      closestWithinShareButton(
+        element,
+        shareButton,
+        'svg, [aria-hidden="true"], .sr-only, [hidden]'
+      )
+    ) {
       return false;
     }
     if (!element.matches('span, div, p, strong, em')) {
@@ -7161,7 +7564,9 @@
         )
       );
       const excluded = !parentElement || Boolean(
-        parentElement.closest(
+        closestWithinShareButton(
+          parentElement,
+          shareButton,
           '[data-cgpt-share-label="fallback"], svg, [aria-hidden="true"], .sr-only, [hidden]'
         )
       );
@@ -7359,7 +7764,7 @@
     return false;
   }
   /*
-   * 將離屏 clone 的分享 + 三顆匯出 Header action 切成指定版面狀態。
+   * 將離屏 clone 的分享 + 單一匯出 Header action 切成指定版面狀態。
    *
    * 只修改 clone 上既有的 data attribute；正式頁面的 DOM 不會在量測過程
    * 中切換，因此不會造成可見閃動或 ResizeObserver 回授迴圈。
@@ -7478,15 +7883,13 @@
     }
   }
   /*
-   * 排程分享 fallback reconciliation 與三顆匯出按鈕的共用版面狀態同步。
+   * 排程分享 fallback reconciliation 與單一匯出觸發按鈕的共用版面狀態同步。
    */
   function syncHeaderActionLayout(
     headerActions,
-    rawButton,
-    handoffButton,
-    completeButton
+    exportButton
   ) {
-    if (!headerActions || !rawButton || !handoffButton || !completeButton) {
+    if (!headerActions || !exportButton) {
       return;
     }
     if (headerActionLayoutTimer !== null) {
@@ -7496,21 +7899,22 @@
       headerActionLayoutTimer = null;
       if (
         !headerActions.isConnected ||
-        !rawButton.isConnected ||
-        !handoffButton.isConnected ||
-        !completeButton.isConnected
+        !exportButton.isConnected
       ) {
+        closeExportMenu({ restoreFocus: false });
         return;
       }
       reconcileShareButtonLabel(headerActions);
       const isCompact = shouldUseCompactHeaderLayout(headerActions);
       setHeaderActionsCompact(
         headerActions,
-        rawButton,
-        handoffButton,
-        completeButton,
+        exportButton,
         isCompact
       );
+      const menu = document.getElementById(EXPORT_MENU_ID);
+      if (menu) {
+        positionExportMenu(menu, exportButton);
+      }
     });
   }
   /*
@@ -7545,19 +7949,15 @@
    */
   function observeHeaderActionLayout(
     headerActions,
-    rawButton,
-    handoffButton,
-    completeButton
+    exportButton
   ) {
-    if (!headerActions || !rawButton || !handoffButton || !completeButton) {
+    if (!headerActions || !exportButton) {
       return;
     }
     if (
       observedHeaderActionLayoutTargets &&
       observedHeaderActionLayoutTargets.headerActions === headerActions &&
-      observedHeaderActionLayoutTargets.rawButton === rawButton &&
-      observedHeaderActionLayoutTargets.handoffButton === handoffButton &&
-      observedHeaderActionLayoutTargets.completeButton === completeButton
+      observedHeaderActionLayoutTargets.exportButton === exportButton
     ) {
       return;
     }
@@ -7567,14 +7967,12 @@
     }
     observedHeaderActionLayoutTargets = {
       headerActions,
-      rawButton,
-      handoffButton,
-      completeButton
+      exportButton
     };
     const parts = getHeaderLayoutParts(headerActions);
     const mutationRoot = parts?.pageHeader || headerActions;
     headerActionLayoutObserver = new MutationObserver(() => {
-      syncHeaderActionLayout(headerActions, rawButton, handoffButton, completeButton);
+      syncHeaderActionLayout(headerActions, exportButton);
     });
     headerActionLayoutObserver.observe(mutationRoot, {
       attributes: true,
@@ -7593,7 +7991,7 @@
     });
     if (typeof ResizeObserver === 'function') {
       headerActionLayoutResizeObserver = new ResizeObserver(() => {
-        syncHeaderActionLayout(headerActions, rawButton, handoffButton, completeButton);
+        syncHeaderActionLayout(headerActions, exportButton);
       });
       const resizeTargets = new Set([
         parts?.pageHeader,
@@ -7610,73 +8008,69 @@
       }
     }
     headerActionLayoutResizeHandler = () => {
-      syncHeaderActionLayout(headerActions, rawButton, handoffButton, completeButton);
+      syncHeaderActionLayout(headerActions, exportButton);
     };
     window.addEventListener('resize', headerActionLayoutResizeHandler, {
       passive: true
     });
-    syncHeaderActionLayout(headerActions, rawButton, handoffButton, completeButton);
+    syncHeaderActionLayout(headerActions, exportButton);
   }
   /*
-   * 將三個單一對話匯出按鈕插入 ChatGPT 對話頁 header。
+   * 將單一「匯出」選單觸發按鈕插入 ChatGPT 對話頁 header。
    *
    * 這個函式同時負責建立、去重、搬移與狀態更新。
-   * ChatGPT header 若因 SPA 導航或 React 重繪被重建，下一次 ensureButtonsSoon() 會把按鈕放回正確位置。
+   * ChatGPT header 若因 SPA 導航或 React 重繪被重建，下一次 ensureButtonsSoon()
+   * 會把按鈕放回正確位置。
    */
   function insertButtonsOnce() {
     if (!isConversationPage()) {
       removeButtonsIfNeeded();
       return;
     }
-    removeDuplicateButtons(RAW_BUTTON_ID);
-    removeDuplicateButtons(HANDOFF_BUTTON_ID);
-    removeDuplicateButtons(COMPLETE_BUTTON_ID);
+    removeDuplicateButtons(EXPORT_MENU_BUTTON_ID);
+    for (const legacyButtonId of LEGACY_SINGLE_EXPORT_BUTTON_IDS) {
+      for (const legacyButton of document.querySelectorAll(`#${legacyButtonId}`)) {
+        legacyButton.remove();
+      }
+    }
     const headerActions = findHeaderActionsContainer();
     if (!headerActions) {
       return;
     }
-    const rawButton = getOrCreateExportButton({
-      id: RAW_BUTTON_ID,
-      label: '下載原始 JSON',
-      ariaLabel: '下載目前對話原始 JSON',
-      testId: 'raw-json-export-button',
-      iconSvg: RAW_JSON_ICON_SVG,
-      onClick: handleDownloadRawClick
-    });
-    const handoffButton = getOrCreateExportButton({
-      id: HANDOFF_BUTTON_ID,
-      label: '下載交接 JSON',
-      ariaLabel: '產出並下載目前對話交接 JSON',
-      testId: 'handoff-json-export-button',
+    const exportButton = getOrCreateExportButton({
+      id: EXPORT_MENU_BUTTON_ID,
+      label: '匯出',
+      ariaLabel: '匯出目前對話 JSON',
+      testId: 'conversation-export-menu-button',
       iconSvg: HANDOFF_ICON_SVG,
-      onClick: handleDownloadHandoffClick
+      onClick: toggleExportMenu,
+      onKeyDown: handleExportMenuTriggerKeyDown
     });
-    const completeButton = getOrCreateExportButton({
-      id: COMPLETE_BUTTON_ID,
-      label: '下載完整 JSON',
-      ariaLabel: '分別下載目前對話原始、textdocs（若有）與交接 JSON',
-      testId: 'complete-json-export-button',
-      iconSvg: COMPLETE_JSON_ICON_SVG,
-      onClick: handleDownloadCompleteClick
-    });
+    exportButton.setAttribute('aria-haspopup', 'menu');
+    if (!document.getElementById(EXPORT_MENU_ID)) {
+      exportButton.setAttribute('aria-expanded', 'false');
+      exportButton.setAttribute('data-state', 'closed');
+      exportButton.removeAttribute('aria-controls');
+    }
+    if (
+      document.getElementById(EXPORT_MENU_ID) &&
+      exportMenuTriggerNode &&
+      exportMenuTriggerNode !== exportButton
+    ) {
+      closeExportMenu({ restoreFocus: false });
+    }
     syncCurrentHeaderButtonPresentation(
       headerActions,
-      rawButton,
-      handoffButton,
-      completeButton
+      exportButton
     );
-    placeExportButtons(
+    placeExportButton(
       headerActions,
-      rawButton,
-      handoffButton,
-      completeButton
+      exportButton
     );
     updateButtonState();
     observeHeaderActionLayout(
       headerActions,
-      rawButton,
-      handoffButton,
-      completeButton
+      exportButton
     );
   }
   /*
@@ -11536,6 +11930,7 @@
        */
     }
     lastPathname = location.pathname;
+    closeExportMenu({ restoreFocus: false });
     activeExportState = null;
     setAllButtonsBusy(false);
     updateButtonState();
