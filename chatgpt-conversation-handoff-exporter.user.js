@@ -2,7 +2,7 @@
 // @name         ChatGPT 對話 JSON 與交接檔匯出工具
 // @name:en      ChatGPT Conversation Handoff Exporter
 // @namespace    https://github.com/SunnyLeu/ChatGPT-Conversation-Handoff-Exporter
-// @version      1.5.11
+// @version      1.5.12
 // @description  匯出 ChatGPT raw / handoff / complete JSON；handoff v2 採 Structure-first / Preserve-on-unknown 完整保留交接文字，並支援受控批次原始、交接與完整 JSON session。
 // @description:en Export ChatGPT raw / handoff / complete JSON; handoff v2 uses structure-first, preserve-on-unknown semantics and supports controlled raw, handoff, and complete batch sessions.
 // @author       SunnyLeu
@@ -103,7 +103,7 @@
    * HANDOFF_SCHEMA_VERSION：
    *   與 userscript 版本分離；只有 handoff 結構或語意改版時才升版。
    */
-  const EXPORTER_VERSION = '1.5.11';
+  const EXPORTER_VERSION = '1.5.12';
   const HANDOFF_SCHEMA_VERSION = '2.0';
   /*
    * Structure-first / Preserve-on-unknown：
@@ -6844,8 +6844,11 @@
   }
   /*
    * 開啟單一對話匯出選單。
+   *
+   * 滑鼠開啟時只把焦點放在 menu 容器，不預先 highlight 任一項；
+   * 鍵盤開啟時才依操作方向將焦點放到第一項或最後一項。
    */
-  function openExportMenu(triggerButton, { focusLast = false } = {}) {
+  function openExportMenu(triggerButton, { initialFocus = 'menu' } = {}) {
     if (
       !triggerButton?.isConnected ||
       triggerButton.disabled ||
@@ -6974,7 +6977,11 @@
     const items = Array.from(
       menu.querySelectorAll('[data-cgpt-export-menu-item="true"]')
     );
-    const focusTarget = focusLast ? items.at(-1) : items[0];
+    const focusTarget = initialFocus === 'last'
+      ? items.at(-1)
+      : initialFocus === 'first'
+        ? items[0]
+        : menu;
     if (focusTarget) {
       requestAnimationFrame(() => {
         if (menu.isConnected) {
@@ -6993,7 +7000,9 @@
       closeExportMenu({ restoreFocus: false });
       return;
     }
-    openExportMenu(triggerButton);
+    openExportMenu(triggerButton, {
+      initialFocus: event.detail === 0 ? 'first' : 'menu'
+    });
   }
   function handleExportMenuTriggerKeyDown(event) {
     if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp') {
@@ -7011,7 +7020,7 @@
       return;
     }
     openExportMenu(triggerButton, {
-      focusLast: event.key === 'ArrowUp'
+      initialFocus: event.key === 'ArrowUp' ? 'last' : 'first'
     });
   }
   /*
