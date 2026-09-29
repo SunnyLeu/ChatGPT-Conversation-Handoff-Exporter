@@ -2,7 +2,7 @@
 // @name         ChatGPT 對話 JSON 與交接檔匯出工具
 // @name:en      ChatGPT Conversation Handoff Exporter
 // @namespace    https://github.com/SunnyLeu/ChatGPT-Conversation-Handoff-Exporter
-// @version      1.5.9
+// @version      1.5.10
 // @description  匯出 ChatGPT raw / handoff / complete JSON；handoff v2 採 Structure-first / Preserve-on-unknown 完整保留交接文字，並支援受控批次原始、交接與完整 JSON session。
 // @description:en Export ChatGPT raw / handoff / complete JSON; handoff v2 uses structure-first, preserve-on-unknown semantics and supports controlled raw, handoff, and complete batch sessions.
 // @author       SunnyLeu
@@ -84,7 +84,7 @@
    *   - 多次包裝 window.fetch
    *   - 重複的 timer / listener
    */
-  const INSTALL_FLAG = '__chatgptConversationHandoffExporterInstalled_v159';
+  const INSTALL_FLAG = '__chatgptConversationHandoffExporterInstalled_v1510';
   /*
    * 匯出按鈕事件綁定標記。
    *
@@ -92,7 +92,7 @@
    * click listener 是否屬於目前腳本，必要時重建按鈕以避免殘留
    * listener 或 conversation 狀態。
    */
-  const EXPORT_BUTTON_LISTENER_VERSION = '1.5.9';
+  const EXPORT_BUTTON_LISTENER_VERSION = '1.5.10';
   /*
    * 匯出器與 handoff schema 版本。
    *
@@ -102,7 +102,7 @@
    * HANDOFF_SCHEMA_VERSION：
    *   與 userscript 版本分離；只有 handoff 結構或語意改版時才升版。
    */
-  const EXPORTER_VERSION = '1.5.9';
+  const EXPORTER_VERSION = '1.5.10';
   const HANDOFF_SCHEMA_VERSION = '2.0';
   /*
    * Structure-first / Preserve-on-unknown：
@@ -6833,30 +6833,73 @@
     }
   }
   /*
+   * 判斷新版 App Shell Header action group 是否目前可用。
+   *
+   * ChatGPT 在 SPA 對話切換期間可能短暫同時保留舊、新多組 titlebar。
+   * 舊節點即使仍 connected，也可能已經是 0 × 0、隱藏或位於 aria-hidden / inert
+   * 的退場 surface；這些節點不能再作為匯出按鈕的掛載目標。
+   */
+  function isUsableCurrentAppShellHeaderActions(actionGroup) {
+    if (!actionGroup?.isConnected) {
+      return false;
+    }
+    if (actionGroup.closest('[aria-hidden="true"], [inert]')) {
+      return false;
+    }
+    const style = getComputedStyle(actionGroup);
+    if (
+      style.display === 'none' ||
+      style.visibility === 'hidden' ||
+      Number.parseFloat(style.opacity || '1') === 0
+    ) {
+      return false;
+    }
+    const rect = actionGroup.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+  }
+  /*
    * 取得新版 App Shell 對話頁右側 action group。
    *
-   * 先用固定 App Shell titlebar / context-menu surface / obstacle attribute 收斂範圍，
-   * 再從右側 obstacle 內的原生 menu button 反推同列 action group。
+   * 先掃描所有 App Shell titlebar，而不是只取 DOM 中第一個 titlebar；
+   * SPA 對話切換時 ChatGPT 可能同時保留多組新舊 Header。
+   * 每個候選仍只使用固定的 context-menu surface / obstacle attribute 與原生
+   * menu button 反推同列 action group，並排除退場、隱藏或 0 × 0 的舊節點。
    * 不依賴 build/module class，也不使用「分享」「更多」等介面文案作主要錨點。
    */
   function findCurrentAppShellHeaderActionsContainer() {
-    const titlebar = document.querySelector('header[data-app-shell-titlebar="true"]');
-    const surface = titlebar?.querySelector(
-      '[data-testid="app-shell-header-context-menu-surface"]'
+    const titlebars = Array.from(
+      document.querySelectorAll('header[data-app-shell-titlebar="true"]')
     );
-    if (!surface) {
-      return null;
-    }
-    const obstacles = Array.from(
-      surface.querySelectorAll('[data-app-shell-header-obstacle="true"]')
-    );
-    for (const obstacle of obstacles) {
-      const optionsButton = obstacle.querySelector('button[aria-haspopup="menu"]');
-      const actionGroup = optionsButton?.parentElement || null;
-      if (!actionGroup || !obstacle.contains(actionGroup)) {
-        continue;
+    for (const titlebar of titlebars) {
+      const surfaces = Array.from(
+        titlebar.querySelectorAll(
+          '[data-testid="app-shell-header-context-menu-surface"]'
+        )
+      );
+      for (const surface of surfaces) {
+        if (
+          !surface.isConnected ||
+          surface.getAttribute('aria-hidden') === 'true' ||
+          surface.hasAttribute('inert')
+        ) {
+          continue;
+        }
+        const obstacles = Array.from(
+          surface.querySelectorAll('[data-app-shell-header-obstacle="true"]')
+        );
+        for (const obstacle of obstacles) {
+          const optionsButton = obstacle.querySelector('button[aria-haspopup="menu"]');
+          const actionGroup = optionsButton?.parentElement || null;
+          if (
+            !actionGroup ||
+            !obstacle.contains(actionGroup) ||
+            !isUsableCurrentAppShellHeaderActions(actionGroup)
+          ) {
+            continue;
+          }
+          return markCurrentAppShellHeaderActions(actionGroup);
+        }
       }
-      return markCurrentAppShellHeaderActions(actionGroup);
     }
     return null;
   }
