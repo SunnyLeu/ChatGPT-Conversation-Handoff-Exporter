@@ -2,7 +2,7 @@
 // @name         ChatGPT 對話 JSON 與交接檔匯出工具
 // @name:en      ChatGPT Conversation Handoff Exporter
 // @namespace    https://github.com/SunnyLeu/ChatGPT-Conversation-Handoff-Exporter
-// @version      1.5.12
+// @version      1.5.14
 // @description  匯出 ChatGPT raw / handoff / complete JSON；handoff v2 採 Structure-first / Preserve-on-unknown 完整保留交接文字，並支援受控批次原始、交接與完整 JSON session。
 // @description:en Export ChatGPT raw / handoff / complete JSON; handoff v2 uses structure-first, preserve-on-unknown semantics and supports controlled raw, handoff, and complete batch sessions.
 // @author       SunnyLeu
@@ -12,7 +12,9 @@
 // @updateURL    https://raw.githubusercontent.com/SunnyLeu/ChatGPT-Conversation-Handoff-Exporter/main/chatgpt-conversation-handoff-exporter.user.js
 // @downloadURL  https://raw.githubusercontent.com/SunnyLeu/ChatGPT-Conversation-Handoff-Exporter/main/chatgpt-conversation-handoff-exporter.user.js
 // @match        https://chatgpt.com/*
+// @exclude      https://chatgpt.com/dots/*
 // @run-at       document-start
+// @noframes
 // @grant        none
 // ==/UserScript==
 /*
@@ -85,7 +87,7 @@
    *   - 多次包裝 window.fetch
    *   - 重複的 timer / listener
    */
-  const INSTALL_FLAG = '__chatgptConversationHandoffExporterInstalled_v1511';
+  const INSTALL_FLAG = '__chatgptConversationHandoffExporterInstalled_v1514';
   /*
    * 匯出按鈕事件綁定標記。
    *
@@ -93,7 +95,7 @@
    * click listener 是否屬於目前腳本，必要時重建按鈕以避免殘留
    * listener 或 conversation 狀態。
    */
-  const EXPORT_BUTTON_LISTENER_VERSION = '1.5.11';
+  const EXPORT_BUTTON_LISTENER_VERSION = '1.5.14';
   /*
    * 匯出器與 handoff schema 版本。
    *
@@ -103,7 +105,7 @@
    * HANDOFF_SCHEMA_VERSION：
    *   與 userscript 版本分離；只有 handoff 結構或語意改版時才升版。
    */
-  const EXPORTER_VERSION = '1.5.12';
+  const EXPORTER_VERSION = '1.5.14';
   const HANDOFF_SCHEMA_VERSION = '2.0';
   /*
    * Structure-first / Preserve-on-unknown：
@@ -245,6 +247,9 @@
   let lastPathname = location.pathname;
   let ensureTimer = null;
   let uiStarted = false;
+  let conversationRuntimeActive = false;
+  let lightPollingIntervalId = null;
+  let titleObserver = null;
   let activeExportState = null;
   let exportMenuAbortController = null;
   let exportMenuTriggerNode = null;
@@ -513,7 +518,34 @@
    * 不支援尚未建立完成的前端暫存對話 ID。
    */
   function isConversationPage() {
-    return Boolean(getConversationIdFromUrl());
+    const conversationId = getConversationIdFromUrl();
+    if (!conversationId) {
+      return false;
+    }
+    /*
+     * Exporter 的有效頁面只限兩種正式對話路徑：
+     *   /c/{conversation_id}
+     *   /g/{project_id}/c/{conversation_id}
+     *
+     * 不因其他網址「剛好含有 /c/」就啟動 Exporter。
+     */
+    const segments = location.pathname
+      .split('/')
+      .filter(Boolean);
+    if (
+      segments.length === 2 &&
+      segments[0] === 'c'
+    ) {
+      return segments[1] === conversationId;
+    }
+    if (
+      segments.length === 4 &&
+      segments[0] === 'g' &&
+      segments[2] === 'c'
+    ) {
+      return segments[3] === conversationId;
+    }
+    return false;
   }
   /*
    * 判斷 conversation 相關 endpoint 屬於哪一代。
@@ -1367,6 +1399,9 @@
    *   - 把敏感資訊印出來。
    */
   function installFetchInterceptor() {
+    if (!isConversationPage()) {
+      return;
+    }
     const originalFetch = window.fetch;
     if (typeof originalFetch !== 'function') {
       return;
@@ -1378,6 +1413,14 @@
       return;
     }
     function interceptedFetch(input, init) {
+      /*
+       * fetch wrapper 可能是在對話頁安裝後，隨 SPA 導航保留到其他頁面。
+       * 非正式對話路徑直接穿透，不做 URL 解析、request template capture
+       * 或 response clone，讓 Dots / Library / Settings 等頁面維持近乎零成本。
+       */
+      if (!isConversationPage()) {
+        return originalFetch.apply(this, arguments);
+      }
       const requestUrl = getRequestUrl(input);
       const exactConversationId = getConversationIdFromExactApiUrl(requestUrl);
       const scopedConversationId = getConversationIdFromScopedApiUrl(requestUrl);
@@ -1411,6 +1454,9 @@
    * 這裡不主動發送任何 API request。
    */
   function ensureFetchInterceptor() {
+    if (!isConversationPage()) {
+      return;
+    }
     const currentFetch = window.fetch;
     if (
       typeof currentFetch === 'function' &&
@@ -9749,6 +9795,49 @@
     }
     return controls;
   }
+  /*
+   * 判斷批次 controls 是否已位於目前 context 的正確位置。
+   *
+   * 低頻維護會每秒重新確認 UI；若狀態與掛載位置都沒有變化，
+   * 就不需要再次寫入 class / data attribute 或重掛 DOM。
+   * 這可避免穩定頁面（特別是 Dots 這類高頻更新 surface）
+   * 因 userscript 的 no-op 寫入額外觸發 style invalidation。
+   */
+  function isBatchControlsPlacementCurrent(
+    scope,
+    controls,
+    context,
+    state
+  ) {
+    if (!controls || !context || !state) {
+      return false;
+    }
+    if (scope === BATCH_SCOPE_GENERAL) {
+      if (state.phase === BATCH_PHASE_IDLE) {
+        if (context.layout === 'current') {
+          return (
+            controls.parentElement === context.controlsHost &&
+            context.controlsHost.lastElementChild === controls
+          );
+        }
+        return (
+          controls.parentElement === context.controlsHost &&
+          context.controlsHost.firstElementChild === controls
+        );
+      }
+      return (
+        controls.parentElement === context.panelHost &&
+        controls.nextElementSibling === context.listRoot
+      );
+    }
+    const projectInsertBefore =
+      context.sourcesTabSlot ||
+      context.sourcesTab;
+    return (
+      controls.parentElement === context.tablist &&
+      controls.nextElementSibling === projectInsertBefore
+    );
+  }
   function placeBatchControls(
     scope,
     controls,
@@ -10511,7 +10600,6 @@
       return;
     }
     const controls = getOrCreateBatchControls(scope);
-    placeBatchControls(scope, controls, context, state);
     const signature = [
       state.phase,
       context.active ? 'active' : 'inactive',
@@ -10525,7 +10613,25 @@
       countBatchStatus(state, BATCH_ITEM_FAILED),
       state.sessionBlockedReason ? 'blocked' : 'open'
     ].join(':');
-    if (controls.getAttribute('data-cgpt-batch-render-signature') === signature) {
+    const signatureUnchanged =
+      controls.getAttribute('data-cgpt-batch-render-signature') === signature;
+    /*
+     * 穩定狀態下只檢查掛載位置，不再每秒重寫相同 class / data attribute。
+     * 若 React 真的把 controls 移走，才沿用原本 placeBatchControls() 修復位置。
+     */
+    if (
+      signatureUnchanged &&
+      isBatchControlsPlacementCurrent(
+        scope,
+        controls,
+        context,
+        state
+      )
+    ) {
+      return;
+    }
+    placeBatchControls(scope, controls, context, state);
+    if (signatureUnchanged) {
       return;
     }
     controls.setAttribute(
@@ -11905,10 +12011,38 @@
     });
   }
   /*
+   * 離開正式對話頁時停止批次 UI 的 DOM 觀察與事件綁定。
+   *
+   * 不改動已建立 session 的資料狀態；若稍後回到正式對話頁，
+   * renderBatchControls() 可依既有 state 重建 UI。
+   */
+  function suspendBatchUiForUnsupportedRoute() {
+    disconnectBatchProjectTabObserver();
+    for (const scope of [BATCH_SCOPE_GENERAL, BATCH_SCOPE_PROJECT]) {
+      detachBatchSelectionListBinding(scope);
+    }
+    for (const id of [
+      BATCH_GENERAL_CONTROLS_ID,
+      BATCH_PROJECT_CONTROLS_ID
+    ]) {
+      const controls = document.getElementById(id);
+      if (controls) {
+        clearBatchMotionLifecycle(controls);
+        controls.remove();
+      }
+    }
+    removeBatchConfirmationDialog();
+    removeCancelBatchJobDialog();
+  }
+  /*
    * 低頻 UI 維護：確保一般側邊欄與專案頁的批次入口存在，
    * 並在 selection / session 狀態中重新綁定被 React 重建的列表。
    */
   function ensureBatchUi() {
+    if (!isConversationPage()) {
+      suspendBatchUiForUnsupportedRoute();
+      return;
+    }
     ensureBatchSelectionStyles();
     ensureBatchProjectTabObserver();
     ensureAllBatchSelectionBindings();
@@ -11943,9 +12077,7 @@
     activeExportState = null;
     setAllButtonsBusy(false);
     updateButtonState();
-    ensureFetchInterceptor();
-    ensureButtonsSoon();
-    ensureBatchUi();
+    syncConversationRuntimeForCurrentRoute();
   }
   /*
    * 包裝 history.pushState / replaceState。
@@ -11980,15 +12112,27 @@
    * 頻率：
    *   每秒一次，且主要只做輕量檢查。
    */
+  function stopLightPolling() {
+    if (lightPollingIntervalId !== null) {
+      window.clearInterval(lightPollingIntervalId);
+      lightPollingIntervalId = null;
+    }
+  }
   function startLightPolling() {
-    window.setInterval(() => {
-      ensureFetchInterceptor();
+    if (
+      lightPollingIntervalId !== null ||
+      !isConversationPage()
+    ) {
+      return;
+    }
+    lightPollingIntervalId = window.setInterval(() => {
       handleRouteMaybeChanged();
-      if (isConversationPage()) {
-        insertButtonsOnce();
-      } else {
-        removeButtonsIfNeeded();
+      if (!isConversationPage()) {
+        stopLightPolling();
+        return;
       }
+      ensureFetchInterceptor();
+      insertButtonsOnce();
       ensureBatchUi();
     }, 1000);
   }
@@ -11998,22 +12142,84 @@
    * 使用者修改對話標題後，ChatGPT 可能會更新 document.title。
    * 此時重新整理 tooltip，使按鈕 title 顯示較新的對話標題。
    */
+  function disconnectTitleObserver() {
+    if (titleObserver) {
+      titleObserver.disconnect();
+      titleObserver = null;
+    }
+  }
   function installTitleObserver() {
+    if (
+      titleObserver ||
+      !isConversationPage()
+    ) {
+      return;
+    }
     const titleElement = document.querySelector('title');
     if (!titleElement) {
       return;
     }
-    const observer = new MutationObserver(() => {
-      ensureButtonsSoon();
+    titleObserver = new MutationObserver(() => {
+      if (isConversationPage()) {
+        ensureButtonsSoon();
+      }
     });
-    observer.observe(titleElement, {
+    titleObserver.observe(titleElement, {
       childList: true,
       subtree: true,
       characterData: true
     });
   }
   /*
-   * 啟動 UI 相關邏輯。
+   * 啟用正式對話頁 runtime。
+   *
+   * 只有 /c/{id} 與 /g/{project}/c/{id} 會啟動 fetch capture、
+   * Header / title / batch observers 與 1 秒 heartbeat。
+   */
+  function startConversationRuntime() {
+    if (
+      conversationRuntimeActive ||
+      !isConversationPage()
+    ) {
+      return;
+    }
+    conversationRuntimeActive = true;
+    ensureFetchInterceptor();
+    installTitleObserver();
+    ensureButtonsSoon();
+    ensureBatchUi();
+    startLightPolling();
+  }
+  /*
+   * 離開正式對話頁時立即停止高成本 runtime。
+   *
+   * history listener 本身保留，用來偵測稍後是否再以 SPA 回到正式對話頁。
+   * 已安裝過的 fetch wrapper 不強制還原，避免覆蓋其他腳本後續包裝；
+   * wrapper 會依 isConversationPage() 直接穿透。
+   */
+  function stopConversationRuntime() {
+    conversationRuntimeActive = false;
+    if (ensureTimer !== null) {
+      window.clearTimeout(ensureTimer);
+      ensureTimer = null;
+    }
+    stopLightPolling();
+    disconnectTitleObserver();
+    stopObservingHeaderActionLayout();
+    removeButtonsIfNeeded();
+    suspendBatchUiForUnsupportedRoute();
+  }
+  function syncConversationRuntimeForCurrentRoute() {
+    if (isConversationPage()) {
+      startConversationRuntime();
+      return;
+    }
+    stopConversationRuntime();
+  }
+  /*
+   * 啟動全域 SPA 路由監聽。
+   *
+   * 非正式對話頁只保留這個低成本路由監聽；Exporter 本體保持停用。
    */
   function startUi() {
     if (uiStarted) {
@@ -12021,10 +12227,7 @@
     }
     uiStarted = true;
     installHistoryListener();
-    installTitleObserver();
-    ensureButtonsSoon();
-    ensureBatchUi();
-    startLightPolling();
+    syncConversationRuntimeForCurrentRoute();
   }
   // ============================================================
   // 七、啟動腳本
@@ -12035,7 +12238,9 @@
    *
    * UI 插入則等 DOM 可用後再開始。
    */
-  ensureFetchInterceptor();
+  if (isConversationPage()) {
+    ensureFetchInterceptor();
+  }
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', startUi, { once: true });
   } else {
