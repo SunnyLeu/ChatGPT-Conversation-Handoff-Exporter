@@ -2,7 +2,7 @@
 // @name         ChatGPT 對話 JSON 與交接檔匯出工具
 // @name:en      ChatGPT Conversation Handoff Exporter
 // @namespace    https://github.com/SunnyLeu/ChatGPT-Conversation-Handoff-Exporter
-// @version      1.5.14
+// @version      1.5.15
 // @description  匯出 ChatGPT raw / handoff / complete JSON；handoff v2 採 Structure-first / Preserve-on-unknown 完整保留交接文字，並支援受控批次原始、交接與完整 JSON session。
 // @description:en Export ChatGPT raw / handoff / complete JSON; handoff v2 uses structure-first, preserve-on-unknown semantics and supports controlled raw, handoff, and complete batch sessions.
 // @author       SunnyLeu
@@ -87,7 +87,7 @@
    *   - 多次包裝 window.fetch
    *   - 重複的 timer / listener
    */
-  const INSTALL_FLAG = '__chatgptConversationHandoffExporterInstalled_v1514';
+  const INSTALL_FLAG = '__chatgptConversationHandoffExporterInstalled_v1515';
   /*
    * 匯出按鈕事件綁定標記。
    *
@@ -95,7 +95,7 @@
    * click listener 是否屬於目前腳本，必要時重建按鈕以避免殘留
    * listener 或 conversation 狀態。
    */
-  const EXPORT_BUTTON_LISTENER_VERSION = '1.5.14';
+  const EXPORT_BUTTON_LISTENER_VERSION = '1.5.15';
   /*
    * 匯出器與 handoff schema 版本。
    *
@@ -105,7 +105,7 @@
    * HANDOFF_SCHEMA_VERSION：
    *   與 userscript 版本分離；只有 handoff 結構或語意改版時才升版。
    */
-  const EXPORTER_VERSION = '1.5.14';
+  const EXPORTER_VERSION = '1.5.15';
   const HANDOFF_SCHEMA_VERSION = '2.0';
   /*
    * Structure-first / Preserve-on-unknown：
@@ -7375,6 +7375,24 @@
    * 若按鈕已存在，會檢查節點的 listener 標記；標記不一致時重建按鈕，
    * 以避免殘留的 click listener 或 conversation 狀態。
    */
+  function setAttributeIfChanged(element, name, value) {
+    if (!element) {
+      return false;
+    }
+    const nextValue = String(value);
+    if (element.getAttribute(name) === nextValue) {
+      return false;
+    }
+    element.setAttribute(name, nextValue);
+    return true;
+  }
+  function removeAttributeIfPresent(element, name) {
+    if (!element || !element.hasAttribute(name)) {
+      return false;
+    }
+    element.removeAttribute(name);
+    return true;
+  }
   function getOrCreateExportButton(config) {
     const existingButton = document.querySelector(`#${config.id}`);
     if (existingButton) {
@@ -7396,11 +7414,11 @@
       }
       /*
        * 補上 CSS 相依的識別屬性。
-       * 這可避免 SPA 頁面中按鈕被重用時，CSS selector 無法命中。
+       * 只有值真的不同才寫 attribute，避免低頻維護自己觸發 Header observer。
        */
-      existingButton.setAttribute('data-cgpt-export-button', 'true');
-      existingButton.setAttribute('data-testid', config.testId);
-      existingButton.setAttribute('aria-label', config.ariaLabel);
+      setAttributeIfChanged(existingButton, 'data-cgpt-export-button', 'true');
+      setAttributeIfChanged(existingButton, 'data-testid', config.testId);
+      setAttributeIfChanged(existingButton, 'aria-label', config.ariaLabel);
       return existingButton;
     }
     return createHeaderButton(config);
@@ -7474,7 +7492,9 @@
       if (!button) {
         continue;
       }
-      button.className = shareButton.className;
+      if (button.className !== shareButton.className) {
+        button.className = shareButton.className;
+      }
     }
   }
   /*
@@ -8026,8 +8046,40 @@
     };
     const parts = getHeaderLayoutParts(headerActions);
     const mutationRoot = parts?.pageHeader || headerActions;
-    headerActionLayoutObserver = new MutationObserver(() => {
-      syncHeaderActionLayout(headerActions, exportButton);
+    headerActionLayoutObserver = new MutationObserver((records) => {
+      const currentParts = getHeaderLayoutParts(headerActions);
+      const leftRegion = currentParts?.leftRegion || null;
+      const rightRegion = currentParts?.rightRegion || null;
+      const pageHeader = currentParts?.pageHeader || null;
+      const needsSync = records.some((record) => {
+        const target = record.target instanceof Element
+          ? record.target
+          : record.target?.parentElement || null;
+        if (!target) {
+          return false;
+        }
+        /*
+         * Exporter 自己的按鈕 attribute / label 更新不會改變原生 Header
+         * 的可用寬度來源；忽略它們，避免 observer 自我回授。
+         */
+        if (target === exportButton || exportButton.contains(target)) {
+          return false;
+        }
+        if (
+          target === pageHeader ||
+          target === headerActions ||
+          target === leftRegion ||
+          target === rightRegion ||
+          leftRegion?.contains(target) ||
+          rightRegion?.contains(target)
+        ) {
+          return true;
+        }
+        return false;
+      });
+      if (needsSync) {
+        syncHeaderActionLayout(headerActions, exportButton);
+      }
     });
     headerActionLayoutObserver.observe(mutationRoot, {
       attributes: true,
@@ -8101,11 +8153,11 @@
       onClick: toggleExportMenu,
       onKeyDown: handleExportMenuTriggerKeyDown
     });
-    exportButton.setAttribute('aria-haspopup', 'menu');
+    setAttributeIfChanged(exportButton, 'aria-haspopup', 'menu');
     if (!document.getElementById(EXPORT_MENU_ID)) {
-      exportButton.setAttribute('aria-expanded', 'false');
-      exportButton.setAttribute('data-state', 'closed');
-      exportButton.removeAttribute('aria-controls');
+      setAttributeIfChanged(exportButton, 'aria-expanded', 'false');
+      setAttributeIfChanged(exportButton, 'data-state', 'closed');
+      removeAttributeIfPresent(exportButton, 'aria-controls');
     }
     if (
       document.getElementById(EXPORT_MENU_ID) &&
@@ -12118,6 +12170,34 @@
       lightPollingIntervalId = null;
     }
   }
+  let lightPollingTick = 0;
+  function headerUiNeedsRepair() {
+    const exportButton = document.getElementById(EXPORT_MENU_BUTTON_ID);
+    if (!exportButton?.isConnected) {
+      return true;
+    }
+    if (
+      !observedHeaderActionLayoutTargets ||
+      observedHeaderActionLayoutTargets.exportButton !== exportButton ||
+      !observedHeaderActionLayoutTargets.headerActions?.isConnected
+    ) {
+      return true;
+    }
+    return false;
+  }
+  function hasActiveBatchUiWork() {
+    return [BATCH_SCOPE_GENERAL, BATCH_SCOPE_PROJECT].some((scope) => {
+      const state = getBatchSelectionState(scope);
+      return Boolean(
+        state &&
+        (
+          state.phase !== BATCH_PHASE_IDLE ||
+          state.selectedConversations.size > 0 ||
+          hasActiveBatchSession(state)
+        )
+      );
+    });
+  }
   function startLightPolling() {
     if (
       lightPollingIntervalId !== null ||
@@ -12125,15 +12205,30 @@
     ) {
       return;
     }
+    lightPollingTick = 0;
     lightPollingIntervalId = window.setInterval(() => {
+      lightPollingTick += 1;
       handleRouteMaybeChanged();
       if (!isConversationPage()) {
         stopLightPolling();
         return;
       }
       ensureFetchInterceptor();
-      insertButtonsOnce();
-      ensureBatchUi();
+      /*
+       * heartbeat 只做「是否需要修復」的廉價檢查。
+       * 不再每秒無條件重跑 insertButtonsOnce()，避免自己改 attribute
+       * → Header MutationObserver → 離屏 clone 量測 → forced layout 的迴圈。
+       */
+      if (headerUiNeedsRepair()) {
+        ensureButtonsSoon();
+      }
+      /*
+       * 批次作業進行中仍維持每秒自癒；閒置時只每 10 秒補救一次
+       * React 重建造成的入口遺失，避免一般閱讀 / 輸入期間反覆重建 UI。
+       */
+      if (hasActiveBatchUiWork() || lightPollingTick % 10 === 0) {
+        ensureBatchUi();
+      }
     }, 1000);
   }
   /*
