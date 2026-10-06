@@ -2,7 +2,7 @@
 // @name         ChatGPT 對話 JSON 與交接檔匯出工具
 // @name:en      ChatGPT Conversation Handoff Exporter
 // @namespace    https://github.com/SunnyLeu/ChatGPT-Conversation-Handoff-Exporter
-// @version      1.5.15
+// @version      1.5.18
 // @description  匯出 ChatGPT raw / handoff / complete JSON；handoff v2 採 Structure-first / Preserve-on-unknown 完整保留交接文字，並支援受控批次原始、交接與完整 JSON session。
 // @description:en Export ChatGPT raw / handoff / complete JSON; handoff v2 uses structure-first, preserve-on-unknown semantics and supports controlled raw, handoff, and complete batch sessions.
 // @author       SunnyLeu
@@ -87,7 +87,7 @@
    *   - 多次包裝 window.fetch
    *   - 重複的 timer / listener
    */
-  const INSTALL_FLAG = '__chatgptConversationHandoffExporterInstalled_v1515';
+  const INSTALL_FLAG = '__chatgptConversationHandoffExporterInstalled_v1518';
   /*
    * 匯出按鈕事件綁定標記。
    *
@@ -95,7 +95,7 @@
    * click listener 是否屬於目前腳本，必要時重建按鈕以避免殘留
    * listener 或 conversation 狀態。
    */
-  const EXPORT_BUTTON_LISTENER_VERSION = '1.5.15';
+  const EXPORT_BUTTON_LISTENER_VERSION = '1.5.18';
   /*
    * 匯出器與 handoff schema 版本。
    *
@@ -105,7 +105,7 @@
    * HANDOFF_SCHEMA_VERSION：
    *   與 userscript 版本分離；只有 handoff 結構或語意改版時才升版。
    */
-  const EXPORTER_VERSION = '1.5.15';
+  const EXPORTER_VERSION = '1.5.18';
   const HANDOFF_SCHEMA_VERSION = '2.0';
   /*
    * Structure-first / Preserve-on-unknown：
@@ -546,6 +546,33 @@
       return segments[3] === conversationId;
     }
     return false;
+  }
+  /*
+   * 判斷目前頁面是否為 ChatGPT 專案首頁。
+   *
+   * 專案批次入口位於 /g/{project_id}/project，而這個路徑不是單一 conversation。
+   * 因此必須與 isConversationPage() 分開判斷，避免為了維持批次 UI 而誤啟動
+   * conversation 專用的 fetch capture、Header 匯出按鈕或 title observer。
+   */
+  function isProjectHomePage() {
+    const segments = location.pathname
+      .split('/')
+      .filter(Boolean);
+    return (
+      segments.length === 3 &&
+      segments[0] === 'g' &&
+      Boolean(segments[1]) &&
+      segments[2] === 'project'
+    );
+  }
+  /*
+   * 批次 UI 支援正式對話頁與專案首頁。
+   *
+   * 一般聊天的批次入口仍依附正式對話頁側邊欄；專案聊天批次入口則位於
+   * 專案首頁的「對話」分頁。其他路徑不維持批次 DOM observer / controls。
+   */
+  function isBatchUiSupportedPage() {
+    return isConversationPage() || isProjectHomePage();
   }
   /*
    * 判斷 conversation 相關 endpoint 屬於哪一代。
@@ -8286,7 +8313,9 @@
   let batchBeforeUnloadGuardAttached = false;
   let allowBatchUnloadOnce = false;
   let batchProjectTabObserver = null;
-  let batchProjectObservedTablist = null;
+  let batchProjectObservedRoot = null;
+  let batchProjectBootstrapObserver = null;
+  let batchProjectBootstrapQueued = false;
   const BATCH_ENTRY_ICON_SVG = `
         <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 20 20" data-icon-shape="non-circular" focusable="false" aria-hidden="true" class="icon-sm" fill="none">
           <rect x="3.25" y="3.25" width="13.5" height="13.5" rx="2.25" stroke="currentColor" stroke-width="1.5"/>
@@ -8714,7 +8743,7 @@
       }
       /* 專案頁整組 batch action（入口、匯出、全選、取消選取、打包、取消作業、關閉）統一縮小一號。 */
       [data-cgpt-batch-controls="project"] [data-cgpt-batch-action] {
-        font-size: 0.8125rem;
+        font-size: 14px;
         line-height: 1.125rem;
       }
       [data-cgpt-batch-action-slot][data-cgpt-batch-action-placement="project"] {
@@ -9058,11 +9087,24 @@
       sourcesTab.parentElement?.parentElement === tablist
         ? sourcesTab.parentElement
         : sourcesTab;
+    /*
+     * 專案批次入口固定放在「對話」與「來源」兩個 tab 中間。
+     * current layout 的每個 tab 外層各有一個 slot，因此實際插入點是
+     * sourcesTabSlot 前；legacy layout 則退回 sourcesTab 本身。
+     *
+     * React 可能重新建立 tablist，所以另外記錄較高層的 projectRoot，
+     * 由 MutationObserver 即時偵測結構替換並補回 controls。
+     */
+    const projectRoot =
+      tablist.closest('[data-chatgpt-project-conversation-drop-target]') ||
+      tablist.parentElement ||
+      tablist;
     return {
       scope: BATCH_SCOPE_PROJECT,
       layout,
       active,
       controlsHost: tablist,
+      projectRoot,
       tablist,
       chatTab,
       sourcesTab,
@@ -9987,8 +10029,7 @@
       context.sourcesTab;
     if (
       controls.parentElement !== context.tablist ||
-      controls.nextElementSibling !==
-      projectInsertBefore
+      controls.nextElementSibling !== projectInsertBefore
     ) {
       context.tablist.insertBefore(
         controls,
@@ -12029,43 +12070,138 @@
     actions.append(backButton, confirmButton);
     shell.body.append(message, actions);
   }
-  function disconnectBatchProjectTabObserver() {
+  function disconnectBatchProjectStructureObserver() {
     if (batchProjectTabObserver) {
       batchProjectTabObserver.disconnect();
     }
     batchProjectTabObserver = null;
-    batchProjectObservedTablist = null;
+    batchProjectObservedRoot = null;
+  }
+  function disconnectBatchProjectBootstrapObserver() {
+    if (batchProjectBootstrapObserver) {
+      batchProjectBootstrapObserver.disconnect();
+    }
+    batchProjectBootstrapObserver = null;
+    batchProjectBootstrapQueued = false;
+  }
+  function disconnectBatchProjectTabObserver() {
+    disconnectBatchProjectStructureObserver();
+    disconnectBatchProjectBootstrapObserver();
+  }
+  function ensureBatchProjectBootstrapObserver() {
+    if (
+      batchProjectBootstrapObserver ||
+      !isProjectHomePage()
+    ) {
+      return;
+    }
+    const root = document.body || document.documentElement;
+    if (!root) {
+      return;
+    }
+    batchProjectBootstrapObserver = new MutationObserver(() => {
+      if (batchProjectBootstrapQueued) {
+        return;
+      }
+      batchProjectBootstrapQueued = true;
+      queueMicrotask(() => {
+        batchProjectBootstrapQueued = false;
+        if (!isProjectHomePage()) {
+          disconnectBatchProjectBootstrapObserver();
+          return;
+        }
+        if (!findProjectBatchUiContext()) {
+          return;
+        }
+        disconnectBatchProjectBootstrapObserver();
+        ensureBatchUi();
+      });
+    });
+    batchProjectBootstrapObserver.observe(root, {
+      childList: true,
+      subtree: true
+    });
   }
   function ensureBatchProjectTabObserver() {
     const context = findProjectBatchUiContext();
     if (!context?.tablist) {
-      disconnectBatchProjectTabObserver();
+      disconnectBatchProjectStructureObserver();
+      ensureBatchProjectBootstrapObserver();
       return;
     }
-    if (batchProjectObservedTablist === context.tablist && batchProjectTabObserver) {
+    disconnectBatchProjectBootstrapObserver();
+    const observedRoot = context.projectRoot || context.tablist;
+    if (
+      batchProjectObservedRoot === observedRoot &&
+      batchProjectTabObserver
+    ) {
       return;
     }
-    disconnectBatchProjectTabObserver();
-    batchProjectObservedTablist = context.tablist;
-    batchProjectTabObserver = new MutationObserver(() => {
-      /*
-       * 只監看專案 tab 的 active state。
-       * 尚未建立 session 時切到「資料來源」會退出批次選取模式；
-       * session 建立後不因 tab 切換而取消，回到「聊天」時可繼續追加或打包。
-       */
-      ensureAllBatchSelectionBindings();
-      renderBatchControls();
+    disconnectBatchProjectStructureObserver();
+    batchProjectObservedRoot = observedRoot;
+    batchProjectTabObserver = new MutationObserver((records) => {
+      let activeStateChanged = false;
+      let structureChanged = false;
+      for (const record of records) {
+        if (record.type === 'attributes') {
+          activeStateChanged = true;
+        } else if (record.type === 'childList') {
+          structureChanged = true;
+        }
+      }
+      if (structureChanged) {
+        const currentContext = findProjectBatchUiContext();
+        if (!currentContext) {
+          ensureBatchProjectTabObserver();
+          return;
+        }
+        const state = getBatchSelectionState(BATCH_SCOPE_PROJECT);
+        const controls = document.getElementById(
+          BATCH_PROJECT_CONTROLS_ID
+        );
+        if (
+          currentContext.tablist !== context.tablist ||
+          !controls ||
+          !controls.isConnected ||
+          !isBatchControlsPlacementCurrent(
+            BATCH_SCOPE_PROJECT,
+            controls,
+            currentContext,
+            state
+          )
+        ) {
+          ensureBatchUi();
+          return;
+        }
+        /*
+         * tabs 可能先出現、對話 panel / listRoot 稍後才完成 hydration。
+         * 即使 controls 已在正確位置，結構變化仍需立即重算 context.active；
+         * renderBatchControls() 有 signature short-circuit，穩定狀態不會重寫 DOM。
+         */
+        ensureAllBatchSelectionBindings();
+        renderBatchControls();
+        return;
+      }
+      if (activeStateChanged) {
+        /*
+         * 尚未建立 session 時切到「來源」會退出批次選取模式；
+         * session 建立後不因 tab 切換而取消，回到「對話」時可繼續追加或打包。
+         */
+        ensureAllBatchSelectionBindings();
+        renderBatchControls();
+      }
     });
-    batchProjectTabObserver.observe(context.tablist, {
+    batchProjectTabObserver.observe(observedRoot, {
       subtree: true,
+      childList: true,
       attributes: true,
       attributeFilter: ['data-state', 'aria-selected']
     });
   }
   /*
-   * 離開正式對話頁時停止批次 UI 的 DOM 觀察與事件綁定。
+   * 離開批次 UI 支援頁面時停止 DOM 觀察與事件綁定。
    *
-   * 不改動已建立 session 的資料狀態；若稍後回到正式對話頁，
+   * 不改動已建立 session 的資料狀態；若稍後回到正式對話頁或專案首頁，
    * renderBatchControls() 可依既有 state 重建 UI。
    */
   function suspendBatchUiForUnsupportedRoute() {
@@ -12091,7 +12227,7 @@
    * 並在 selection / session 狀態中重新綁定被 React 重建的列表。
    */
   function ensureBatchUi() {
-    if (!isConversationPage()) {
+    if (!isBatchUiSupportedPage()) {
       suspendBatchUiForUnsupportedRoute();
       return;
     }
@@ -12129,7 +12265,7 @@
     activeExportState = null;
     setAllButtonsBusy(false);
     updateButtonState();
-    syncConversationRuntimeForCurrentRoute();
+    syncRuntimeForCurrentRoute();
   }
   /*
    * 包裝 history.pushState / replaceState。
@@ -12158,8 +12294,10 @@
    * 低頻輪詢。
    *
    * 用途：
-   *   - 補救某些 React 重繪導致按鈕消失的情況。
-   *   - 確認非對話頁時移除按鈕。
+   *   - 正式對話頁補救 React 重繪造成的 Header 匯出按鈕遺失。
+   *   - 正式對話頁維持 fetch interceptor。
+   *   - 正式對話頁與專案首頁維持批次入口 / 選取綁定。
+   *   - 離開上述支援路徑時停止輪詢。
    *
    * 頻率：
    *   每秒一次，且主要只做輕量檢查。
@@ -12198,10 +12336,36 @@
       );
     });
   }
+  /*
+   * 專案首頁的主要掛載／重建偵測已交由 MutationObserver 即時處理。
+   * 這裡只保留 heartbeat fallback：若瀏覽器或前端框架出現觀察器未涵蓋的
+   * 邊界情況，再以廉價 placement 檢查補救，不作為正常顯示入口的主要機制。
+   */
+  function projectBatchUiNeedsRepair() {
+    if (!isProjectHomePage()) {
+      return false;
+    }
+    const context = findProjectBatchUiContext();
+    if (!context) {
+      return false;
+    }
+    const state = getBatchSelectionState(BATCH_SCOPE_PROJECT);
+    const controls = document.getElementById(BATCH_PROJECT_CONTROLS_ID);
+    return (
+      !controls ||
+      !controls.isConnected ||
+      !isBatchControlsPlacementCurrent(
+        BATCH_SCOPE_PROJECT,
+        controls,
+        context,
+        state
+      )
+    );
+  }
   function startLightPolling() {
     if (
       lightPollingIntervalId !== null ||
-      !isConversationPage()
+      !isBatchUiSupportedPage()
     ) {
       return;
     }
@@ -12209,24 +12373,33 @@
     lightPollingIntervalId = window.setInterval(() => {
       lightPollingTick += 1;
       handleRouteMaybeChanged();
-      if (!isConversationPage()) {
+      if (!isBatchUiSupportedPage()) {
         stopLightPolling();
         return;
       }
-      ensureFetchInterceptor();
-      /*
-       * heartbeat 只做「是否需要修復」的廉價檢查。
-       * 不再每秒無條件重跑 insertButtonsOnce()，避免自己改 attribute
-       * → Header MutationObserver → 離屏 clone 量測 → forced layout 的迴圈。
-       */
-      if (headerUiNeedsRepair()) {
-        ensureButtonsSoon();
+      if (isConversationPage()) {
+        ensureFetchInterceptor();
+        /*
+         * heartbeat 只在正式對話頁做 Header「是否需要修復」的廉價檢查。
+         * 不再每秒無條件重跑 insertButtonsOnce()，避免自己改 attribute
+         * → Header MutationObserver → 離屏 clone 量測 → forced layout 的迴圈。
+         */
+        if (headerUiNeedsRepair()) {
+          ensureButtonsSoon();
+        }
       }
       /*
-       * 批次作業進行中仍維持每秒自癒；閒置時只每 10 秒補救一次
-       * React 重建造成的入口遺失，避免一般閱讀 / 輸入期間反覆重建 UI。
+       * 批次作業進行中仍維持每秒自癒。
+       *
+       * 專案首頁的正常掛載由 MutationObserver 即時處理；這裡的
+       * projectBatchUiNeedsRepair() 僅是最後一道 fallback。其他閒置情況
+       * 保留每 10 秒一次的低頻完整補救。
        */
-      if (hasActiveBatchUiWork() || lightPollingTick % 10 === 0) {
+      if (
+        hasActiveBatchUiWork() ||
+        projectBatchUiNeedsRepair() ||
+        lightPollingTick % 10 === 0
+      ) {
         ensureBatchUi();
       }
     }, 1000);
@@ -12286,11 +12459,12 @@
     startLightPolling();
   }
   /*
-   * 離開正式對話頁時立即停止高成本 runtime。
+   * 離開正式對話頁時停止 conversation 專用 runtime。
    *
    * history listener 本身保留，用來偵測稍後是否再以 SPA 回到正式對話頁。
    * 已安裝過的 fetch wrapper 不強制還原，避免覆蓋其他腳本後續包裝；
-   * wrapper 會依 isConversationPage() 直接穿透。
+   * wrapper 會依 isConversationPage() 直接穿透。批次 UI 是否保留則由
+   * syncRuntimeForCurrentRoute() 依目前路徑另行決定。
    */
   function stopConversationRuntime() {
     conversationRuntimeActive = false;
@@ -12302,14 +12476,25 @@
     disconnectTitleObserver();
     stopObservingHeaderActionLayout();
     removeButtonsIfNeeded();
-    suspendBatchUiForUnsupportedRoute();
   }
-  function syncConversationRuntimeForCurrentRoute() {
+  /*
+   * 依目前路徑分流 runtime：
+   *   - 正式 conversation：啟動完整 Exporter runtime。
+   *   - 專案首頁：只啟動批次 UI 與低頻 heartbeat。
+   *   - 其他頁面：停止 conversation runtime 並移除批次 UI。
+   */
+  function syncRuntimeForCurrentRoute() {
     if (isConversationPage()) {
       startConversationRuntime();
       return;
     }
     stopConversationRuntime();
+    if (isBatchUiSupportedPage()) {
+      ensureBatchUi();
+      startLightPolling();
+      return;
+    }
+    suspendBatchUiForUnsupportedRoute();
   }
   /*
    * 啟動全域 SPA 路由監聽。
@@ -12322,7 +12507,7 @@
     }
     uiStarted = true;
     installHistoryListener();
-    syncConversationRuntimeForCurrentRoute();
+    syncRuntimeForCurrentRoute();
   }
   // ============================================================
   // 七、啟動腳本
