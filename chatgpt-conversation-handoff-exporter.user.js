@@ -2,7 +2,7 @@
 // @name         ChatGPT 對話 JSON 與交接檔匯出工具
 // @name:en      ChatGPT Conversation Handoff Exporter
 // @namespace    https://github.com/SunnyLeu/ChatGPT-Conversation-Handoff-Exporter
-// @version      1.5.22
+// @version      1.5.23
 // @description  匯出 ChatGPT raw / handoff / complete JSON；handoff v2 採 Structure-first / Preserve-on-unknown 完整保留交接文字，並支援受控批次原始、交接與完整 JSON session。
 // @description:en Export ChatGPT raw / handoff / complete JSON; handoff v2 uses structure-first, preserve-on-unknown semantics and supports controlled raw, handoff, and complete batch sessions.
 // @author       SunnyLeu
@@ -56,7 +56,7 @@
  *   - 同一個批次 session 鎖定 raw、handoff 或 complete 類型，可在既有 queue 執行期間繼續追加。
  *   - 批次資料只暫存在目前頁面記憶體；按下「打包」後才建立 ZIP STORE
  *     （compression method 0），不壓縮、不載入第三方 ZIP library。
- *   - 從出現第一個批次選取起，到所有相關 session 打包完成前，使用 beforeunload 防止誤關閉／重新整理。
+ *   - 從出現第一個批次選取起，到所有相關 session 打包完成前，使用 beforeunload 防止誤關閉 / 重新整理。
  *   - 「取消批次下載作業」需再次確認；確認後以一次性 bypass 直接重新整理頁面，以清除整個 session。
  *   - raw 批次沿用單一 raw 匯出語意：封裝 conversation JSON，若有 textdocs 則一併封裝
  *     正規化 `.textdocs.json`；handoff 批次輸出 `.handoff.json`；complete 批次使用同一份
@@ -87,7 +87,7 @@
    *   - 多次包裝 window.fetch
    *   - 重複的 timer / listener
    */
-  const INSTALL_FLAG = '__chatgptConversationHandoffExporterInstalled_v1522';
+  const INSTALL_FLAG = '__chatgptConversationHandoffExporterInstalled_v1523';
   /*
    * 匯出按鈕事件綁定標記。
    *
@@ -95,7 +95,7 @@
    * click listener 是否屬於目前腳本，必要時重建按鈕以避免殘留
    * listener 或 conversation 狀態。
    */
-  const EXPORT_BUTTON_LISTENER_VERSION = '1.5.22';
+  const EXPORT_BUTTON_LISTENER_VERSION = '1.5.23';
   /*
    * 匯出器與 handoff schema 版本。
    *
@@ -105,7 +105,7 @@
    * HANDOFF_SCHEMA_VERSION：
    *   與 userscript 版本分離；只有 handoff 結構或語意改版時才升版。
    */
-  const EXPORTER_VERSION = '1.5.22';
+  const EXPORTER_VERSION = '1.5.23';
   const HANDOFF_SCHEMA_VERSION = '2.0';
   /*
    * Structure-first / Preserve-on-unknown：
@@ -559,13 +559,14 @@
     );
   }
   /*
-   * 批次 UI 支援正式對話頁與專案首頁。
+   * 批次 UI 支援 ChatGPT 首頁、正式對話頁與專案首頁。
    *
-   * 一般聊天的批次入口仍依附正式對話頁側邊欄；專案聊天批次入口則位於
-   * 專案首頁的「對話」分頁。其他路徑不維持批次 DOM observer / controls。
+   * 一般聊天的批次入口依附首頁 / 對話頁側邊欄的「最近項目」列表；
+   * 專案聊天批次入口位於專案首頁的「對話」分頁。
+   * 其他路徑不維持批次 DOM observer / controls。
    */
   function isBatchUiSupportedPage() {
-    return isConversationPage() || isProjectHomePage();
+    return location.pathname === '/' || isConversationPage() || isProjectHomePage();
   }
   /*
    * 判斷 conversation 相關 endpoint 屬於哪一代。
@@ -12599,7 +12600,7 @@
   /*
    * 離開批次 UI 支援頁面時停止 DOM 觀察與事件綁定。
    *
-   * 不改動已建立 session 的資料狀態；若稍後回到正式對話頁或專案首頁，
+   * 不改動已建立 session 的資料狀態；若稍後回到首頁、正式對話頁或專案首頁，
    * renderBatchControls() 可依既有 state 重建 UI。
    */
   function suspendBatchUiForUnsupportedRoute() {
@@ -12694,7 +12695,7 @@
    * 用途：
    *   - 正式對話頁補救 React 重繪造成的 Header 匯出按鈕遺失。
    *   - 正式對話頁維持 fetch interceptor。
-   *   - 正式對話頁與專案首頁維持批次入口 / 選取綁定。
+   *   - 首頁、正式對話頁與專案首頁維持批次入口 / 選取綁定。
    *   - 離開上述支援路徑時停止輪詢。
    *
    * 頻率：
@@ -12735,7 +12736,7 @@
     });
   }
   /*
-   * 專案首頁的主要掛載／重建偵測已交由 MutationObserver 即時處理。
+   * 專案首頁的主要掛載 / 重建偵測已交由 MutationObserver 即時處理。
    * 這裡只保留 heartbeat fallback：若瀏覽器或前端框架出現觀察器未涵蓋的
    * 邊界情況，再以廉價 placement 檢查補救，不作為正常顯示入口的主要機制。
    */
@@ -12878,7 +12879,7 @@
   /*
    * 依目前路徑分流 runtime：
    *   - 正式 conversation：啟動完整 Exporter runtime。
-   *   - 專案首頁：只啟動批次 UI 與低頻 heartbeat。
+   *   - 首頁 / 專案首頁：只啟動批次 UI 與低頻 heartbeat。
    *   - 其他頁面：停止 conversation runtime 並移除批次 UI。
    */
   function syncRuntimeForCurrentRoute() {
