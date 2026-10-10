@@ -2,7 +2,7 @@
 // @name         ChatGPT 對話 JSON 與交接檔匯出工具
 // @name:en      ChatGPT Conversation Handoff Exporter
 // @namespace    https://github.com/SunnyLeu/ChatGPT-Conversation-Handoff-Exporter
-// @version      1.5.21
+// @version      1.5.22
 // @description  匯出 ChatGPT raw / handoff / complete JSON；handoff v2 採 Structure-first / Preserve-on-unknown 完整保留交接文字，並支援受控批次原始、交接與完整 JSON session。
 // @description:en Export ChatGPT raw / handoff / complete JSON; handoff v2 uses structure-first, preserve-on-unknown semantics and supports controlled raw, handoff, and complete batch sessions.
 // @author       SunnyLeu
@@ -87,7 +87,7 @@
    *   - 多次包裝 window.fetch
    *   - 重複的 timer / listener
    */
-  const INSTALL_FLAG = '__chatgptConversationHandoffExporterInstalled_v1521';
+  const INSTALL_FLAG = '__chatgptConversationHandoffExporterInstalled_v1522';
   /*
    * 匯出按鈕事件綁定標記。
    *
@@ -95,7 +95,7 @@
    * click listener 是否屬於目前腳本，必要時重建按鈕以避免殘留
    * listener 或 conversation 狀態。
    */
-  const EXPORT_BUTTON_LISTENER_VERSION = '1.5.21';
+  const EXPORT_BUTTON_LISTENER_VERSION = '1.5.22';
   /*
    * 匯出器與 handoff schema 版本。
    *
@@ -105,7 +105,7 @@
    * HANDOFF_SCHEMA_VERSION：
    *   與 userscript 版本分離；只有 handoff 結構或語意改版時才升版。
    */
-  const EXPORTER_VERSION = '1.5.21';
+  const EXPORTER_VERSION = '1.5.22';
   const HANDOFF_SCHEMA_VERSION = '2.0';
   /*
    * Structure-first / Preserve-on-unknown：
@@ -452,18 +452,6 @@
       return '建議：ChatGPT 後端可能暫時異常，請稍後再試。';
     }
     return '建議：重新整理頁面，等待對話內容載入完成後再試。';
-  }
-  /*
-   * 建立缺少 request context 時的錯誤訊息。
-   *
-   * 常見原因是腳本尚未攔截到 ChatGPT 自己發出的 backend API 請求。
-   */
-  function buildMissingRequestContextMessage(dataName) {
-    return (
-      `目前無法取得此對話的 ${dataName} 請求資訊。\n\n` +
-      '建議：先等待對話內容完全載入，再按一次匯出按鈕。\n' +
-      '如果仍然失敗，請重新整理頁面，或重新進入這段對話後再試。'
-    );
   }
   /*
    * 顯示使用者可理解的錯誤訊息。
@@ -1597,7 +1585,8 @@
           endpointKind
         ),
         capturedAt: replayRequest.capturedAt,
-        endpointKind
+        endpointKind,
+        authSource: replayRequest.authSource || null
       };
     }
     if (!latestReplayRequestTemplate) {
@@ -1622,7 +1611,7 @@
    * textdocs 使用同一套 request context，但 target path / route 必須改成
    * /backend-api/conversation/{conversation_id}/textdocs。
    *
-   * 如果沒有可重用 context，呼叫端會把 textdocs 視為不可取得，而不是中斷主要匯出。
+   * 如果沒有可重用 context，上層會於實際匯出時嘗試獨立取得目前工作階段授權。
    */
   function getReplayRequestForTextdocs(conversationId) {
     const replayRequest = replayRequestByConversationId.get(conversationId);
@@ -1630,7 +1619,8 @@
       return {
         url: buildTextdocsApiUrl(conversationId),
         headers: applyTextdocsTargetHeaders(new Headers(replayRequest.headers), conversationId),
-        capturedAt: replayRequest.capturedAt
+        capturedAt: replayRequest.capturedAt,
+        authSource: replayRequest.authSource || null
       };
     }
     if (!latestReplayRequestTemplate) {
@@ -1641,6 +1631,162 @@
       headers: applyTextdocsTargetHeaders(new Headers(latestReplayRequestTemplate.headers), conversationId),
       capturedAt: latestReplayRequestTemplate.capturedAt
     };
+  }
+  /*
+   * 零預先捕捉時的授權初始化。
+   *
+   * 此流程只在使用者實際觸發單一或批次匯出，而且找不到可重用 request
+   * context（或現有 context 被伺服器拒絕）時啟動。使用已登入的同源工作階段，
+   * 由 /api/auth/session 即時取得 access token；不列舉對話、不存入永久儲存區，
+   * 也不把 session response / Authorization 寫入 Console 或匯出 JSON。
+   *
+   * 這是 ChatGPT 私有端點；若失效就明確失敗，絕不繞過伺服器存取控制。
+   */
+  const INDEPENDENT_SESSION_AUTH_TTL_MS = 60 * 1000;
+  const INDEPENDENT_SESSION_AUTH_TIMEOUT_MS = 15 * 1000;
+  let independentSessionAuthorization = null;
+  let independentSessionAuthorizationPromise = null;
+  function getIndependentSessionAuthorization({ forceRefresh = false } = {}) {
+    if (forceRefresh) {
+      independentSessionAuthorization = null;
+    }
+    if (
+      !forceRefresh &&
+      independentSessionAuthorization &&
+      Date.now() - independentSessionAuthorization.obtainedAt < INDEPENDENT_SESSION_AUTH_TTL_MS
+    ) {
+      return Promise.resolve(independentSessionAuthorization.authorization);
+    }
+    if (independentSessionAuthorizationPromise) {
+      return independentSessionAuthorizationPromise;
+    }
+    /* 不使用 window.fetch：避免要求先捕捉到其他對話請求作為授權來源。 */
+    independentSessionAuthorizationPromise = new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      try {
+        xhr.open('GET', new URL('/api/auth/session', location.origin).href, true);
+        xhr.withCredentials = true;
+        xhr.timeout = INDEPENDENT_SESSION_AUTH_TIMEOUT_MS;
+        xhr.setRequestHeader('accept', 'application/json');
+        xhr.setRequestHeader('cache-control', 'no-cache');
+        xhr.addEventListener('load', () => {
+          if (xhr.status < 200 || xhr.status >= 300) {
+            reject(new Error(`目前工作階段授權初始化失敗：HTTP ${xhr.status}。請確認已登入 ChatGPT。`));
+            return;
+          }
+          if (!String(xhr.getResponseHeader('content-type') || '').includes('application/json')) {
+            reject(new Error('目前工作階段授權初始化失敗：session 回應不是 JSON。'));
+            return;
+          }
+          let session;
+          try {
+            session = JSON.parse(xhr.responseText);
+          } catch {
+            reject(new Error('目前工作階段授權初始化失敗：session JSON 無法解析。'));
+            return;
+          }
+          const candidates = [
+            session?.accessToken,
+            session?.access_token,
+            session?.session?.accessToken,
+            session?.session?.access_token
+          ];
+          const token = candidates.find((value) =>
+            typeof value === 'string' && value.trim().length > 20
+          );
+          if (!token) {
+            reject(new Error('目前工作階段授權初始化失敗：session 未提供可用授權。請確認登入狀態。'));
+            return;
+          }
+          const sanitizedToken = token.trim().replace(/^Bearer\s+/i, '');
+          if (!sanitizedToken || /[\r\n]/.test(sanitizedToken)) {
+            reject(new Error('目前工作階段授權初始化失敗：授權格式無效。'));
+            return;
+          }
+          resolve(`Bearer ${sanitizedToken}`);
+        }, { once: true });
+        xhr.addEventListener('error', () => {
+          reject(new Error('目前工作階段授權初始化失敗：同源 session 網路請求失敗。'));
+        }, { once: true });
+        xhr.addEventListener('timeout', () => {
+          reject(new Error('目前工作階段授權初始化失敗：同源 session 請求逾時。'));
+        }, { once: true });
+        xhr.addEventListener('abort', () => {
+          reject(new Error('目前工作階段授權初始化失敗：同源 session 請求中止。'));
+        }, { once: true });
+        xhr.send();
+      } catch {
+        reject(new Error('目前工作階段授權初始化失敗：無法送出同源 session 請求。'));
+      }
+    }).then((authorization) => {
+      independentSessionAuthorization = {
+        authorization,
+        obtainedAt: Date.now()
+      };
+      return authorization;
+    }).finally(() => {
+      independentSessionAuthorizationPromise = null;
+    });
+    return independentSessionAuthorizationPromise;
+  }
+  /*
+   * 只為使用者指定的 conversation ID 建立新請求，不依賴先前捕捉的 headers。
+   * conversation 使用診斷已驗證成功的 Authorization + current header 形狀；
+   * textdocs 則維持 v1.5.21 既有的 legacy target path / route 語意。
+   */
+  async function buildIndependentReplayRequest(conversationId, {
+    textdocs = false,
+    forceRefresh = false
+  } = {}) {
+    if (!isExportableConversationId(conversationId)) {
+      throw new Error('授權初始化中止：conversation ID 無效。');
+    }
+    const authorization = await getIndependentSessionAuthorization({ forceRefresh });
+    const headers = new Headers({ authorization });
+    const requestHeaders = textdocs
+      ? applyTextdocsTargetHeaders(headers, conversationId)
+      : applyCurrentConversationHeaders(headers);
+    return {
+      url: textdocs
+        ? buildTextdocsApiUrl(conversationId)
+        : buildConversationApiUrl(conversationId),
+      headers: requestHeaders,
+      capturedAt: Date.now(),
+      endpointKind: CONVERSATION_ENDPOINT_CURRENT,
+      authSource: 'independent-session'
+    };
+  }
+  /*
+   * 僅當所有取得通道都因 HTTP 授權拒絕而失敗時更新授權；
+   * 若為舊 request context，亦容許以同源 session 再核對一次 404。
+   * 不因解析、完整性不一致或其他未知錯誤而放寬驗證或無限重試。
+   */
+  function shouldRefreshIndependentAuthorization(xhrAttempt, fetchAttempt, request) {
+    const attempts = [xhrAttempt, fetchAttempt].filter(Boolean);
+    if (!attempts.length) return false;
+    const statuses = request?.authSource === 'independent-session'
+      ? /\bHTTP\s+(401|403)\b/i
+      : /\bHTTP\s+(401|403|404)\b/i;
+    return attempts.every((attempt) =>
+      !attempt.candidate && attempt.error && statuses.test(toErrorMessage(attempt.error))
+    );
+  }
+  /*
+   * 以未變動的 XHR / Fetch + Resource Timing 來源完整性機制取得候選。
+   */
+  async function runConversationTransportAttempts(replayRequest, conversationId, onProgress) {
+    const xhrAttempt = await tryConversationTransport('xhr', replayRequest, conversationId, onProgress);
+    const fetchAttempt = (!xhrAttempt.candidate || xhrAttempt.candidate.timing?.status !== 'match')
+      ? await tryConversationTransport('fetch', replayRequest, conversationId)
+      : null;
+    return { xhrAttempt, fetchAttempt };
+  }
+  async function runTextdocsTransportAttempts(replayRequest, onProgress) {
+    const xhrAttempt = await tryTextdocsTransport('xhr', replayRequest, onProgress);
+    const fetchAttempt = (!xhrAttempt.candidate || xhrAttempt.candidate.timing?.status !== 'match')
+      ? await tryTextdocsTransport('fetch', replayRequest)
+      : null;
+    return { xhrAttempt, fetchAttempt };
   }
   /*
    * 計算字串以 UTF-8 編碼後的實際 bytes。
@@ -2204,22 +2350,25 @@
     );
   }
   /*
-   * 使用先前被動捕捉的 request context，即時重新抓取目前 conversation。
-   *
-   * 正式匯出不再直接信任被動 capture，也不再把 window.fetch 的單一路徑
-   * 當成 authoritative source。預設先走 XHR；只有無法直接驗證或發現異常時，
-   * 才追加 fetch 第二通道，最後由完整性判定挑選可信 snapshot。
+   * 對話擷取優先沿用可用 context；若從未捕捉到任何 request，
+   * 直接以目前登入工作階段取得授權。舊樣板若被拒絕，最多再初始化一次。
+   * 最後仍由原本的 XHR / Fetch / Resource Timing 規則選擇可信 snapshot。
    */
   async function refetchLatestConversationSnapshot(conversationId, { onProgress = null } = {}) {
-    const replayRequest = getReplayRequestForConversation(conversationId);
+    let replayRequest = getReplayRequestForConversation(conversationId);
     if (!replayRequest) {
-      throw new Error(buildMissingRequestContextMessage('conversation JSON'));
+      replayRequest = await buildIndependentReplayRequest(conversationId);
     }
     replayRequestByConversationId.set(conversationId, replayRequest);
-    const xhrAttempt = await tryConversationTransport('xhr', replayRequest, conversationId, onProgress);
-    let fetchAttempt = null;
-    if (!xhrAttempt.candidate || xhrAttempt.candidate.timing?.status !== 'match') {
-      fetchAttempt = await tryConversationTransport('fetch', replayRequest, conversationId);
+    let { xhrAttempt, fetchAttempt } = await runConversationTransportAttempts(
+      replayRequest, conversationId, onProgress
+    );
+    if (shouldRefreshIndependentAuthorization(xhrAttempt, fetchAttempt, replayRequest)) {
+      replayRequest = await buildIndependentReplayRequest(conversationId, { forceRefresh: true });
+      replayRequestByConversationId.set(conversationId, replayRequest);
+      ({ xhrAttempt, fetchAttempt } = await runConversationTransportAttempts(
+        replayRequest, conversationId, onProgress
+      ));
     }
     const trustedCandidate = selectTrustedConversationCandidate(xhrAttempt, fetchAttempt);
     rememberRawConversation(
@@ -2657,21 +2806,22 @@
     );
   }
   /*
-   * 使用先前被動捕捉的 request context，即時重新抓取目前 textdocs。
-   *
-   * textdocs 現在與 conversation 使用相同的 transport / Resource Timing 原則：
-   * 預設 XHR，必要時追加 window.fetch 作第二通道；只有通過完整性判定的
-   * candidate 才會進入 .textdocs.json 或 handoff。
+   * textdocs 亦支援從零預先捕捉獨立初始化授權；仍保留既有
+   * endpoint、XHR / Fetch 雙通道與完整性驗證。不可取得時由上層
+   * getLatestTextdocsResult() 延續既有 unavailable 容錯行為。
    */
   async function refetchLatestTextdocsSnapshot(conversationId, { onProgress = null } = {}) {
-    const replayRequest = getReplayRequestForTextdocs(conversationId);
+    let replayRequest = getReplayRequestForTextdocs(conversationId);
     if (!replayRequest) {
-      throw new Error(buildMissingRequestContextMessage('textdocs JSON'));
+      replayRequest = await buildIndependentReplayRequest(conversationId, { textdocs: true });
     }
-    const xhrAttempt = await tryTextdocsTransport('xhr', replayRequest, onProgress);
-    let fetchAttempt = null;
-    if (!xhrAttempt.candidate || xhrAttempt.candidate.timing?.status !== 'match') {
-      fetchAttempt = await tryTextdocsTransport('fetch', replayRequest);
+    let { xhrAttempt, fetchAttempt } = await runTextdocsTransportAttempts(replayRequest, onProgress);
+    if (shouldRefreshIndependentAuthorization(xhrAttempt, fetchAttempt, replayRequest)) {
+      replayRequest = await buildIndependentReplayRequest(conversationId, {
+        textdocs: true,
+        forceRefresh: true
+      });
+      ({ xhrAttempt, fetchAttempt } = await runTextdocsTransportAttempts(replayRequest, onProgress));
     }
     const trustedCandidate = selectTrustedTextdocsCandidate(xhrAttempt, fetchAttempt);
     logInfo('textdocs JSON 完整性驗證通過。', {
@@ -11516,7 +11666,8 @@
       /\bHTTP\s+(401|403)\b/i.test(message) ||
       /無法取得[^。]*request context/i.test(message) ||
       /缺少[^。]*request context/i.test(message) ||
-      /目前無法取得此對話的[^。]*請求資訊/i.test(message)
+      /目前無法取得此對話的[^。]*請求資訊/i.test(message) ||
+      /目前工作階段授權初始化失敗/i.test(message)
     );
   }
   function releaseBatchConversationLargeData(conversationId) {
