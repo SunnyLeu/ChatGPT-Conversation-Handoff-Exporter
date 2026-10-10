@@ -2,7 +2,7 @@
 // @name         ChatGPT 對話 JSON 與交接檔匯出工具
 // @name:en      ChatGPT Conversation Handoff Exporter
 // @namespace    https://github.com/SunnyLeu/ChatGPT-Conversation-Handoff-Exporter
-// @version      1.5.18
+// @version      1.5.21
 // @description  匯出 ChatGPT raw / handoff / complete JSON；handoff v2 採 Structure-first / Preserve-on-unknown 完整保留交接文字，並支援受控批次原始、交接與完整 JSON session。
 // @description:en Export ChatGPT raw / handoff / complete JSON; handoff v2 uses structure-first, preserve-on-unknown semantics and supports controlled raw, handoff, and complete batch sessions.
 // @author       SunnyLeu
@@ -87,7 +87,7 @@
    *   - 多次包裝 window.fetch
    *   - 重複的 timer / listener
    */
-  const INSTALL_FLAG = '__chatgptConversationHandoffExporterInstalled_v1518';
+  const INSTALL_FLAG = '__chatgptConversationHandoffExporterInstalled_v1521';
   /*
    * 匯出按鈕事件綁定標記。
    *
@@ -95,7 +95,7 @@
    * click listener 是否屬於目前腳本，必要時重建按鈕以避免殘留
    * listener 或 conversation 狀態。
    */
-  const EXPORT_BUTTON_LISTENER_VERSION = '1.5.18';
+  const EXPORT_BUTTON_LISTENER_VERSION = '1.5.21';
   /*
    * 匯出器與 handoff schema 版本。
    *
@@ -105,7 +105,7 @@
    * HANDOFF_SCHEMA_VERSION：
    *   與 userscript 版本分離；只有 handoff 結構或語意改版時才升版。
    */
-  const EXPORTER_VERSION = '1.5.18';
+  const EXPORTER_VERSION = '1.5.21';
   const HANDOFF_SCHEMA_VERSION = '2.0';
   /*
    * Structure-first / Preserve-on-unknown：
@@ -123,6 +123,8 @@
    */
   const EXPORT_MENU_BUTTON_ID = 'cgpt-export-menu-button';
   const EXPORT_MENU_ID = 'cgpt-export-menu';
+  const EXPORT_TOOLTIP_ID = 'cgpt-export-menu-tooltip';
+  const EXPORT_TOOLTIP_DELAY_MS = 600;
   const LEGACY_SINGLE_EXPORT_BUTTON_IDS = [
     'cgpt-export-raw-json-button',
     'cgpt-export-handoff-json-button',
@@ -253,6 +255,9 @@
   let activeExportState = null;
   let exportMenuAbortController = null;
   let exportMenuTriggerNode = null;
+  let exportTooltipTriggerNode = null;
+  let exportTooltipShowTimer = null;
+  let exportTooltipAbortController = null;
   /*
    * ChatGPT 回覆中的內嵌引用標記，例如：
    *   citeturn0search0
@@ -716,15 +721,6 @@
       pad2(date.getMinutes()),
       pad2(date.getSeconds())
     ].join('');
-  }
-  /*
-   * tooltip 顯示用時間。
-   */
-  function getDisplayDateTime(date = new Date()) {
-    return [
-      `${date.getFullYear()}-${pad2(date.getMonth() + 1)}-${pad2(date.getDate())}`,
-      `${pad2(date.getHours())}:${pad2(date.getMinutes())}:${pad2(date.getSeconds())}`
-    ].join(' ');
   }
   /*
    * 將 Unix timestamp 轉成 UTC ISO 字串。
@@ -6382,15 +6378,202 @@
     }
   }
   /*
-   * 更新指定匯出按鈕的 title tooltip。
+   * 使用當前 ChatGPT 自身 tooltip 的結構與 utility class。
+   *
+   * 原生分享按鈕在目前 App Shell 顯示 [role="tooltip"] 浮動氣泡；
+   * 匯出按鈕無法直接掛接 React / Radix 的內部 Tooltip component，
+   * 因此只借用已觀察到的 DOM 外觀與主題變數，自行管理顯示時機及位置。
+   * 不注入自訂 CSS，也不覆蓋平台其他按鈕的 tooltip。
+   */
+  const NATIVE_EXPORT_TOOLTIP_CLASS = [
+    'w-fit',
+    'text-sm',
+    'whitespace-normal',
+    'break-words',
+    'min-h-min',
+    'select-none',
+    'z-50',
+    'textTheme-uIegu3',
+    'text-center',
+    'rounded-2xl',
+    'border',
+    'border-(color:--color-border-tooltip)',
+    'bg-(--color-background-tooltip)',
+    'text-(color:--color-text-tooltip)',
+    'leading-4.5',
+    'font-(weight:--tooltip-compact-font-weight)',
+    'tracking-(--tracking-tooltip)',
+    'shadow-(--shadow-tooltip)',
+    'px-3',
+    'py-1.25',
+    'pointer-events-none'
+  ].join(' ');
+  /*
+   * 解除等待顯示的排程，不留下跨對話的舊 tooltip timer。
+   */
+  function cancelExportTooltipTimer() {
+    if (exportTooltipShowTimer !== null) {
+      window.clearTimeout(exportTooltipShowTimer);
+      exportTooltipShowTimer = null;
+    }
+  }
+  /*
+   * 清除匯出 tooltip、ARIA 關聯及暫時性監聽器。
+   */
+  function closeExportTooltip() {
+    cancelExportTooltipTimer();
+    if (exportTooltipAbortController) {
+      exportTooltipAbortController.abort();
+      exportTooltipAbortController = null;
+    }
+    const triggerButton = exportTooltipTriggerNode;
+    if (triggerButton?.getAttribute('aria-describedby') === EXPORT_TOOLTIP_ID) {
+      triggerButton.removeAttribute('aria-describedby');
+    }
+    exportTooltipTriggerNode = null;
+    document.getElementById(EXPORT_TOOLTIP_ID)?.remove();
+  }
+  /*
+   * tooltip 使用純文字節點，不解析 HTML；目前只顯示單行固定提示。
+   */
+  function renderExportTooltipText(tooltip, value) {
+    const content = tooltip?.querySelector('[data-cgpt-export-tooltip-lines]');
+    if (!content) return;
+    const lines = String(value || '').split('\n').filter((line) => line.trim());
+    const nodes = lines.map((line, index) => {
+      const row = document.createElement('div');
+      row.className = index === 0 ? 'min-w-0 text-center' : 'min-w-0 text-start';
+      row.textContent = line;
+      return row;
+    });
+    content.replaceChildren(...nodes);
+  }
+  /*
+   * 對齊原生分享 tooltip 的下方顯示方式；空間不足時移到上方，
+   * 並將氣泡限制在可視範圍內（與 Radix 的 collision avoidance 同目的）。
+   */
+  function positionExportTooltip(tooltip, triggerButton) {
+    if (!tooltip?.isConnected || !triggerButton?.isConnected) {
+      closeExportTooltip();
+      return;
+    }
+    const triggerRect = triggerButton.getBoundingClientRect();
+    if (triggerRect.width <= 0 || triggerRect.height <= 0) {
+      closeExportTooltip();
+      return;
+    }
+    const tooltipRect = tooltip.getBoundingClientRect();
+    const margin = 8;
+    const gap = 6;
+    const width = tooltipRect.width;
+    const height = tooltipRect.height;
+    const spaceBelow = window.innerHeight - triggerRect.bottom - margin;
+    const spaceAbove = triggerRect.top - margin;
+    const showAbove = spaceBelow < height + gap && spaceAbove > spaceBelow;
+    const proposedLeft = triggerRect.left + (triggerRect.width - width) / 2;
+    const proposedTop = showAbove
+      ? triggerRect.top - height - gap
+      : triggerRect.bottom + gap;
+    const left = Math.max(margin, Math.min(proposedLeft, window.innerWidth - width - margin));
+    const top = Math.max(margin, Math.min(proposedTop, window.innerHeight - height - margin));
+    tooltip.dataset.side = showAbove ? 'top' : 'bottom';
+    tooltip.style.transform = `translate(${Math.round(left * 100) / 100}px, ${Math.round(top * 100) / 100}px)`;
+    tooltip.style.setProperty('--radix-tooltip-trigger-width', `${triggerRect.width}px`);
+    tooltip.style.setProperty('--radix-tooltip-content-available-width', `${Math.max(0, window.innerWidth - margin * 2)}px`);
+    tooltip.style.setProperty('--radix-tooltip-content-available-height', `${Math.max(0, window.innerHeight - margin * 2)}px`);
+  }
+  /*
+   * 將目前資訊以 ChatGPT 原生樣式的 tooltip 呈現。
+   * 只在匯出按鈕可用、對話頁仍有效且選單未開啟時顯示。
+   */
+  function openExportTooltip(triggerButton) {
+    if (
+      !triggerButton?.isConnected ||
+      triggerButton.disabled ||
+      !isConversationPage() ||
+      document.getElementById(EXPORT_MENU_ID)
+    ) {
+      return;
+    }
+    const text = triggerButton.getAttribute('data-cgpt-export-tooltip-text');
+    if (!text) return;
+    closeExportTooltip();
+    const tooltip = document.createElement('div');
+    tooltip.id = EXPORT_TOOLTIP_ID;
+    tooltip.setAttribute('role', 'tooltip');
+    tooltip.setAttribute('data-cgpt-export-tooltip', 'true');
+    tooltip.className = NATIVE_EXPORT_TOOLTIP_CLASS;
+    tooltip.dir = document.documentElement.dir || 'ltr';
+    Object.assign(tooltip.style, {
+      position: 'fixed',
+      left: '0px',
+      top: '0px',
+      maxWidth: 'min(20rem, calc(100vw - 16px))',
+      maxHeight: 'calc(100vh - 16px)',
+      overflowY: 'auto',
+      willChange: 'transform',
+      transform: 'translate(0px, 0px)'
+    });
+    const content = document.createElement('div');
+    content.setAttribute('data-cgpt-export-tooltip-lines', 'true');
+    content.className = 'flex flex-col gap-1 min-w-0';
+    tooltip.append(content);
+    renderExportTooltipText(tooltip, text);
+    document.body.append(tooltip);
+    exportTooltipTriggerNode = triggerButton;
+    triggerButton.setAttribute('aria-describedby', EXPORT_TOOLTIP_ID);
+    positionExportTooltip(tooltip, triggerButton);
+    exportTooltipAbortController = new AbortController();
+    const { signal } = exportTooltipAbortController;
+    window.addEventListener('resize', () => {
+      positionExportTooltip(tooltip, triggerButton);
+    }, { passive: true, signal });
+    window.addEventListener('scroll', () => {
+      closeExportTooltip();
+    }, { capture: true, passive: true, signal });
+  }
+  /*
+   * 滑鼠停留一小段時間後才顯示，避免指標掠過時不斷閃爍；
+   * 鍵盤 focus 則立即顯示，並透過 aria-describedby 提供資訊。
+   */
+  function scheduleExportTooltip(triggerButton, delay = EXPORT_TOOLTIP_DELAY_MS) {
+    cancelExportTooltipTimer();
+    if (!triggerButton?.isConnected || triggerButton.disabled) return;
+    exportTooltipShowTimer = window.setTimeout(() => {
+      exportTooltipShowTimer = null;
+      if (
+        triggerButton.isConnected &&
+        (triggerButton.matches(':hover') || document.activeElement === triggerButton)
+      ) {
+        openExportTooltip(triggerButton);
+      }
+    }, delay);
+  }
+  /*
+   * 原先 title 是瀏覽器預設 tooltip；移除後只顯示上述原生同款氣泡，
+   * 避免與自訂 tooltip 疊加。文字由 updateButtonState() 統一設定。
    */
   function setButtonTooltip(buttonId, text) {
     const button = document.querySelector(`#${buttonId}`);
-    if (!button) {
-      return;
-    }
-    if (button.title !== text) {
-      button.title = text;
+    if (!button) return;
+    if (button.hasAttribute('title')) button.removeAttribute('title');
+    const currentText = button.getAttribute('data-cgpt-export-tooltip-text') || '';
+    const nextText = String(text || '');
+    if (currentText !== nextText) {
+      if (nextText) {
+        button.setAttribute('data-cgpt-export-tooltip-text', nextText);
+      } else {
+        button.removeAttribute('data-cgpt-export-tooltip-text');
+      }
+      const tooltip = document.getElementById(EXPORT_TOOLTIP_ID);
+      if (tooltip && exportTooltipTriggerNode === button) {
+        if (!nextText) {
+          closeExportTooltip();
+        } else {
+          renderExportTooltipText(tooltip, nextText);
+          positionExportTooltip(tooltip, button);
+        }
+      }
     }
   }
   /*
@@ -6422,6 +6605,9 @@
     }
     const opacity = isBusy ? '0.65' : '';
     const cursor = isBusy ? 'wait' : '';
+    if (isBusy && (exportTooltipTriggerNode === button || exportTooltipShowTimer !== null)) {
+      closeExportTooltip();
+    }
     if (button.disabled !== isBusy) {
       button.disabled = isBusy;
     }
@@ -6544,36 +6730,13 @@
     }
   }
   /*
-   * 建立單一匯出觸發按鈕 tooltip。
-   *
-   * tooltip 只顯示目前「匯出」入口、對話標題、conversation ID 與捕捉時間，
-   * 不顯示 headers 或 raw JSON。
-   */
-  function buildBaseTooltip({ actionName, conversationId, capture, replayRequest }) {
-    const title = conversationId ? getKnownConversationTitle(conversationId) : '';
-    const lines = [actionName];
-    if (title) {
-      lines.push(`對話標題：${title}`);
-    }
-    if (conversationId) {
-      lines.push(`Conversation ID：${conversationId}`);
-    }
-    if (replayRequest) {
-      lines.push(`最近一次捕捉請求資訊：${getDisplayDateTime(new Date(replayRequest.capturedAt))}`);
-    }
-    if (capture) {
-      lines.push(`最近一次捕捉 JSON：${getDisplayDateTime(new Date(capture.capturedAt))}`);
-    }
-    return lines.join('\n');
-  }
-  /*
    * 根據目前頁面狀態更新單一「匯出」觸發按鈕文字與 tooltip。
    *
    * Header 平時只顯示「匯出」；實際 raw / handoff / complete 動作由彈出選單
    * 提供。匯出進行中時仍沿用既有進度文字，避免失去目前工作階段提示。
    */
   function updateButtonState() {
-    const { conversationId, capture, replayRequest } = getCurrentState();
+    const { conversationId } = getCurrentState();
     const isExporting = applyExportInProgressState();
     if (!isConversationPage() || !conversationId) {
       setButtonConversationId(EXPORT_MENU_BUTTON_ID, null);
@@ -6589,15 +6752,7 @@
       setButtonText(EXPORT_MENU_BUTTON_ID, '匯出');
       setAllButtonsBusy(false);
     }
-    setButtonTooltip(
-      EXPORT_MENU_BUTTON_ID,
-      buildBaseTooltip({
-        actionName: '匯出目前對話 JSON',
-        conversationId,
-        capture,
-        replayRequest
-      })
-    );
+    setButtonTooltip(EXPORT_MENU_BUTTON_ID, '匯出目前對話 JSON');
   }
   /*
    * 離開對話頁時移除單一匯出觸發按鈕與彈出選單。
@@ -6607,6 +6762,7 @@
    */
   function removeButtonsIfNeeded() {
     stopObservingHeaderActionLayout();
+    closeExportTooltip();
     closeExportMenu({ restoreFocus: false });
     const exportButton = document.querySelector(`#${EXPORT_MENU_BUTTON_ID}`);
     if (exportButton) {
@@ -6662,14 +6818,22 @@
       </div>
     `;
     /*
-     * 滑鼠移入或鍵盤 focus 時重新整理 tooltip。
-     * 這能讓剛改名的對話標題較快反映到 title。
+     * 滑鼠與鍵盤使用 ChatGPT 同款浮動 tooltip；
+     * mouseleave / blur 會清理浮動節點，避免跨按鈕或開啟選單後殘留。
      */
     button.addEventListener('mouseenter', () => {
       updateButtonState();
+      scheduleExportTooltip(button);
+    });
+    button.addEventListener('mouseleave', () => {
+      if (document.activeElement !== button) closeExportTooltip();
     });
     button.addEventListener('focus', () => {
       updateButtonState();
+      scheduleExportTooltip(button, 0);
+    });
+    button.addEventListener('blur', () => {
+      closeExportTooltip();
     });
     button.addEventListener('click', onClick);
     if (typeof onKeyDown === 'function') {
@@ -6929,6 +7093,7 @@
     ) {
       return;
     }
+    closeExportTooltip();
     closeExportMenu({ restoreFocus: false });
     const conversationId = getConversationIdFromUrl();
     const direction = document.documentElement.dir || 'ltr';
@@ -7067,6 +7232,7 @@
    * Header「匯出」觸發按鈕 click / keyboard 行為。
    */
   function toggleExportMenu(event) {
+    closeExportTooltip();
     const triggerButton = event.currentTarget;
     const existingMenu = document.getElementById(EXPORT_MENU_ID);
     if (existingMenu) {
@@ -7082,6 +7248,7 @@
       return;
     }
     event.preventDefault();
+    closeExportTooltip();
     const triggerButton = event.currentTarget;
     const existingMenu = document.getElementById(EXPORT_MENU_ID);
     if (existingMenu) {
@@ -7243,9 +7410,9 @@
   /*
    * 取得目前 Header action 中的原生分享按鈕。
    *
-   * 舊版優先使用固定 data-testid；新版 App Shell 則使用 userscript 自己標記的
-   * native share button。若 marker 尚未建立，最後才依「更多」action 前一個原生
-   * action 的結構關係辨識，避免把介面語言文案當成主要 selector。
+   * 舊版優先使用固定 data-testid；新版 App Shell 使用已辨識的 marker。
+   * 新版「分享」可能獨立於「更多」容器；同一個已標記的分享 action group
+   * 若只有一顆原生非選單按鈕，也可在 React 重建按鈕後安全地重新辨識。
    */
   function findNativeShareButton(headerActions) {
     if (!headerActions) {
@@ -7261,7 +7428,17 @@
     if (markedShareButton) {
       return markedShareButton;
     }
-    const optionsButton = headerActions.querySelector('button[aria-haspopup="menu"]');
+    if (headerActions.matches?.(CURRENT_HEADER_ACTIONS_SELECTOR)) {
+      const nativeButtons = Array.from(
+        headerActions.querySelectorAll('button:not([data-cgpt-export-button="true"])')
+      );
+      if (nativeButtons.length === 1 && !nativeButtons[0].hasAttribute('aria-haspopup')) {
+        return nativeButtons[0];
+      }
+    }
+    const optionsButton = headerActions.querySelector(
+      'button[aria-haspopup="menu"]:not([data-cgpt-export-button="true"])'
+    );
     const optionsAction = getDirectChildWithin(headerActions, optionsButton);
     let candidateAction = optionsAction?.previousElementSibling || null;
     while (candidateAction?.matches?.('[data-cgpt-export-button="true"]')) {
@@ -7281,13 +7458,13 @@
    * marker 只標記目前已由穩定 App Shell 結構辨識出的 action group 與原生分享按鈕，
    * 讓 CSS 與後續量測不必依賴模組 class 或本地化文字。
    */
-  function markCurrentAppShellHeaderActions(headerActions) {
+  function markCurrentAppShellHeaderActions(headerActions, nativeShareButton = null) {
     if (!headerActions) {
       return headerActions;
     }
     headerActions.setAttribute('data-cgpt-export-header-actions', 'true');
-    const shareButton = findNativeShareButton(headerActions);
-    if (shareButton) {
+    const shareButton = nativeShareButton || findNativeShareButton(headerActions);
+    if (shareButton && headerActions.contains(shareButton)) {
       shareButton.setAttribute('data-cgpt-native-share-button', 'true');
     }
     return headerActions;
@@ -7330,13 +7507,49 @@
     return rect.width > 0 && rect.height > 0;
   }
   /*
+   * 從新版 App Shell 右側 obstacle 找出真正的原生分享按鈕。
+   *
+   * 2026-10 DOM 中「分享」「切換釘選摘要」「更多」位於三個兄弟 action wrapper。
+   * 只在原生更多選單之前的 wrapper 搜尋，優先採用舊 testid / 已標記按鈕，
+   * 再比對分享圖示的 SVG symbol；文案只作為圖示改版時的保守備援。
+   * 若無法可靠辨識分享，交由既有「更多」action group 路徑處理，不猜測釘選按鈕。
+   */
+  function findCurrentAppShellNativeShareButton(obstacle, optionsActionGroup) {
+    const optionsWrapper = getDirectChildWithin(obstacle, optionsActionGroup);
+    if (!optionsWrapper) {
+      return null;
+    }
+    const candidates = [];
+    for (const wrapper of obstacle.children) {
+      if (wrapper === optionsWrapper) {
+        break;
+      }
+      for (const button of wrapper.querySelectorAll('button:not([data-cgpt-export-button="true"])')) {
+        if (!button.closest('[aria-hidden="true"], [inert]')) {
+          candidates.push(button);
+        }
+      }
+    }
+    return (
+      candidates.find((button) =>
+        button.matches(SHARE_BUTTON_SELECTOR) ||
+        button.matches('[data-cgpt-native-share-button="true"]')
+      ) ||
+      candidates.find((button) =>
+        Boolean(button.querySelector('svg use[href*="#arrow-up-open-"]'))
+      ) ||
+      candidates.find((button) =>
+        ['分享', 'Share'].includes(button.getAttribute('aria-label'))
+      ) ||
+      null
+    );
+  }
+  /*
    * 取得新版 App Shell 對話頁右側 action group。
    *
-   * 先掃描所有 App Shell titlebar，而不是只取 DOM 中第一個 titlebar；
-   * SPA 對話切換時 ChatGPT 可能同時保留多組新舊 Header。
-   * 每個候選仍只使用固定的 context-menu surface / obstacle attribute 與原生
-   * menu button 反推同列 action group，並排除退場、隱藏或 0 × 0 的舊節點。
-   * 不依賴 build/module class，也不使用「分享」「更多」等介面文案作主要錨點。
+   * 新版優先使用原生分享按鈕所屬的 action group，讓匯出緊接分享右側；
+   * 不再因「更多」和「分享」分屬不同容器，就把匯出放在釘選摘要後面。
+   * 保留原本以「更多」為錨點的備援，供無法可靠辨識分享的 DOM 使用。
    */
   function findCurrentAppShellHeaderActionsContainer() {
     const titlebars = Array.from(
@@ -7360,16 +7573,34 @@
           surface.querySelectorAll('[data-app-shell-header-obstacle="true"]')
         );
         for (const obstacle of obstacles) {
-          const optionsButton = obstacle.querySelector('button[aria-haspopup="menu"]');
-          const actionGroup = optionsButton?.parentElement || null;
+          const optionsButton = obstacle.querySelector(
+            'button[aria-haspopup="menu"]:not([data-cgpt-export-button="true"])'
+          );
+          const optionsActionGroup = optionsButton?.parentElement || null;
           if (
-            !actionGroup ||
-            !obstacle.contains(actionGroup) ||
-            !isUsableCurrentAppShellHeaderActions(actionGroup)
+            !optionsActionGroup ||
+            !obstacle.contains(optionsActionGroup) ||
+            !isUsableCurrentAppShellHeaderActions(optionsActionGroup)
           ) {
             continue;
           }
-          return markCurrentAppShellHeaderActions(actionGroup);
+          const shareButton = findCurrentAppShellNativeShareButton(obstacle, optionsActionGroup);
+          const shareActionGroup = shareButton?.parentElement || null;
+          if (
+            shareActionGroup &&
+            obstacle.contains(shareActionGroup) &&
+            isUsableCurrentAppShellHeaderActions(shareActionGroup)
+          ) {
+            /* 舊版可能已將 marker 標在「更多」群組；搬移前撤回舊標記。 */
+            for (const previousGroup of obstacle.querySelectorAll(CURRENT_HEADER_ACTIONS_SELECTOR)) {
+              if (previousGroup !== shareActionGroup) {
+                previousGroup.removeAttribute('data-cgpt-header-compact');
+                previousGroup.removeAttribute('data-cgpt-export-header-actions');
+              }
+            }
+            return markCurrentAppShellHeaderActions(shareActionGroup, shareButton);
+          }
+          return markCurrentAppShellHeaderActions(optionsActionGroup);
         }
       }
     }
@@ -7425,6 +7656,7 @@
     if (existingButton) {
       if (existingButton.getAttribute('data-cgpt-export-listener-version') !== EXPORT_BUTTON_LISTENER_VERSION) {
         if (config.id === EXPORT_MENU_BUTTON_ID) {
+          closeExportTooltip();
           closeExportMenu({ restoreFocus: false });
         }
         const replacementButton = createHeaderButton(config);
@@ -7473,7 +7705,7 @@
    * 將單一「匯出」觸發按鈕放到 ChatGPT header 的適當位置。
    *
    * 目標順序：
-   *   分享 → 匯出 → 更多選單
+   *   分享 → 匯出 → 其他原生操作（如釘選摘要）→ 更多選單
    *
    * 使用 header action 的直接子元素作為插入錨點，避免匯出按鈕被放到
    * ChatGPT 原生按鈕的內層 wrapper 裡。
@@ -7702,6 +7934,13 @@
     const shareButton = findNativeShareButton(headerActions);
     if (!shareButton) {
       return null;
+    }
+    /* React 若只替換原生分享 button，重建 marker 供既有 compact CSS 繼續使用。 */
+    if (
+      headerActions.matches?.(CURRENT_HEADER_ACTIONS_SELECTOR) &&
+      shareButton.getAttribute('data-cgpt-native-share-button') !== 'true'
+    ) {
+      shareButton.setAttribute('data-cgpt-native-share-button', 'true');
     }
     const expectedText = normalizeUiText(shareButton.getAttribute('aria-label')) || '分享';
     const fallbackLabels = Array.from(
@@ -8003,6 +8242,7 @@
         !headerActions.isConnected ||
         !exportButton.isConnected
       ) {
+        closeExportTooltip();
         closeExportMenu({ restoreFocus: false });
         return;
       }
@@ -8016,6 +8256,10 @@
       const menu = document.getElementById(EXPORT_MENU_ID);
       if (menu) {
         positionExportMenu(menu, exportButton);
+      }
+      const tooltip = document.getElementById(EXPORT_TOOLTIP_ID);
+      if (tooltip && exportTooltipTriggerNode === exportButton) {
+        positionExportTooltip(tooltip, exportButton);
       }
     });
   }
@@ -8192,6 +8436,9 @@
       exportMenuTriggerNode !== exportButton
     ) {
       closeExportMenu({ restoreFocus: false });
+    }
+    if (exportTooltipTriggerNode && exportTooltipTriggerNode !== exportButton) {
+      closeExportTooltip();
     }
     syncCurrentHeaderButtonPresentation(
       headerActions,
@@ -12408,7 +12655,7 @@
    * 監聽 document.title 變化。
    *
    * 使用者修改對話標題後，ChatGPT 可能會更新 document.title。
-   * 此時重新整理 tooltip，使按鈕 title 顯示較新的對話標題。
+   * 此時更新提示框內容中的對話標題。
    */
   function disconnectTitleObserver() {
     if (titleObserver) {
